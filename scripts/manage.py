@@ -589,6 +589,9 @@ def package(args):
         shutil.copytree(SOURCE / 'frontend/dist', stage / 'frontend')
         shutil.copytree(SOURCE / 'deploy', stage / 'deploy')
         shutil.copy2(SOURCE / 'scripts/manage.py', stage / 'deploy/manage.py')
+        # Build-time only: the installed manager has no Cargo/Node dependency.
+        import notices
+        notices.collect(SOURCE, args.target, stage / 'deploy/licenses')
         (stage / 'release.json').write_text(json.dumps(manifest) + '\n')
         with tarfile.open(archive, 'w:gz') as tar:
             for child in sorted(stage.iterdir()):
