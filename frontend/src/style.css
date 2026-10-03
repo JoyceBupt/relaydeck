@@ -82,6 +82,10 @@ textarea { resize: vertical; min-height: 90px; }
 .topbar { min-height: 70px; border-bottom: 1px solid var(--line); background: #fff; display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 15px 36px; }
 .executor-status { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; color: #795019; white-space: nowrap; }
 .status-dot { width: 6px; height: 6px; border-radius: 50%; background: #966324; }
+.executor-status.running { color: #00635e; }
+.executor-status.running .status-dot { background: #00635e; }
+.executor-status.offline { color: #a4333a; }
+.executor-status.offline .status-dot { background: #a4333a; }
 .signed-in { display: flex; align-items: center; gap: 13px; font-size: 13px; min-width: 0; }
 .signed-in > span:first-child { overflow: hidden; text-overflow: ellipsis; max-width: 140px; white-space: nowrap; }
 .role-label { color: var(--muted); font-size: 11px; }
@@ -118,6 +122,11 @@ tbody tr:hover { background: #f8fafb; }
 .state-label { color: #00635e; white-space: nowrap; font-size: 12px; }
 .muted { color: #697b86; }
 .pending-label { display: inline-flex; align-items: center; background: #fff2da; color: #7c561c; border-radius: 4px; padding: 4px 7px; font-size: 11px; line-height: 15px; white-space: nowrap; }
+.runtime-label { display: inline-flex; align-items: center; border-radius: 4px; padding: 4px 7px; font-size: 11px; line-height: 15px; white-space: nowrap; }
+.runtime-label.pending { background: #fff2da; color: #7c561c; }
+.runtime-label.active { background: #e0efed; color: #15534e; }
+.runtime-label.stopped { background: #edf2f4; color: #526c7b; }
+.runtime-label.failed { background: #fff0f1; color: #9f2934; }
 .actions-col { text-align: right; white-space: nowrap; }
 .row-actions { display: inline-flex; gap: 1px; margin-right: -9px; }
 .loading-row { display: flex; align-items: center; justify-content: center; gap: 10px; min-height: 220px; font-size: 13px; color: var(--muted); }
@@ -146,6 +155,18 @@ dd { margin: 0; overflow-wrap: anywhere; }
 .password-form { display: grid; gap: 20px; }
 .password-form h2 { margin-bottom: 3px; }
 .password-form > .button { justify-self: start; margin-top: 4px; min-width: 90px; }
+.account-security { min-width: 0; display: grid; gap: 32px; }
+.account-security .password-form { border-top: 1px solid var(--line); padding-top: 28px; }
+.mfa-settings { min-width: 0; display: grid; gap: 20px; }
+.security-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.security-heading h2 { font-size: 17px; }
+.mfa-form { display: grid; gap: 20px; }
+.mfa-form > .button, .mfa-settings > .button { justify-self: start; }
+.mfa-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+input.secret-input { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: 12px; }
+.recovery-form { width: min(100%, 480px); }
+.recovery-list { display: grid; gap: 9px; padding: 20px; margin: 0; border: 1px solid var(--line); border-radius: 6px; background: #fff; list-style: none; }
+.recovery-list code { font-size: 13px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .editor-dialog { width: min(520px, calc(100vw - 32px)); max-height: calc(100dvh - 48px); padding: 0; border: none; border-radius: 12px; background: #fff; color: var(--ink); box-shadow: 0 20px 65px rgba(10, 36, 51, .22); overflow: auto; }
 .editor-dialog::backdrop { background: rgba(13, 36, 49, .42); }
 .dialog-heading { display: flex; justify-content: space-between; align-items: center; gap: 15px; padding: 24px 26px 19px; border-bottom: 1px solid #e6edef; }
@@ -206,6 +227,9 @@ input[type="checkbox"] { width: 17px; height: 17px; accent-color: var(--teal); m
   .account-layout { grid-template-columns: 1fr; gap: 37px; padding: 24px; }
   .account-facts { gap: 17px; }
   .password-form { border-top: 1px solid var(--line); padding-top: 28px; }
+  .mfa-form input:not(.secret-input) { font-size: 16px; }
+  .recovery-list { padding: 14px 12px; }
+  .recovery-list code { font-size: 11px; }
   .skip-link { left: 16px; }
   .login-brand { padding: 27px 26px; font-size: 19px; }
   .login-main { padding: 48px 27px 85px; }

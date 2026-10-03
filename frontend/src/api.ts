@@ -4,13 +4,17 @@ export class ApiError extends Error {
 
 let csrfToken = ''
 let sessionGeneration = 0
+let mutationGeneration = 0
+export function mutationVersion() { return mutationGeneration }
 export function setCsrfToken(token: string) {
   if (token !== csrfToken) sessionGeneration += 1
   csrfToken = token
 }
 
 export async function request<T>(path: string, method = 'GET', data?: unknown): Promise<T> {
+  if (method !== 'GET') mutationGeneration += 1
   const generation = sessionGeneration
+  const mutation = mutationGeneration
   const headers: Record<string, string> = { Accept: 'application/json' }
   if (data !== undefined) headers['Content-Type'] = 'application/json'
   if (method !== 'GET') headers['X-CSRF-Token'] = csrfToken
@@ -27,6 +31,9 @@ export async function request<T>(path: string, method = 'GET', data?: unknown): 
   // A delayed response from an earlier session must neither restore its data
   // nor revoke a newer session after logout or reauthentication.
   if (generation !== sessionGeneration) throw new ApiError(0, 'stale_session', '会话已变更')
+  // A read that began before an MFA/password mutation cannot expire the UI
+  // before that mutation's response delivers recovery codes or final state.
+  if (method === 'GET' && mutation !== mutationGeneration) throw new ApiError(0, 'stale_read', '数据已变更')
   if (response.status === 401 && path !== '/login') {
     window.dispatchEvent(new Event('relaydeck:session-expired'))
   }

@@ -13,8 +13,10 @@ export interface User {
   view_mode: ViewMode
   desired_revision: number
   applied_revision: number
+  mfa_enabled: boolean
 }
-export interface Session { user: User; csrf_token: string }
+export interface Session { user: User; csrf_token: string; mfa_required: boolean }
+export interface MfaEnrollment { secret: string; otpauth_uri: string }
 export interface Health { status: string; name: string; version: string; executor: string }
 export interface Rule {
   id: number
@@ -28,7 +30,7 @@ export interface Rule {
   protocol: 'tcp' | 'udp' | 'both'
   source_cidrs: string[]
   enabled: boolean
-  runtime_status: 'pending'
+  runtime_status: 'pending' | 'active' | 'stopped' | 'failed'
   created_at: number
   updated_at: number
 }
