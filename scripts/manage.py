@@ -24,6 +24,8 @@ CONFIG = pathlib.Path('/etc/relaydeck')
 RELEASES = pathlib.Path('/opt/relaydeck/releases')
 CURRENT = pathlib.Path('/opt/relaydeck/current')
 BIN = pathlib.Path('/usr/local/libexec/relaydeck')
+MANAGER = BIN.with_name('relaydeck-manage.py')
+UPDATER = pathlib.Path('/usr/local/sbin/relaydeck-update')
 UNITS = ('relaydeck-broker.service', 'relaydeck-web.service', 'relaydeck-worker.service')
 ENV_KEYS = {'RELAYDECK_DATABASE', 'RELAYDECK_MFA_KEY', 'RELAYDECK_LISTEN', 'RELAYDECK_ORIGIN', 'RELAYDECK_TRUST_PROXY', 'RELAYDECK_FRONTEND'}
 SAFE_ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8'}
@@ -97,7 +99,7 @@ def extract_release(archive, expected, destination):
             if parts[0] == 'bin' and raw not in ('bin', 'bin/relaydeck'):
                 raise ValueError('Unexpected executable payload')
             seen.add(raw)
-        required = {'bin/relaydeck', 'frontend/index.html', 'release.json', 'deploy/broker.example.json', 'deploy/Caddyfile.example', *(f'deploy/{unit}' for unit in UNITS)}
+        required = {'bin/relaydeck', 'frontend/index.html', 'release.json', 'deploy/broker.example.json', 'deploy/Caddyfile.example', 'deploy/manage.py', 'deploy/relaydeck-update', *(f'deploy/{unit}' for unit in UNITS)}
         if not required <= seen:
             raise ValueError('Incomplete release')
         if not all(tar.getmember(name).isfile() for name in required):
@@ -181,6 +183,11 @@ def current_link(release):
     os.replace(temporary, CURRENT)
 
 
+def management_tools(release):
+    atomic_copy(release / 'deploy/manage.py', MANAGER, 0o644)
+    atomic_copy(release / 'deploy/relaydeck-update', UPDATER, 0o755)
+
+
 def read_environment():
     path = CONFIG / 'relaydeck.env'
     root_path(path)
@@ -230,7 +237,7 @@ def manage_lock():
 
 def install(args):
     preflight()
-    if any(path.exists() or path.is_symlink() for path in (CONFIG, STATE, CURRENT, BIN, BIN.with_name('realm'))):
+    if any(path.exists() or path.is_symlink() for path in (CONFIG, STATE, CURRENT, BIN, BIN.with_name('realm'), MANAGER, UPDATER)):
         raise ValueError('Existing installation detected; use update or migrate explicitly')
     url = urllib.parse.urlsplit(args.origin)
     if url.scheme != 'https' or not url.hostname or url.username or url.password or url.path not in ('', '/') or url.query or url.fragment or not re.fullmatch('[a-zA-Z0-9.-]+', url.netloc):
@@ -273,7 +280,7 @@ def install(args):
             name = f'relaydeck-runner-{slot}'
             run('groupadd', '--gid', str(uid), name)
             run('useradd', '--uid', str(uid), '--gid', str(uid), '--home-dir', '/nonexistent', '--no-create-home', '--shell', '/usr/sbin/nologin', name)
-        for path in (CONFIG, STATE, STATE / 'runtime', RELEASES, BIN.parent):
+        for path in (CONFIG, STATE, STATE / 'runtime', RELEASES, BIN.parent, UPDATER.parent):
             path.mkdir(parents=True, exist_ok=True)
             root_path(path)
             path.chmod(0o755)
@@ -285,6 +292,7 @@ def install(args):
         shutil.copytree(stage, release)
         atomic_copy(release / 'bin/relaydeck', BIN)
         atomic_copy(pathlib.Path(work) / 'realm', BIN.with_name('realm'))
+        management_tools(release)
         current_link(release)
         policy = json.loads((release / 'deploy/broker.example.json').read_text())
         policy.update(web_uid=account.pw_uid, web_gid=account.pw_gid)
@@ -316,7 +324,7 @@ def install(args):
         run('systemctl', 'daemon-reload')
         run('systemctl', 'enable', '--now', *UNITS)
         wait_health(manifest['version'])
-        print('Installed. Import /etc/relaydeck/Caddyfile into your Caddy configuration before public use.')
+        print('Installed. Import /etc/relaydeck/Caddyfile into your Caddy configuration before public use. Updates: sudo relaydeck-update --bundle <release.tar.gz> --sha256 <trusted-digest>')
 
 
 def update(args):
@@ -346,16 +354,19 @@ def update(args):
         try:
             as_web(BIN, 'backup', str(backup))
         except BaseException:
+            run('systemctl', 'reset-failed', *UNITS)
             run('systemctl', 'start', *UNITS)
             raise
         run('systemctl', 'stop', 'relaydeck-broker.service')
         try:
             atomic_copy(release / 'bin/relaydeck', BIN)
             current_link(release)
+            management_tools(release)
             for unit in UNITS:
                 atomic_copy(release / 'deploy' / unit, pathlib.Path('/etc/systemd/system') / unit, 0o644)
             as_web(BIN, 'migrate')
             run('systemctl', 'daemon-reload')
+            run('systemctl', 'reset-failed', *UNITS)
             run('systemctl', 'start', *UNITS)
             wait_health(manifest['version'])
         except BaseException:
@@ -365,9 +376,11 @@ def update(args):
             run('runuser', '-u', 'relaydeck', '--', 'python3', '-c', restore, str(backup / 'relaydeck.db'), str(STATE / 'data/relaydeck.db'), env=SAFE_ENV)
             atomic_copy(previous / 'bin/relaydeck', BIN)
             current_link(previous)
+            management_tools(previous)
             for unit in UNITS:
                 atomic_copy(previous / 'deploy' / unit, pathlib.Path('/etc/systemd/system') / unit, 0o644)
             run('systemctl', 'daemon-reload')
+            run('systemctl', 'reset-failed', *UNITS)
             run('systemctl', 'start', *UNITS)
             wait_health(old_version)
             raise RuntimeError(f'Update failed and was rolled back. Backup: {backup}')
@@ -393,6 +406,7 @@ def package(args):
         shutil.copy2(pathlib.Path(os.environ.get('CARGO_TARGET_DIR', SOURCE / 'target')) / 'release/relaydeck', stage / 'bin/relaydeck')
         shutil.copytree(SOURCE / 'frontend/dist', stage / 'frontend')
         shutil.copytree(SOURCE / 'deploy', stage / 'deploy')
+        shutil.copy2(SOURCE / 'scripts/manage.py', stage / 'deploy/manage.py')
         (stage / 'release.json').write_text(json.dumps(manifest) + '\n')
         with tarfile.open(archive, 'w:gz') as tar:
             for child in sorted(stage.iterdir()):

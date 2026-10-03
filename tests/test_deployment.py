@@ -25,6 +25,8 @@ class ReleaseValidation(unittest.TestCase):
             'frontend/index.html': b'<!doctype html>',
             'deploy/broker.example.json': b'{}',
             'deploy/Caddyfile.example': b'panel.example.com {}',
+            'deploy/manage.py': MODULE.read_bytes(),
+            'deploy/relaydeck-update': b'#!/bin/sh\nexec python3 /usr/local/libexec/relaydeck-manage.py update "$@"\n',
             **{f'deploy/{unit}': b'[Service]\nExecStart=/usr/local/libexec/relaydeck\n' for unit in manage.UNITS},
         }
         with tarfile.open(path, 'w:gz') as tar:
