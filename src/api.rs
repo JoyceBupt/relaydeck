@@ -862,6 +862,12 @@ struct AuditView {
     actor_username: String,
     action: String,
     resource_id: Option<i64>,
+    // Current name of the referenced rule or account, so the log reads as
+    // sentences rather than bare identifiers. Rules keep their name after
+    // soft deletion; accounts are never deleted.
+    resource_kind: Option<String>,
+    resource_name: Option<String>,
+    resource_port: Option<i64>,
     created_at: i64,
 }
 
@@ -870,7 +876,65 @@ async fn audit(
     auth: AuthContext,
 ) -> Result<Json<Vec<AuditView>>, ApiError> {
     auth.admin()?;
-    Ok(Json(sqlx::query_as("SELECT id,actor_username,action,resource_id,created_at FROM audit_events ORDER BY id DESC LIMIT 200").fetch_all(&state.pool).await?))
+    Ok(Json(sqlx::query_as("SELECT a.id,a.actor_username,a.action,a.resource_id,CASE WHEN a.resource_id IS NULL THEN NULL WHEN a.action LIKE 'rule!_%' ESCAPE '!' THEN 'rule' ELSE 'user' END AS resource_kind,CASE WHEN a.action LIKE 'rule!_%' ESCAPE '!' THEN r.name ELSE u.username END AS resource_name,CASE WHEN a.action LIKE 'rule!_%' ESCAPE '!' THEN r.listen_port END AS resource_port,a.created_at FROM audit_events a LEFT JOIN rules r ON r.id=a.resource_id LEFT JOIN users u ON u.id=a.resource_id ORDER BY a.id DESC LIMIT 200").fetch_all(&state.pool).await?))
+}
+
+#[derive(Serialize)]
+struct PortLease {
+    port: i64,
+    rule_id: i64,
+    // "active" while the lease's rule still listens on the port; "releasing"
+    // after an edit or deletion, until the executor confirms the old runtime.
+    state: &'static str,
+}
+
+#[derive(Serialize)]
+struct PortUsage {
+    owner_id: i64,
+    port_start: i64,
+    port_end: i64,
+    reserved: Vec<u16>,
+    leases: Vec<PortLease>,
+}
+
+async fn port_usage(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(id): Path<i64>,
+) -> Result<Json<PortUsage>, ApiError> {
+    auth.ready()?;
+    if auth.user.role != "admin" && auth.user.id != id {
+        return Err(ApiError::not_found());
+    }
+    let owner: DbUser = sqlx::query_as("SELECT * FROM users WHERE id=?")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or_else(ApiError::not_found)?;
+    let rows: Vec<(i64, i64, bool)> = sqlx::query_as("SELECT p.port,p.rule_id,EXISTS(SELECT 1 FROM rules r WHERE r.id=p.rule_id AND r.deleted_at IS NULL AND r.listen_port=p.port) FROM port_leases p WHERE p.owner_id=? ORDER BY p.port")
+        .bind(owner.id)
+        .fetch_all(&state.pool)
+        .await?;
+    Ok(Json(PortUsage {
+        owner_id: owner.id,
+        port_start: owner.port_start,
+        port_end: owner.port_end,
+        reserved: state
+            .config
+            .reserved_ports
+            .iter()
+            .copied()
+            .filter(|port| (owner.port_start..=owner.port_end).contains(&i64::from(*port)))
+            .collect(),
+        leases: rows
+            .into_iter()
+            .map(|(port, rule_id, active)| PortLease {
+                port,
+                rule_id,
+                state: if active { "active" } else { "releasing" },
+            })
+            .collect(),
+    }))
 }
 
 pub async fn initialize_admin(
@@ -892,11 +956,16 @@ pub async fn initialize_admin(
     Ok(())
 }
 
+async fn api_not_found() -> ApiError {
+    ApiError::not_found()
+}
+
 pub fn router(state: AppState) -> Router {
-    let static_files = tower_http::services::ServeDir::new(&state.config.frontend)
-        .not_found_service(tower_http::services::ServeFile::new(
-            state.config.frontend.join("index.html"),
-        ));
+    // Client-side routes (/rules/12, /accounts) are real pages: serve the SPA
+    // shell with 200. Unknown API paths are answered by api_not_found instead.
+    let static_files = tower_http::services::ServeDir::new(&state.config.frontend).fallback(
+        tower_http::services::ServeFile::new(state.config.frontend.join("index.html")),
+    );
     Router::new()
         .route("/api/login",post(login))
         .route("/api/session",get(session))
@@ -909,10 +978,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/users/{id}",put(update_user))
         .route("/api/users/{id}/password",post(reset_password))
         .route("/api/users/{id}/apply",post(retry_apply))
+        .route("/api/users/{id}/ports",get(port_usage))
         .route("/api/preferences",put(preferences))
         .route("/api/audit",get(audit))
         .route("/api/health",get(health))
         .merge(crate::rules::routes())
+        .route("/api/{*path}",axum::routing::any(api_not_found))
         .fallback_service(static_files)
         .layer(axum::extract::DefaultBodyLimit::max(16*1024))
         .layer(axum::middleware::from_fn(|request:axum::extract::Request,next:axum::middleware::Next|async move{

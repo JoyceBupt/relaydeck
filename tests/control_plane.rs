@@ -917,3 +917,119 @@ async fn preferences_are_per_user_and_secrets_stay_out_of_audit() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn rules_audit_and_ports_expose_readable_runtime_context() {
+    let f = Fixture::new().await;
+    let alice = f.add_user("alice", 41000).await;
+    let bob = f.add_user("bob", 42000).await;
+    let owner = alice.user["id"].as_i64().unwrap();
+    let (status, _, created) = call(
+        &f.app,
+        "POST",
+        "/api/rules",
+        Some(rule(41000)),
+        Some(&alice),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["runtime_error"], Value::Null);
+    sqlx::query("INSERT INTO runtime_states SELECT id,desired_revision,'failed','listener mismatch',? FROM users WHERE id=?")
+        .bind(relaydeck::db::now())
+        .bind(owner)
+        .execute(&f.state.pool)
+        .await
+        .unwrap();
+    let (_, _, rules) = call(&f.app, "GET", "/api/rules", None, Some(&alice), false).await;
+    assert_eq!(rules[0]["runtime_status"], "failed");
+    assert_eq!(rules[0]["runtime_error"], "listener mismatch");
+    assert!(rules[0]["runtime_updated_at"].is_i64());
+    // A failure reported for an older revision is not presented as current.
+    sqlx::query("UPDATE runtime_states SET revision=revision-1 WHERE owner_id=?")
+        .bind(owner)
+        .execute(&f.state.pool)
+        .await
+        .unwrap();
+    let (_, _, rules) = call(&f.app, "GET", "/api/rules", None, Some(&alice), false).await;
+    assert_eq!(rules[0]["runtime_error"], Value::Null);
+
+    let path = format!("/api/rules/{}", created["id"]);
+    let (status, _, moved) =
+        call(&f.app, "PUT", &path, Some(rule(41001)), Some(&alice), true).await;
+    assert_eq!(status, StatusCode::OK, "{moved}");
+    let ports_path = format!("/api/users/{owner}/ports");
+    let (status, _, ports) = call(&f.app, "GET", &ports_path, None, Some(&alice), false).await;
+    assert_eq!(status, StatusCode::OK, "{ports}");
+    assert_eq!(ports["port_start"], 41000);
+    assert_eq!(ports["port_end"], 41009);
+    assert_eq!(
+        ports["leases"],
+        json!([
+            {"port":41000,"rule_id":created["id"],"state":"releasing"},
+            {"port":41001,"rule_id":created["id"],"state":"active"}
+        ])
+    );
+    assert_eq!(
+        call(&f.app, "GET", &ports_path, None, Some(&bob), false)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    let (status, _, admin_ports) = call(
+        &f.app,
+        "GET",
+        "/api/users/1/ports",
+        None,
+        Some(&f.admin),
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(admin_ports["reserved"], json!([40005]));
+    assert_eq!(
+        call(&f.app, "GET", &ports_path, None, Some(&f.admin), false)
+            .await
+            .0,
+        StatusCode::OK
+    );
+
+    let (_, _, audit) = call(&f.app, "GET", "/api/audit", None, Some(&f.admin), false).await;
+    let entries = audit.as_array().unwrap();
+    let updated = entries
+        .iter()
+        .find(|entry| entry["action"] == "rule_updated")
+        .unwrap();
+    assert_eq!(updated["resource_kind"], "rule");
+    assert_eq!(updated["resource_name"], "测试转发");
+    assert_eq!(updated["resource_port"], 41001);
+    let created_user = entries
+        .iter()
+        .find(|entry| entry["action"] == "user_created" && entry["resource_id"] == owner)
+        .unwrap();
+    assert_eq!(created_user["resource_kind"], "user");
+    assert_eq!(created_user["resource_name"], "alice");
+    assert_eq!(created_user["resource_port"], Value::Null);
+}
+
+#[tokio::test]
+async fn unknown_api_paths_answer_json_not_the_spa_shell() {
+    let f = Fixture::new().await;
+    let (status, headers, body) = call(
+        &f.app,
+        "GET",
+        "/api/no-such-endpoint",
+        None,
+        Some(&f.admin),
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        headers[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("application/json")
+    );
+    assert_eq!(body["error"]["code"], "not_found");
+}

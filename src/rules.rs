@@ -24,7 +24,7 @@ use crate::{
 
 static DNS_SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(4)));
 const MAX_DNS_RESULTS: usize = 32;
-const RULE_SELECT: &str = "SELECT r.id,r.owner_id,u.username AS owner_username,r.name,r.listen_port,r.target_host,r.target_ip,r.target_port,r.protocol,r.source_cidrs,r.enabled,r.created_at,r.updated_at,CASE WHEN s.revision=u.desired_revision AND s.status='failed' THEN 'failed' WHEN e.status IS NULL OR e.status!='running' OR e.last_seen<=unixepoch()-10 THEN 'pending' WHEN s.revision!=u.desired_revision OR u.applied_revision!=u.desired_revision THEN 'pending' WHEN s.status='stopped' THEN 'stopped' WHEN s.status='active' AND r.enabled=0 THEN 'stopped' WHEN s.status='active' AND u.enabled=1 AND (u.expires_at IS NULL OR u.expires_at>unixepoch()) THEN 'active' ELSE 'pending' END AS runtime_status FROM rules r JOIN users u ON u.id=r.owner_id LEFT JOIN runtime_states s ON s.owner_id=u.id LEFT JOIN executor_status e ON e.id=1";
+const RULE_SELECT: &str = "SELECT r.id,r.owner_id,u.username AS owner_username,r.name,r.listen_port,r.target_host,r.target_ip,r.target_port,r.protocol,r.source_cidrs,r.enabled,r.created_at,r.updated_at,CASE WHEN s.revision=u.desired_revision AND s.status='failed' THEN 'failed' WHEN e.status IS NULL OR e.status!='running' OR e.last_seen<=unixepoch()-10 THEN 'pending' WHEN s.revision!=u.desired_revision OR u.applied_revision!=u.desired_revision THEN 'pending' WHEN s.status='stopped' THEN 'stopped' WHEN s.status='active' AND r.enabled=0 THEN 'stopped' WHEN s.status='active' AND u.enabled=1 AND (u.expires_at IS NULL OR u.expires_at>unixepoch()) THEN 'active' ELSE 'pending' END AS runtime_status,CASE WHEN s.revision=u.desired_revision AND s.status='failed' THEN s.last_error END AS runtime_error,s.updated_at AS runtime_updated_at FROM rules r JOIN users u ON u.id=r.owner_id LEFT JOIN runtime_states s ON s.owner_id=u.id LEFT JOIN executor_status e ON e.id=1";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -99,6 +99,8 @@ struct DbRule {
     created_at: i64,
     updated_at: i64,
     runtime_status: String,
+    runtime_error: Option<String>,
+    runtime_updated_at: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -115,6 +117,10 @@ struct RuleView {
     source_cidrs: Vec<String>,
     enabled: bool,
     runtime_status: String,
+    // Executor-reported reason for the current revision's failure; sanitized
+    // and bounded by the executor before it is stored.
+    runtime_error: Option<String>,
+    runtime_updated_at: Option<i64>,
     created_at: i64,
     updated_at: i64,
 }
@@ -138,6 +144,8 @@ impl DbRule {
             source_cidrs,
             enabled: self.enabled,
             runtime_status: self.runtime_status,
+            runtime_error: self.runtime_error,
+            runtime_updated_at: self.runtime_updated_at,
             created_at: self.created_at,
             updated_at: self.updated_at,
         })
