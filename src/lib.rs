@@ -1,7 +1,11 @@
+pub mod api;
 pub mod config;
 pub mod credentials;
 pub mod db;
+pub mod error;
+pub mod models;
 pub mod policy;
+pub mod rules;
 
 pub fn health_router() -> axum::Router {
     axum::Router::new().route(

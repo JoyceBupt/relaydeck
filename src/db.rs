@@ -19,9 +19,14 @@ pub async fn connect(path: &Path) -> anyhow::Result<SqlitePool> {
                 builder.create(parent)?;
                 #[cfg(unix)]
                 {
-                    use std::os::unix::fs::PermissionsExt;
+                    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                    let metadata = std::fs::metadata(parent)?;
                     anyhow::ensure!(
-                        std::fs::metadata(parent)?.permissions().mode() & 0o022 == 0,
+                        metadata.uid() == unsafe { libc::geteuid() },
+                        "database directory must be owned by the current user"
+                    );
+                    anyhow::ensure!(
+                        metadata.permissions().mode() & 0o022 == 0,
                         "database directory must not be writable by other users"
                     );
                 }

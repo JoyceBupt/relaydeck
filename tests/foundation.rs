@@ -73,3 +73,17 @@ async fn database_refuses_symlinks_and_shared_writable_directories() {
     );
     pool.close().await;
 }
+
+#[test]
+fn backend_refuses_public_http_even_with_an_https_origin() {
+    let dir = tempfile::tempdir().unwrap();
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_relaydeck"))
+        .env("RELAYDECK_LISTEN", "0.0.0.0:7410")
+        .env("RELAYDECK_ORIGIN", "https://relaydeck.test")
+        .env("RELAYDECK_DATABASE", dir.path().join("unexpected.db"))
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("loopback"));
+    assert!(!dir.path().join("unexpected.db").exists());
+}

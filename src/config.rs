@@ -9,6 +9,7 @@ pub struct Config {
     pub database: PathBuf,
     pub public_origin: String,
     pub secure_cookie: bool,
+    pub trust_proxy: bool,
     pub reserved_ports: Vec<u16>,
     pub local_ips: Vec<IpAddr>,
     pub frontend: PathBuf,
@@ -19,6 +20,10 @@ impl Config {
         let listen: SocketAddr = std::env::var("RELAYDECK_LISTEN")
             .unwrap_or_else(|_| "127.0.0.1:7410".into())
             .parse()?;
+        anyhow::ensure!(
+            listen.ip().is_loopback(),
+            "the HTTP backend must listen on loopback; use Caddy for HTTPS"
+        );
         let public_origin =
             std::env::var("RELAYDECK_ORIGIN").unwrap_or_else(|_| format!("http://{listen}"));
         let url = url::Url::parse(&public_origin)?;
@@ -31,6 +36,18 @@ impl Config {
             "RELAYDECK_ORIGIN must contain only a scheme, host and optional port"
         );
         let secure_cookie = url.scheme() == "https";
+        let trust_proxy = match std::env::var("RELAYDECK_TRUST_PROXY")
+            .unwrap_or_else(|_| "false".into())
+            .as_str()
+        {
+            "true" => true,
+            "false" => false,
+            _ => anyhow::bail!("RELAYDECK_TRUST_PROXY must be true or false"),
+        };
+        anyhow::ensure!(
+            !trust_proxy || secure_cookie,
+            "trusted proxy mode requires an HTTPS public origin"
+        );
         let local_origin = match url.host() {
             Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
             Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
@@ -66,6 +83,7 @@ impl Config {
                 .unwrap_or_else(|| PathBuf::from(".local/relaydeck.db")),
             public_origin: url.origin().ascii_serialization(),
             secure_cookie,
+            trust_proxy,
             reserved_ports,
             local_ips,
             frontend: std::env::var_os("RELAYDECK_FRONTEND")
