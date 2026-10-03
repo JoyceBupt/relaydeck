@@ -32,7 +32,6 @@ pub async fn reconcile_tick<D: ExecutorDriver>(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    let mut failed = false;
     let mut owners = reconciler.pending_owners().await?;
     let renewals:Vec<i64>=sqlx::query_scalar("SELECT s.owner_id FROM runtime_states s JOIN users u ON u.id=s.owner_id WHERE s.status='active' AND s.revision=u.desired_revision AND u.enabled=1 AND (u.expires_at IS NULL OR u.expires_at>?) AND s.updated_at<=?").bind(now()).bind(now()-5).fetch_all(pool).await?;
     for owner in renewals {
@@ -42,16 +41,16 @@ pub async fn reconcile_tick<D: ExecutorDriver>(
     }
     for owner in owners {
         if let Err(error) = reconciler.reconcile_owner(owner).await {
-            failed = true;
             tracing::error!(owner_id=owner,%error,"account reconciliation failed");
             match &error {
+                ReconcileError::Temporary(_) | ReconcileError::Stop(_) => continue,
                 ReconcileError::Database(error) if transient_database(error) => continue,
                 _ => return Err(error.into()),
             }
         }
     }
     sqlx::query("INSERT INTO executor_status(id,last_seen,status) VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET last_seen=excluded.last_seen,status=excluded.status")
-        .bind(now()).bind(if failed {"failed"} else {"running"}).execute(pool).await?;
+        .bind(now()).bind("running").execute(pool).await?;
     Ok(())
 }
 
@@ -64,9 +63,9 @@ where
     F: Fn(String, u16) -> Fut,
     Fut: std::future::Future<Output = Result<String, crate::error::ApiError>>,
 {
-    let rows:Vec<(i64,i64,String,String,i64,i64)>=sqlx::query_as("SELECT r.id,r.owner_id,r.target_host,r.target_ip,r.target_port,r.dns_resolved_at FROM rules r JOIN users u ON u.id=r.owner_id WHERE r.enabled=1 AND r.deleted_at IS NULL AND u.enabled=1 AND (u.expires_at IS NULL OR u.expires_at>?) AND r.dns_checked_at<? ORDER BY r.dns_checked_at,r.id LIMIT 4")
+    let rows:Vec<(i64,i64,String,String,i64,i64,bool)>=sqlx::query_as("SELECT r.id,r.owner_id,r.target_host,r.target_ip,r.target_port,r.dns_resolved_at,r.dns_blocked FROM rules r JOIN users u ON u.id=r.owner_id WHERE r.enabled=1 AND r.deleted_at IS NULL AND u.enabled=1 AND (u.expires_at IS NULL OR u.expires_at>?) AND r.dns_checked_at<? ORDER BY r.dns_checked_at,r.id LIMIT 4")
         .bind(now()).bind(now()-60).fetch_all(pool).await?;
-    for (id, owner, host, old_ip, port, resolved_at) in rows {
+    for (id, owner, host, old_ip, port, resolved_at, was_blocked) in rows {
         if host.parse::<std::net::IpAddr>().is_ok() {
             sqlx::query("UPDATE rules SET dns_checked_at=? WHERE id=?")
                 .bind(now())
@@ -91,27 +90,30 @@ where
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         let (changed, action) = match answer {
             Ok(ip) => {
-                let result=sqlx::query("UPDATE rules SET target_ip=?,dns_checked_at=?,dns_resolved_at=?,dns_error=NULL WHERE id=? AND target_host=? AND target_ip=? AND target_port=? AND deleted_at IS NULL AND enabled=1")
+                let result=sqlx::query("UPDATE rules SET target_ip=?,dns_checked_at=?,dns_resolved_at=?,dns_error=NULL,dns_blocked=0 WHERE id=? AND target_host=? AND target_ip=? AND target_port=? AND deleted_at IS NULL AND enabled=1")
                     .bind(&ip).bind(now()).bind(now()).bind(id).bind(&host).bind(&old_ip).bind(port).execute(&mut *tx).await?;
                 (
-                    result.rows_affected() > 0 && ip != old_ip,
-                    "rule_dns_updated",
+                    result.rows_affected() > 0 && (ip != old_ip || was_blocked),
+                    if was_blocked {
+                        "rule_dns_restored"
+                    } else {
+                        "rule_dns_updated"
+                    },
                 )
             }
             Err(error) => {
                 let stop = error.code == "target_denied" || now().saturating_sub(resolved_at) > 900;
-                let result=sqlx::query("UPDATE rules SET dns_checked_at=?,dns_error=?,enabled=CASE WHEN ? THEN 0 ELSE enabled END WHERE id=? AND target_host=? AND target_ip=? AND target_port=? AND deleted_at IS NULL AND enabled=1")
+                let result=sqlx::query("UPDATE rules SET dns_checked_at=?,dns_error=?,dns_blocked=CASE WHEN ? THEN 1 ELSE dns_blocked END WHERE id=? AND target_host=? AND target_ip=? AND target_port=? AND deleted_at IS NULL AND enabled=1")
                     .bind(now()).bind(error.message).bind(stop).bind(id).bind(&host).bind(&old_ip).bind(port).execute(&mut *tx).await?;
-                (result.rows_affected() > 0 && stop, "rule_dns_blocked")
+                (
+                    result.rows_affected() > 0 && stop && !was_blocked,
+                    "rule_dns_blocked",
+                )
             }
         };
         if changed {
             crate::api::enqueue_apply(&mut tx, owner).await?;
-            let user: crate::models::DbUser = sqlx::query_as("SELECT * FROM users WHERE id=?")
-                .bind(owner)
-                .fetch_one(&mut *tx)
-                .await?;
-            crate::api::record_audit(&mut tx, &user, action, Some(id)).await?;
+            crate::api::record_system_audit(&mut tx, action, id).await?;
         }
         tx.commit().await?;
     }
@@ -124,8 +126,25 @@ async fn receive_failures(pool: &SqlitePool, driver: &SocketDriver) -> anyhow::R
     if events.is_empty() {
         return Ok(());
     }
+    record_runtime_failures(pool, &events).await?;
+    driver
+        .acknowledge(
+            &events
+                .iter()
+                .map(|event| (event.owner, event.revision))
+                .collect::<Vec<_>>(),
+        )
+        .await
+}
+
+/// Persist broker failures separately from transport outages; backoff is scoped
+/// to consecutive crashes of the currently authorized revision.
+pub async fn record_runtime_failures(
+    pool: &SqlitePool,
+    events: &[crate::broker::Failure],
+) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-    for event in &events {
+    for event in events {
         let existing: Option<(i64,String)> = sqlx::query_as("SELECT retry_count,status FROM runtime_states WHERE owner_id=? AND revision=? AND revision=(SELECT desired_revision FROM users WHERE id=?)")
             .bind(event.owner).bind(event.revision).bind(event.owner).fetch_optional(&mut *tx).await?;
         let Some((retries, status)) = existing else {
@@ -135,7 +154,7 @@ async fn receive_failures(pool: &SqlitePool, driver: &SocketDriver) -> anyhow::R
             continue;
         }
         let retry_at = (event.retryable && retries < 3).then(|| now() + (10_i64 << retries.min(3)));
-        sqlx::query("UPDATE runtime_states SET status='failed',last_error=?,updated_at=?,retry_count=?,retry_at=? WHERE owner_id=? AND revision=?")
+        sqlx::query("UPDATE runtime_states SET status='failed',healthy_since=NULL,last_error=?,updated_at=?,retry_count=?,retry_at=? WHERE owner_id=? AND revision=?")
             .bind(&event.message).bind(now()).bind(retries+ i64::from(retry_at.is_some())).bind(retry_at).bind(event.owner).bind(event.revision).execute(&mut *tx).await?;
         sqlx::query("UPDATE apply_jobs SET status='failed' WHERE owner_id=? AND revision=?")
             .bind(event.owner)
@@ -144,14 +163,7 @@ async fn receive_failures(pool: &SqlitePool, driver: &SocketDriver) -> anyhow::R
             .await?;
     }
     tx.commit().await?;
-    driver
-        .acknowledge(
-            &events
-                .iter()
-                .map(|event| (event.owner, event.revision))
-                .collect::<Vec<_>>(),
-        )
-        .await
+    Ok(())
 }
 
 pub async fn run(policy_path: &Path) -> anyhow::Result<()> {
@@ -202,7 +214,15 @@ pub async fn run(policy_path: &Path) -> anyhow::Result<()> {
                             refresh_dns(&pool,&local_ips,|host,port| {let ips=local_ips.clone();async move {crate::rules::resolve_host(&host,port,&ips).await}}).await
                         }.await;
                         if let Err(error) = tick {
-                            let transient = error.downcast_ref::<sqlx::Error>().is_some_and(transient_database)
+                            if error.downcast_ref::<crate::broker::BrokerUnavailable>().is_some() {
+                                // An outage breaks the observed healthy window,
+                                // even when the DB still says the last plan was active.
+                                if let Err(database)=sqlx::query("UPDATE runtime_states SET healthy_since=NULL WHERE status='active' AND healthy_since IS NOT NULL").execute(&pool).await {
+                                    tracing::warn!(%database,"cannot clear stability window during broker outage");
+                                }
+                            }
+                            let transient = error.downcast_ref::<crate::broker::BrokerUnavailable>().is_some()
+                                || error.downcast_ref::<sqlx::Error>().is_some_and(transient_database)
                                 || matches!(error.downcast_ref::<ReconcileError>(),Some(ReconcileError::Database(error)) if transient_database(error))
                                 || error.downcast_ref::<crate::error::ApiError>().is_some_and(|error|error.code=="busy");
                             if !transient { return Err(error.context("database worker failed")); }

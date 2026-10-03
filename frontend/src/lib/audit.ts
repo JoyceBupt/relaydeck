@@ -15,8 +15,9 @@ const phrases: Record<string, { verb: string; category: AuditCategory; self?: bo
   rule_created: { verb: '创建了转发', category: 'rule' },
   rule_updated: { verb: '修改了转发', category: 'rule' },
   rule_deleted: { verb: '删除了转发', category: 'rule' },
-  rule_dns_updated: { verb: '更新了目标解析', category: 'rule' },
-  rule_dns_blocked: { verb: '因解析失败停用了', category: 'rule' },
+  rule_dns_updated: { verb: '目标地址已刷新', category: 'rule' },
+  rule_dns_restored: { verb: '目标已恢复', category: 'rule' },
+  rule_dns_blocked: { verb: '目标已阻断', category: 'rule' },
   user_created: { verb: '创建了账户', category: 'account' },
   user_updated: { verb: '调整了账户授权', category: 'account' },
   password_reset: { verb: '重置了账户密码', category: 'account' },
@@ -30,5 +31,5 @@ export function describeAudit(entry: Audit) {
     port: entry.resource_port,
     to: entry.resource_kind === 'rule' && entry.action !== 'rule_deleted' ? `/rules/${entry.resource_id}` : entry.resource_kind === 'user' ? `/accounts/${entry.resource_id}` : null,
   }
-  return { verb: phrase.verb, category: phrase.category, object }
+  return { verb: entry.failure_count > 0 ? `${phrase.verb}（${entry.failure_count} 次）` : phrase.verb, category: phrase.category, object }
 }

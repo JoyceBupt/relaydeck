@@ -18,7 +18,7 @@ const retry = useRetry()
 const ports = usePorts(computed(() => (isAdmin.value ? null : currentUser.value?.id)))
 
 const all = computed(() => rules.data.value ?? [])
-const statusOrder: RuntimeStatus[] = ['active', 'pending', 'failed', 'stopped']
+const statusOrder: RuntimeStatus[] = ['active', 'pending', 'failed', 'blocked', 'stopped']
 const counts = computed(() => statusOrder.map(status => ({ status, count: all.value.filter(rule => rule.runtime_status === status).length })))
 const statuses = computed(() => Object.fromEntries(all.value.map(rule => [rule.id, { name: rule.name, status: rule.runtime_status }])))
 
@@ -35,7 +35,7 @@ const expiring = computed(() => (users.data.value ?? []).filter(user => user.rol
 const full = computed(() => (users.data.value ?? []).filter(user => user.role === 'user' && user.enabled && user.max_rules > 0 && user.rule_count >= user.max_rules))
 const executor = computed(() => health.data.value?.executor)
 const attentionCount = computed(() => failedOwners.value.length + (isAdmin.value ? expiring.value.length + full.value.length : 0) + (executor.value && executor.value !== 'running' ? 1 : 0))
-const meterTone: Record<RuntimeStatus, string> = { active: 'is-ok', pending: 'is-warn', failed: 'is-bad', stopped: '' }
+const meterTone: Record<RuntimeStatus, string> = { active: 'is-ok', pending: 'is-warn', failed: 'is-bad', blocked: 'is-bad', stopped: '' }
 const meterRules = computed(() => [...all.value].sort((a, b) => statusOrder.indexOf(a.runtime_status) - statusOrder.indexOf(b.runtime_status)))
 const tenants = computed(() => (users.data.value ?? []).filter(user => user.role === 'user'))
 function tenantTone(index: number) {

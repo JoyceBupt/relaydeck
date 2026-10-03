@@ -222,6 +222,12 @@ impl RuntimePlan {
         self.rules.is_empty()
     }
 
+    pub fn rule_json(&self, id: i64) -> Result<Vec<u8>, serde_json::Error> {
+        let mut single = self.clone();
+        single.rules.retain(|rule| rule.id == id);
+        single.realm_json()
+    }
+
     pub fn realm_json(&self) -> Result<Vec<u8>, serde_json::Error> {
         #[derive(Serialize)]
         struct Network {
@@ -264,12 +270,31 @@ impl RuntimePlan {
 #[error("{message}")]
 pub struct DriverError {
     pub message: String,
+    pub retryable: bool,
+    pub crashed: bool,
 }
 
 impl DriverError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            retryable: false,
+            crashed: false,
+        }
+    }
+
+    pub fn crashed(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: true,
+            crashed: true,
+        }
+    }
+    pub fn temporary(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: true,
+            crashed: false,
         }
     }
 }
@@ -307,6 +332,8 @@ pub enum ReconcileError {
     Owner,
     #[error("runtime could not be stopped: {0}")]
     Stop(String),
+    #[error("broker temporarily unavailable: {0}")]
+    Temporary(String),
 }
 
 pub struct Reconciler<D: ExecutorDriver> {
@@ -356,7 +383,7 @@ async fn load_plan(
     let available = user.enabled && user.expires_at.is_none_or(|expiry| expiry > timestamp);
     let raw_rules = if available {
         sqlx::query_as::<_, PlanRule>(
-            "SELECT id,listen_port,target_ip,target_port,protocol,source_cidrs,enabled FROM rules WHERE owner_id=? AND deleted_at IS NULL ORDER BY id LIMIT 31",
+            "SELECT id,listen_port,target_ip,target_port,protocol,source_cidrs,(enabled=1 AND dns_blocked=0) AS enabled FROM rules WHERE owner_id=? AND deleted_at IS NULL ORDER BY id LIMIT 31",
         )
         .bind(owner_id)
         .fetch_all(&mut **tx)
@@ -472,17 +499,6 @@ impl<D: ExecutorDriver> Reconciler<D> {
         .await?)
     }
 
-    pub async fn startup_owners(&self) -> Result<Vec<i64>, ReconcileError> {
-        // A restart gets one bounded retry of each desired configuration,
-        // including failed jobs. Routine polling never retries a failed job.
-        Ok(sqlx::query_scalar(
-            "SELECT id FROM users WHERE desired_revision>0 OR EXISTS (SELECT 1 FROM runtime_states s WHERE s.owner_id=users.id) ORDER BY CASE WHEN enabled=0 OR (expires_at IS NOT NULL AND expires_at<=?) THEN 0 ELSE 1 END,id",
-        )
-        .bind(now())
-        .fetch_all(&self.pool)
-        .await?)
-    }
-
     pub async fn reconcile_owner(&self, owner_id: i64) -> Result<ReconcileOutcome, ReconcileError> {
         if owner_id <= 0 {
             return Err(ReconcileError::Owner);
@@ -491,7 +507,10 @@ impl<D: ExecutorDriver> Reconciler<D> {
         let mut runtime_changed = false;
         let result = self.reconcile_locked(owner_id, &mut runtime_changed).await;
         let untouched_busy = matches!(&result,Err(ReconcileError::Database(error)) if !runtime_changed && crate::worker::transient_database(error));
-        if result.is_err() && !untouched_busy {
+        if result.is_err()
+            && !untouched_busy
+            && !matches!(&result, Err(ReconcileError::Temporary(_)))
+        {
             // A failed DB read/finalization may conceal a revocation. Keep the
             // runtime stopped rather than continuing an unconfirmed revision.
             // Stop implementations are idempotent and must be cancellation-safe.
@@ -542,9 +561,23 @@ impl<D: ExecutorDriver> Reconciler<D> {
         };
         let result = match result {
             Ok(result) => result,
-            Err(_) => Err(DriverError::new("executor operation timed out")),
+            Err(_) => {
+                self.confirm_stop(owner_id).await?;
+                Err(DriverError::temporary("executor operation timed out"))
+            }
         };
         if let Err(error) = result {
+            if error.retryable {
+                // Keep the desired job pending. The root-owned lease stops an
+                // unconfirmed runtime even while the broker socket is absent.
+                let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+                sqlx::query("UPDATE apply_jobs SET status='pending' WHERE owner_id=? AND revision=? AND revision=(SELECT desired_revision FROM users WHERE id=?)")
+                    .bind(owner_id).bind(revision).bind(owner_id).execute(&mut *tx).await?;
+                sqlx::query("UPDATE runtime_states SET status='pending',last_error=?,healthy_since=NULL WHERE owner_id=? AND revision=?")
+                    .bind(&error.message).bind(owner_id).bind(revision).execute(&mut *tx).await?;
+                tx.commit().await?;
+                return Err(ReconcileError::Temporary(error_message(error)));
+            }
             let stopped = self.confirm_stop(owner_id).await;
             self.mark_failure(owner_id, revision, error_message(error))
                 .await?;
@@ -569,11 +602,12 @@ impl<D: ExecutorDriver> Reconciler<D> {
             .bind(revision)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("INSERT INTO runtime_states(owner_id,revision,status,last_error,updated_at) VALUES(?,?,?,NULL,?) ON CONFLICT(owner_id) DO UPDATE SET revision=excluded.revision,status=excluded.status,last_error=NULL,updated_at=excluded.updated_at")
+        sqlx::query("INSERT INTO runtime_states(owner_id,revision,status,last_error,updated_at,healthy_since) VALUES(?,?,?,NULL,?,?) ON CONFLICT(owner_id) DO UPDATE SET revision=excluded.revision,status=excluded.status,last_error=NULL,updated_at=excluded.updated_at,retry_at=NULL,retry_count=CASE WHEN runtime_states.revision!=excluded.revision OR (runtime_states.status='active' AND runtime_states.healthy_since<=excluded.updated_at-300) THEN 0 ELSE runtime_states.retry_count END,healthy_since=CASE WHEN excluded.status!='active' THEN NULL WHEN runtime_states.status='active' AND runtime_states.revision=excluded.revision THEN COALESCE(runtime_states.healthy_since,excluded.healthy_since) ELSE excluded.healthy_since END")
             .bind(owner_id)
             .bind(revision)
             .bind(if plan.stopped() { "stopped" } else { "active" })
             .bind(now())
+            .bind((!plan.stopped()).then(now))
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM port_leases WHERE owner_id=? AND NOT EXISTS (SELECT 1 FROM rules r WHERE r.id=port_leases.rule_id AND r.deleted_at IS NULL AND r.listen_port=port_leases.port)")
@@ -598,8 +632,11 @@ impl<D: ExecutorDriver> Reconciler<D> {
     async fn confirm_stop(&self, owner_id: i64) -> Result<(), ReconcileError> {
         match tokio::time::timeout(self.timeout, self.driver.stop(owner_id)).await {
             Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) if error.retryable => {
+                Err(ReconcileError::Temporary(error_message(error)))
+            }
             Ok(Err(error)) => Err(ReconcileError::Stop(error_message(error))),
-            Err(_) => Err(ReconcileError::Stop("executor stop timed out".into())),
+            Err(_) => Err(ReconcileError::Temporary("executor stop timed out".into())),
         }
     }
 
@@ -623,7 +660,7 @@ impl<D: ExecutorDriver> Reconciler<D> {
                 .bind(revision)
                 .execute(&mut *tx)
                 .await?;
-            sqlx::query("INSERT INTO runtime_states(owner_id,revision,status,last_error,updated_at) VALUES(?,?,'failed',?,?) ON CONFLICT(owner_id) DO UPDATE SET revision=excluded.revision,status='failed',last_error=excluded.last_error,updated_at=excluded.updated_at")
+            sqlx::query("INSERT INTO runtime_states(owner_id,revision,status,last_error,updated_at) VALUES(?,?,'failed',?,?) ON CONFLICT(owner_id) DO UPDATE SET revision=excluded.revision,status='failed',last_error=excluded.last_error,updated_at=excluded.updated_at,healthy_since=NULL")
                 .bind(owner_id)
                 .bind(revision)
                 .bind(message)

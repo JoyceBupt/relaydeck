@@ -225,6 +225,7 @@ const runtime = computed(() => {
   if (!value) return null
   switch (value.runtime_status) {
     case 'active': return { title: '运行中', detail: value.runtime_updated_at ? `${relative(value.runtime_updated_at)}同步` : '' }
+    case 'blocked': return { title: '已阻断', detail: '' }
     case 'stopped': return { title: '已停用', detail: '' }
     case 'failed': return { title: '生效失败', detail: '该账户的转发已暂停' }
     default: return {

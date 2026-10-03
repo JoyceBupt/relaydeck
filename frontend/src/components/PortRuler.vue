@@ -72,6 +72,7 @@ const tone: Record<Cell['kind'], string> = {
   active: 'bg-[var(--meter-ok)]',
   pending: 'bg-[var(--meter-warn)]',
   failed: 'bg-[var(--meter-bad)]',
+  blocked: 'bg-[var(--meter-bad)] border border-dashed border-surface',
   stopped: 'bg-faint/50',
 }
 </script>

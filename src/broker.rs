@@ -1,5 +1,7 @@
 use crate::executor::{DriverError, DriverFuture, ExecutorDriver, RuntimePlan};
-use anyhow::{Context, ensure};
+#[cfg(target_os = "linux")]
+use anyhow::Context;
+use anyhow::ensure;
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
@@ -35,6 +37,8 @@ pub struct Failure {
 #[serde(deny_unknown_fields)]
 struct Reply {
     error: Option<String>,
+    #[serde(default)]
+    retryable: bool,
     events: Vec<Failure>,
 }
 
@@ -66,6 +70,21 @@ async fn write_frame<T: Serialize>(
     Ok(())
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("broker temporarily unavailable: {0}")]
+pub struct BrokerUnavailable(pub String);
+
+fn transport(error: std::io::Error) -> anyhow::Error {
+    BrokerUnavailable(error.to_string()).into()
+}
+fn driver_error(error: anyhow::Error) -> DriverError {
+    if error.downcast_ref::<BrokerUnavailable>().is_some() {
+        DriverError::temporary(error.to_string())
+    } else {
+        DriverError::new(error.to_string())
+    }
+}
+
 pub struct SocketDriver {
     path: PathBuf,
 }
@@ -78,18 +97,33 @@ impl SocketDriver {
         let operation = async {
             let mut stream = tokio::net::UnixStream::connect(&self.path)
                 .await
-                .context("connect to root broker")?;
+                .map_err(transport)?;
             ensure!(stream.peer_cred()?.uid() == 0, "broker peer must be root");
-            write_frame(&mut stream, &request).await?;
-            let reply: Reply = read_frame(&mut stream).await?;
+            write_frame(&mut stream, &request).await.map_err(|error| {
+                if error.downcast_ref::<std::io::Error>().is_some() {
+                    BrokerUnavailable(error.to_string()).into()
+                } else {
+                    error
+                }
+            })?;
+            let reply: Reply = read_frame(&mut stream).await.map_err(|error| {
+                if error.downcast_ref::<std::io::Error>().is_some() {
+                    BrokerUnavailable(error.to_string()).into()
+                } else {
+                    error
+                }
+            })?;
             if let Some(error) = &reply.error {
+                if reply.retryable {
+                    return Err(BrokerUnavailable(error.clone()).into());
+                }
                 anyhow::bail!("root broker: {error}");
             }
             Ok(reply)
         };
         tokio::time::timeout(Duration::from_secs(35), operation)
             .await
-            .context("broker request timed out")?
+            .map_err(|_| BrokerUnavailable("request timed out".into()))?
     }
     #[cfg(not(unix))]
     async fn request(&self, _request: Request) -> anyhow::Result<Reply> {
@@ -110,7 +144,7 @@ impl ExecutorDriver for SocketDriver {
             self.request(Request::Apply(plan.clone()))
                 .await
                 .map(|_| ())
-                .map_err(|e| DriverError::new(e.to_string()))
+                .map_err(driver_error)
         })
     }
     fn stop(&self, owner: i64) -> DriverFuture<'_> {
@@ -118,7 +152,7 @@ impl ExecutorDriver for SocketDriver {
             self.request(Request::Stop(owner))
                 .await
                 .map(|_| ())
-                .map_err(|e| DriverError::new(e.to_string()))
+                .map_err(driver_error)
         })
     }
 }
@@ -182,6 +216,7 @@ pub async fn run(policy_path: &Path) -> anyhow::Result<()> {
         let mut leases: BTreeMap<i64, (i64, i64)> = BTreeMap::new();
         let mut events: BTreeMap<i64, Failure> = BTreeMap::new();
         let mut blocked: BTreeMap<i64, i64> = BTreeMap::new();
+        let mut stopping = std::collections::BTreeSet::new();
         let mut interval = tokio::time::interval(Duration::from_secs(10));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut terminate =
@@ -202,10 +237,16 @@ pub async fn run(policy_path: &Path) -> anyhow::Result<()> {
                                 Request::Apply(plan) => {
                                     ensure!(!plan.stopped(),"empty plans must use the stop operation");
                                     ensure!(blocked.get(&plan.owner_id()).is_none_or(|revision| plan.revision() > *revision), "runtime requires a fresh authorized revision");
+                                    if stopping.contains(&plan.owner_id()) {
+                                        if let Err(error) = driver.stop(plan.owner_id()).await { reply.retryable=true; return Err(error.into()); }
+                                        stopping.remove(&plan.owner_id());
+                                    }
                                     if let Err(error) = driver.apply(&plan).await {
+                                        reply.retryable=error.retryable;
+                                        if error.crashed {events.insert(plan.owner_id(),Failure{owner:plan.owner_id(),revision:plan.revision(),message:error.message.clone(),retryable:true});}
                                         let cleanup = driver.stop(plan.owner_id()).await;
                                         leases.remove(&plan.owner_id());
-                                        cleanup.context("failed apply cleanup")?;
+                                        if let Err(cleanup) = cleanup { stopping.insert(plan.owner_id()); reply.retryable=true; return Err(anyhow::anyhow!(cleanup).context("failed apply cleanup")); }
                                         return Err(anyhow::anyhow!(error));
                                     }
                                     driver.renew_authorization(&plan)?;
@@ -213,7 +254,7 @@ pub async fn run(policy_path: &Path) -> anyhow::Result<()> {
                                     blocked.remove(&plan.owner_id());
                                     events.remove(&plan.owner_id());
                                 }
-                                Request::Stop(owner) => { driver.stop(owner).await?; leases.remove(&owner); }
+                                Request::Stop(owner) => { leases.remove(&owner); if let Err(error)=driver.stop(owner).await { stopping.insert(owner); reply.retryable=true; return Err(error.into()); } stopping.remove(&owner); }
                                 Request::Inspect => { reply.events = events.values().cloned().collect(); }
                                 Request::Acknowledge(ack) => {
                                     ensure!(ack.len() <= policy.max_owners as usize,"too many acknowledgements");
@@ -226,15 +267,21 @@ pub async fn run(policy_path: &Path) -> anyhow::Result<()> {
                         let _ = tokio::time::timeout(Duration::from_secs(3),write_frame(&mut stream,&reply)).await;
                     }
                     _ = interval.tick() => {
+                        for owner in stopping.clone() {
+                            match driver.stop(owner).await {
+                                Ok(()) => { stopping.remove(&owner); }
+                                Err(error) => tracing::warn!(owner,%error,"tenant stop remains pending"),
+                            }
+                        }
                         let expired: Vec<_> = leases.iter().filter(|(_,(_,until))|*until<=crate::db::now()).map(|(owner,(revision,_))|(*owner,*revision)).collect();
                         for (owner,revision) in expired {
-                            driver.stop(owner).await.context("cannot stop stale authorization")?;
-                            leases.remove(&owner); blocked.insert(owner,revision);
-                            events.insert(owner,Failure{owner,revision,message:"运行授权已过期".into(),retryable:false});
+                            leases.remove(&owner);
+                            if let Err(error)=driver.stop(owner).await { tracing::error!(owner,%error,"stale tenant isolated; stop will be retried"); stopping.insert(owner); }
+                            events.insert(owner,Failure{owner,revision,message:"运行授权已过期".into(),retryable:true});
                         }
                         for (owner,revision,message,retryable) in driver.unhealthy_owners().await {
-                            driver.stop(owner).await.context("cannot stop unhealthy runtime")?;
                             leases.remove(&owner);
+                            if let Err(error)=driver.stop(owner).await { tracing::error!(owner,%error,"unhealthy tenant isolated; stop will be retried"); stopping.insert(owner); }
                             if !retryable { blocked.insert(owner,revision); }
                             events.insert(owner,Failure{owner,revision,message,retryable});
                         }

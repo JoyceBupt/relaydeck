@@ -40,6 +40,18 @@ async fn main() -> anyhow::Result<()> {
         )
         .await;
     }
+    if let [command, realm, config, expires_at, uid, revision] = arguments.as_slice()
+        && command == "tenant-plan"
+    {
+        return relaydeck::tenant::run_plan(
+            std::path::Path::new(realm),
+            std::path::Path::new(config),
+            expires_at.parse()?,
+            uid.parse()?,
+            revision.parse()?,
+        )
+        .await;
+    }
     if let [command, path] = arguments.as_slice()
         && command == "worker"
     {

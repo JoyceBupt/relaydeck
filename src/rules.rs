@@ -24,7 +24,7 @@ use crate::{
 
 static DNS_SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(4)));
 const MAX_DNS_RESULTS: usize = 32;
-const RULE_SELECT: &str = "SELECT r.id,r.owner_id,u.username AS owner_username,r.name,r.listen_port,r.target_host,r.target_ip,r.target_port,r.protocol,r.source_cidrs,r.enabled,r.created_at,r.updated_at,r.dns_error,CASE WHEN s.revision=u.desired_revision AND s.status='failed' THEN 'failed' WHEN e.status IS NULL OR e.status!='running' OR e.last_seen<=unixepoch()-10 THEN 'pending' WHEN s.revision!=u.desired_revision OR u.applied_revision!=u.desired_revision THEN 'pending' WHEN s.status='stopped' THEN 'stopped' WHEN s.status='active' AND r.enabled=0 THEN 'stopped' WHEN s.status='active' AND u.enabled=1 AND (u.expires_at IS NULL OR u.expires_at>unixepoch()) THEN 'active' ELSE 'pending' END AS runtime_status,CASE WHEN s.revision=u.desired_revision AND s.status='failed' THEN s.last_error END AS runtime_error,s.updated_at AS runtime_updated_at FROM rules r JOIN users u ON u.id=r.owner_id LEFT JOIN runtime_states s ON s.owner_id=u.id LEFT JOIN executor_status e ON e.id=1";
+const RULE_SELECT: &str = "SELECT r.id,r.owner_id,u.username AS owner_username,r.name,r.listen_port,r.target_host,r.target_ip,r.target_port,r.protocol,r.source_cidrs,r.enabled,r.created_at,r.updated_at,r.dns_error,CASE WHEN r.enabled=0 OR u.enabled=0 OR (u.expires_at IS NOT NULL AND u.expires_at<=unixepoch()) THEN 'stopped' WHEN r.dns_blocked=1 THEN 'blocked' WHEN s.revision=u.desired_revision AND s.status='failed' THEN 'failed' WHEN e.status IS NULL OR e.status!='running' OR e.last_seen<=unixepoch()-10 THEN 'pending' WHEN s.revision!=u.desired_revision OR u.applied_revision!=u.desired_revision THEN 'pending' WHEN s.status='stopped' THEN 'stopped' WHEN s.status='active' AND r.enabled=0 THEN 'stopped' WHEN s.status='active' AND u.enabled=1 AND (u.expires_at IS NULL OR u.expires_at>unixepoch()) THEN 'active' ELSE 'pending' END AS runtime_status,CASE WHEN s.revision=u.desired_revision AND s.status='failed' THEN s.last_error END AS runtime_error,s.updated_at AS runtime_updated_at FROM rules r JOIN users u ON u.id=r.owner_id LEFT JOIN runtime_states s ON s.owner_id=u.id LEFT JOIN executor_status e ON e.id=1";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -460,7 +460,7 @@ async fn update_rule(
     validate_owner_rule(&state, &owner, &input)?;
     check_enabled_quota(&mut *tx, &owner, id, input.enabled).await?;
     check_lease(&mut *tx, input.listen_port, owner.id, Some(id)).await?;
-    sqlx::query("UPDATE rules SET name=?,listen_port=?,target_host=?,target_ip=?,target_port=?,protocol=?,source_cidrs=?,enabled=?,updated_at=?,dns_checked_at=unixepoch(),dns_resolved_at=unixepoch(),dns_error=NULL WHERE id=? AND deleted_at IS NULL")
+    sqlx::query("UPDATE rules SET name=?,listen_port=?,target_host=?,target_ip=?,target_port=?,protocol=?,source_cidrs=?,enabled=?,updated_at=?,dns_checked_at=unixepoch(),dns_resolved_at=unixepoch(),dns_error=NULL,dns_blocked=0 WHERE id=? AND deleted_at IS NULL")
         .bind(&input.name)
         .bind(input.listen_port)
         .bind(&input.target_host)

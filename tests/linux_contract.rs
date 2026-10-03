@@ -92,11 +92,11 @@ fn systemd_has_fixed_nonroot_identity_expiry_and_limits() {
         "NoNewPrivileges=yes\n",
         "CapabilityBoundingSet=\n",
         "MemoryMax=64M\n",
-        "TasksMax=16\n",
+        "TasksMax=96\n",
         "SocketBindDeny=any\n",
-        "SocketBindAllow=tcp:41000\n",
-        "SocketBindAllow=udp:41000\n",
-        "ExecStart=/usr/local/libexec/relaydeck tenant /usr/local/libexec/realm /var/lib/relaydeck-runtime/owner-2/realm.json 2000 60001 2\n",
+        "SocketBindAllow=tcp:41000-41009\n",
+        "SocketBindAllow=udp:41000-41009\n",
+        "ExecStart=/usr/local/libexec/relaydeck tenant-plan /usr/local/libexec/realm /var/lib/relaydeck-runtime/owner-2/plan.json 2000 60001 2\n",
         "Slice=relaydeck.slice\n",
     ] {
         assert!(unit.contains(required), "missing {required}");
@@ -320,4 +320,28 @@ fn udp_readiness_accepts_ephemeral_upstream_sockets_but_stop_requires_none() {
     let extra_tcp = HashSet::from([("tcp", 41000), ("tcp", 52001), ("udp", 41000)]);
     assert!(validate_runtime_listeners(Some(&plan), &extra_tcp).is_err());
     assert!(validate_runtime_listeners(None, &HashSet::new()).is_ok());
+}
+
+#[test]
+fn managed_ports_must_be_reserved_from_outbound_auto_allocation() {
+    use relaydeck::linux::validate_reserved_ports;
+    assert!(validate_reserved_ports("8080,40000-60000\n", 40000, 60000).is_ok());
+    assert!(validate_reserved_ports("40000-49999,50001-60000", 40000, 60000).is_err());
+    assert!(validate_reserved_ports("", 40000, 60000).is_err());
+    assert!(validate_reserved_ports("60000-40000", 40000, 60000).is_err());
+}
+
+#[test]
+fn supervisor_rejects_insufficient_process_budget_before_startup() {
+    let mut policy = policy();
+    policy.limits.tasks = 16;
+    assert!(
+        policy
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("64..256")
+    );
+    policy.limits.tasks = 96;
+    assert!(policy.validate().is_ok());
 }

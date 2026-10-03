@@ -15,6 +15,10 @@ impl Limits {
         }
     }
 
+    pub fn reset(&mut self, key: &str) {
+        self.entries.remove(key);
+    }
+
     pub fn admit(&mut self, key: String, maximum: u32, timestamp: i64) -> bool {
         self.entries
             .retain(|_, (start, _)| timestamp.saturating_sub(*start) < 60);

@@ -1148,7 +1148,7 @@ async fn mfa_failures_lock_totp_across_restart_but_recovery_still_works() {
             .unwrap();
     assert_eq!(failures, 0);
     let audited: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE action='login_mfa_failed'")
+        sqlx::query_scalar("SELECT COALESCE(SUM(count),0) FROM authentication_failures WHERE action='login_mfa_failed'")
             .fetch_one(&f.state.pool)
             .await
             .unwrap();
@@ -1261,7 +1261,8 @@ async fn ddns_refresh_revalidates_targets_and_retains_leases_until_stop() {
         .await
         .unwrap();
     let (_, _, rules) = call(&f.app, "GET", "/api/rules", None, Some(&f.admin), false).await;
-    assert_eq!(rules[0]["enabled"], false);
+    assert_eq!(rules[0]["enabled"], true);
+    assert_eq!(rules[0]["runtime_status"], "blocked");
     assert!(rules[0]["dns_error"].is_string());
     let leased: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM port_leases WHERE rule_id=?")
         .bind(id)
@@ -1269,6 +1270,25 @@ async fn ddns_refresh_revalidates_targets_and_retains_leases_until_stop() {
         .await
         .unwrap();
     assert_eq!(leased, 1);
+    let (_, _, audit) = call(&f.app, "GET", "/api/audit", None, Some(&f.admin), false).await;
+    let blocked = audit
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["action"] == "rule_dns_blocked")
+        .unwrap();
+    assert_eq!(blocked["actor_username"], "系统");
+    sqlx::query("UPDATE rules SET dns_checked_at=0 WHERE id=?")
+        .bind(id)
+        .execute(&f.state.pool)
+        .await
+        .unwrap();
+    relaydeck::worker::refresh_dns(&f.state.pool, &[], |_, _| async { Ok("1.1.1.1".into()) })
+        .await
+        .unwrap();
+    let (_, _, rules) = call(&f.app, "GET", "/api/rules", None, Some(&f.admin), false).await;
+    assert!(rules[0]["dns_error"].is_null());
+    assert_ne!(rules[0]["runtime_status"], "blocked");
 }
 
 #[tokio::test]
@@ -1352,4 +1372,116 @@ async fn ipv6_rotation_within_one_subnet_cannot_bypass_network_limit() {
             }
         );
     }
+}
+
+async fn login_from(app: &Router, ip: &str, password: &str) -> StatusCode {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/login")
+        .header(header::ORIGIN, ORIGIN)
+        .header(header::CONTENT_TYPE, "application/json")
+        .extension(axum::extract::ConnectInfo(
+            format!("{ip}:12345")
+                .parse::<std::net::SocketAddr>()
+                .unwrap(),
+        ))
+        .body(Body::from(
+            json!({"username":"adminroot","password":password}).to_string(),
+        ))
+        .unwrap();
+    app.clone().oneshot(request).await.unwrap().status()
+}
+
+#[tokio::test]
+async fn one_network_cannot_lock_admin_elsewhere_and_success_resets_pair_budget() {
+    let f = Fixture::new().await;
+    for _ in 0..8 {
+        assert_eq!(
+            login_from(&f.app, "192.0.2.10", "wrong").await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        login_from(&f.app, "192.0.2.10", ADMIN_PASSWORD).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        login_from(&f.app, "192.0.2.11", ADMIN_PASSWORD).await,
+        StatusCode::OK
+    );
+    for _ in 0..7 {
+        assert_eq!(
+            login_from(&f.app, "192.0.2.11", "wrong").await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        login_from(&f.app, "192.0.2.11", ADMIN_PASSWORD).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        login_from(&f.app, "192.0.2.11", "wrong").await,
+        StatusCode::UNAUTHORIZED
+    );
+    // Exhaust the account-wide failed-credential budget across many networks.
+    for index in 30..47 {
+        for _ in 0..8 {
+            login_from(&f.app, &format!("192.0.2.{index}"), "wrong").await;
+        }
+    }
+    assert_eq!(
+        login_from(&f.app, "192.0.2.90", ADMIN_PASSWORD).await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn failed_logins_are_aggregated_without_evicting_operation_audit() {
+    let f = Fixture::new().await;
+    sqlx::query("DELETE FROM audit_events")
+        .execute(&f.state.pool)
+        .await
+        .unwrap();
+    sqlx::query("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<10000) INSERT INTO audit_events(actor_id,actor_username,action,created_at) SELECT 1,'adminroot','password_changed',x FROM n").execute(&f.state.pool).await.unwrap();
+    for ip in ["192.0.2.20", "192.0.2.21"] {
+        for _ in 0..8 {
+            assert_eq!(
+                login_from(&f.app, ip, "wrong").await,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+    }
+    let retained: (i64, i64) = sqlx::query_as("SELECT COUNT(*),MIN(id) FROM audit_events")
+        .fetch_one(&f.state.pool)
+        .await
+        .unwrap();
+    assert_eq!(retained, (10000, 1));
+    let summary: (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*),SUM(count) FROM authentication_failures WHERE action='login_failed'",
+    )
+    .fetch_one(&f.state.pool)
+    .await
+    .unwrap();
+    assert!((1..=2).contains(&summary.0));
+    assert_eq!(summary.1, 16);
+    let (_, _, audit) = call(&f.app, "GET", "/api/audit", None, Some(&f.admin), false).await;
+    assert_eq!(
+        audit
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["action"] == "password_changed")
+            .count(),
+        200
+    );
+    assert_eq!(
+        audit
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["action"] == "login_failed")
+            .map(|e| e["failure_count"].as_i64().unwrap())
+            .sum::<i64>(),
+        16
+    );
 }

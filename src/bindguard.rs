@@ -243,6 +243,28 @@ mod linux {
             Ok(guard)
         }
 
+        pub fn replace(&self, plan: &RuntimePlan, path: &Path) -> anyhow::Result<Self> {
+            // Multi-attached bind filters intersect. Attach the new restriction
+            // before removing the old one; there is no unfiltered bind window.
+            let new = Self::attach(plan, path)?;
+            let group = cgroup(path)?;
+            for (program, kind) in self.programs.iter().zip([8, 9]) {
+                syscall(
+                    9,
+                    &mut Attach {
+                        target: group.as_raw_fd() as u32,
+                        program: program.as_raw_fd() as u32,
+                        kind,
+                        flags: 0,
+                        replace: 0,
+                    },
+                )
+                .context("detach previous bind guard")?;
+            }
+            new.verify(path)?;
+            Ok(new)
+        }
+
         pub fn verify(&self, path: &Path) -> anyhow::Result<()> {
             let group = cgroup(path)?;
             for (index, kind) in [8, 9].into_iter().enumerate() {
@@ -260,10 +282,6 @@ mod linux {
                 ensure!(
                     attrs.count <= 64 && ids[..attrs.count as usize].contains(&self.ids[index]),
                     "bind guard was detached or replaced"
-                );
-                ensure!(
-                    self.programs[index].as_raw_fd() >= 0,
-                    "bind guard descriptor lost"
                 );
             }
             Ok(())

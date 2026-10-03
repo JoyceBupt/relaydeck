@@ -34,6 +34,7 @@ async function beginMfa() {
     if (epoch !== sessionState.epoch) return
     Object.assign(mfa, { password: '', secret: enrollment.secret, uri: enrollment.otpauth_uri })
     mfaStep.value = 'scan'
+    mfaBusy.value = false
     await nextTick()
     codeInput.value?.focus()
   } catch (error) { if (!isStaleError(error)) mfaError.value = errorMessage(error) } finally { mfaBusy.value = false }
