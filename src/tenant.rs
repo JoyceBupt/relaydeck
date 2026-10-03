@@ -286,6 +286,7 @@ impl Children {
                         && old.target_ip == new.target_ip
                         && old.target_port == new.target_port
                         && old.protocol == new.protocol
+                        && old.source_cidrs == new.source_cidrs
                 })
             })
             .map(|(id, _)| *id)

@@ -204,6 +204,17 @@ class Recovery(unittest.TestCase):
         request('apply',plan(1,6,'8.8.43.21'))
         with connection(41000) as recovered:
             echo(recovered)
+            # Tightening a source ACL must also revoke accepted connections.
+            acl=plan(1,7,'8.8.43.21')
+            acl['rules'][0]['source_cidrs']=['8.8.43.11/32']
+            with connection(41001) as unaffected:
+                request('apply',acl)
+                recovered.settimeout(3)
+                self.assertEqual(recovered.recv(4096),b'')
+                echo(unaffected)
+            request('apply',plan(1,8,'8.8.43.21'))
+            with connection(41000) as restored:
+                echo(restored)
 
 
 if __name__ == '__main__':
