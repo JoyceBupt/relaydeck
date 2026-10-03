@@ -19,10 +19,8 @@ const state = computed(() => {
 <template>
   <TooltipRoot>
     <TooltipTrigger as-child>
-      <span class="inline-flex items-center gap-2 rounded-full px-2 py-1 text-xs text-muted" tabindex="0" :aria-label="`${state.text}。${state.help}`">
-        <span class="relative flex size-2">
-          <span class="relative size-2 rounded-full" :class="state.tone" />
-        </span>
+      <span :class="props.compact ? 'px-2 py-1' : 'border border-line bg-surface px-2.5 py-1 shadow-[var(--shadow-card)]'" class="inline-flex items-center gap-2 rounded-full text-xs text-muted" tabindex="0" :aria-label="`${state.text}。${state.help}`">
+        <span class="size-2 rounded-full" :class="state.tone" />
         <span v-if="!props.compact">{{ state.text }}</span>
       </span>
     </TooltipTrigger>

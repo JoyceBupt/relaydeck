@@ -149,17 +149,17 @@ const expiryInfo = computed(() => (user.value ? expiry(user.value.expires_at) : 
 </script>
 
 <template>
-  <SideDrawer :open="open" :title="isNew ? '新建账户' : user?.username ?? '账户'" :description="isNew ? '为租户分配端口段、规则额度和有效期。' : user ? `ID ${user.id} · 租户` : undefined" @close="requestClose" @before-close="onBeforeClose">
-    <div v-if="missing" class="rounded-lg border border-line px-4 py-8 text-center text-muted">账户不存在</div>
+  <SideDrawer :open="open" :title="isNew ? '新建账户' : user?.username ?? '账户'" :description="isNew ? '为租户分配端口段、规则额度和有效期。' : user ? `ID ${user.id} · ${user.role === 'admin' ? '管理员' : '租户'}` : undefined" @close="requestClose" @before-close="onBeforeClose">
+    <div v-if="missing" class="well px-4 py-8 text-center text-muted">账户不存在</div>
     <div v-else class="grid gap-6">
       <section v-if="user" class="grid gap-3">
         <div class="flex flex-wrap gap-1.5">
-          <span class="chip" :class="user.enabled ? 'bg-success-soft text-success' : ''">{{ user.enabled ? '已启用' : '已停用' }}</span>
-          <span v-if="expiryInfo" class="chip" :class="expiryInfo.tone === 'soon' ? 'bg-warning-soft text-warning' : expiryInfo.tone === 'expired' ? 'bg-danger-soft text-danger' : ''">{{ expiryInfo.text }}</span>
-          <span class="chip" :class="user.mfa_enabled ? 'bg-accent-soft text-accent' : ''"><ShieldCheck class="size-3" />{{ user.mfa_enabled ? '已开双因素' : '未开双因素' }}</span>
-          <span v-if="user.must_change_password" class="chip">待修改初始密码</span>
+          <span class="chip" :class="user.enabled ? 'chip-green' : ''">{{ user.enabled ? '已启用' : '已停用' }}</span>
+          <span v-if="expiryInfo" class="chip" :class="expiryInfo.tone === 'soon' ? 'chip-amber' : expiryInfo.tone === 'expired' ? 'chip-red' : ''">{{ expiryInfo.text }}</span>
+          <span class="chip" :class="user.mfa_enabled ? 'chip-blue' : ''"><ShieldCheck class="size-3" />{{ user.mfa_enabled ? '已开双因素' : '未开双因素' }}</span>
+          <span v-if="user.must_change_password" class="chip chip-violet">待修改初始密码</span>
         </div>
-        <div v-if="failed.length" class="flex items-start gap-2.5 rounded-lg border border-danger/40 bg-danger-soft p-3 text-sm">
+        <div v-if="failed.length" class="flex items-start gap-2.5 rounded-xl border border-danger/30 bg-danger-soft p-3 text-sm">
           <TriangleAlert class="mt-0.5 size-4 text-danger" aria-hidden="true" />
           <div class="min-w-0 flex-1">
             <p class="font-medium text-danger">{{ failed.length }} 条转发生效失败</p>
@@ -219,7 +219,7 @@ const expiryInfo = computed(() => (user.value ? expiry(user.value.expires_at) : 
           </div>
         </div>
 
-        <div v-if="!isNew && user?.role !== 'admin'" class="flex items-center justify-between gap-4 rounded-lg border border-line px-3.5 py-3">
+        <div v-if="!isNew && user?.role !== 'admin'" class="well flex items-center justify-between gap-4 px-3.5 py-3">
           <div>
             <p class="font-medium">启用账户</p>
             <p class="text-xs text-muted">停用后无法登录，名下转发全部停止。</p>
@@ -227,11 +227,11 @@ const expiryInfo = computed(() => (user.value ? expiry(user.value.expires_at) : 
           <UiSwitch v-model="form.enabled" label="启用账户" />
         </div>
 
-        <p v-if="affected > 0" class="flex items-start gap-2 rounded-md bg-warning-soft px-3 py-2 text-sm text-fg" role="status">
+        <p v-if="affected > 0" class="flex items-start gap-2 rounded-lg bg-warning-soft px-3 py-2 text-sm text-fg" role="status">
           <TriangleAlert class="mt-0.5 size-4 text-warning" aria-hidden="true" />保存后会停用 {{ affected }} 条超出新授权的转发。
         </p>
         <p v-if="!isNew && dirty" class="field-hint">保存授权会让该账户的现有登录失效。</p>
-        <p v-if="serverError" class="rounded-md bg-danger-soft px-3 py-2 text-sm text-danger" role="alert">{{ serverError }}</p>
+        <p v-if="serverError" class="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger" role="alert">{{ serverError }}</p>
       </form>
     </div>
 

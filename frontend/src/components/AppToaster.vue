@@ -10,7 +10,7 @@ function onOpen(id: number, open: boolean) { if (!open) dismissToast(id) }
   <ToastProvider :duration="5000" swipe-direction="right" label="通知">
     <ToastRoot
       v-for="item in toasts" :key="item.id" :open="item.open" :type="item.tone === 'danger' ? 'foreground' : 'background'" :duration="item.action ? 9000 : 5000"
-      class="anim-toast pop pointer-events-auto flex w-full items-start gap-3 px-3.5 py-3"
+      class="anim-toast pop pointer-events-auto flex w-full items-start gap-3 !rounded-2xl px-4 py-3.5"
       @update:open="onOpen(item.id, $event)"
     >
       <CircleAlert v-if="item.tone === 'danger'" class="mt-0.5 size-4 text-danger" aria-hidden="true" />

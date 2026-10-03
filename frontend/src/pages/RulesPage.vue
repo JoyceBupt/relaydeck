@@ -3,7 +3,7 @@ import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useEventListener } from '@vueuse/core'
 import { DropdownMenuContent, DropdownMenuItem, DropdownMenuPortal, DropdownMenuRoot, DropdownMenuSeparator, DropdownMenuTrigger } from 'reka-ui'
-import { ArrowRightLeft, Copy, Ellipsis, LayoutList, LayoutGrid, Pencil, Plus, RotateCw, Search, Trash2, X } from '@lucide/vue'
+import { ArrowRightLeft, Copy, Ellipsis, Plus, RotateCw, Search, Trash2, X } from '@lucide/vue'
 import StatusMark from '../components/StatusMark.vue'
 import RuleEndpoint from '../components/RuleEndpoint.vue'
 import Segmented from '../components/Segmented.vue'
@@ -15,8 +15,8 @@ import { api, ruleInput } from '../api/endpoints'
 import { errorMessage, isStaleError } from '../api/client'
 import type { Rule, RuntimeStatus, ViewMode } from '../types'
 import { acceptSession, currentUser, isAdmin, sessionState } from '../lib/session'
-import { afterRuleChange, reportError, sharedToggle, useHealth, useRetry, useRules, useUsers } from '../lib/queries'
-import { protocolLabels, sourcesText, statusLabels } from '../lib/format'
+import { afterRuleChange, reportError, sharedToggle, useHealth, useRules, useUsers } from '../lib/queries'
+import { hostText, protocolLabels, sourcesText, statusLabels } from '../lib/format'
 import { toast } from '../lib/toast'
 
 const route = useRoute()
@@ -25,7 +25,6 @@ const rules = useRules()
 const users = useUsers()
 const health = useHealth()
 const toggle = sharedToggle()
-const retry = useRetry()
 
 type Filter = 'all' | RuntimeStatus
 const filter = computed<Filter>({
@@ -137,6 +136,8 @@ async function confirmDelete() {
   } catch (error) { reportError(error, '删除失败') } finally { deleteBusy.value = false; await afterRuleChange() }
 }
 
+const cardTone: Record<RuntimeStatus, string> = { active: 'chip-green', pending: 'chip-amber', failed: 'chip-red', stopped: '' }
+
 const searchInput = ref<HTMLInputElement | null>(null)
 useEventListener(window, 'relaydeck:focus-search', () => searchInput.value?.focus())
 onMounted(async () => {
@@ -150,11 +151,11 @@ const cloneSource = computed(() => (route.name === 'rule-new' && route.query.fro
   <div>
     <div class="flex flex-wrap items-end justify-between gap-4">
       <div class="min-w-0">
-        <h1 class="text-2xl font-semibold tracking-[-0.02em]">转发</h1>
+        <h1 class="page-title">转发</h1>
         <p class="mt-1 text-muted tabular">{{ rules.isLoading.value ? '正在读取…' : subtitle }}</p>
       </div>
       <button type="button" class="btn btn-primary" @click="newRule">
-        <Plus class="size-4" />新建转发<span class="kbd ml-1 border-transparent bg-white/15 text-current max-md:hidden">N</span>
+        <Plus class="size-4" />新建转发
       </button>
     </div>
 
@@ -166,15 +167,14 @@ const cloneSource = computed(() => (route.name === 'rule-new' && route.query.fro
       </select>
       <label class="relative ml-auto w-full sm:w-64">
         <span class="sr-only">搜索转发</span>
-        <Search class="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-faint" aria-hidden="true" />
-        <input ref="searchInput" v-model="search" type="search" class="input pr-8 pl-8" placeholder="搜索名称、端口或目标" @keydown.esc="search = ''; ($event.target as HTMLInputElement).blur()" />
-        <span class="kbd pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 max-md:hidden" :class="search ? 'invisible' : ''">/</span>
+        <Search class="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-faint" aria-hidden="true" />
+        <input ref="searchInput" v-model="search" type="search" class="input pl-9" placeholder="搜索名称、端口或目标" @keydown.esc="search = ''; ($event.target as HTMLInputElement).blur()" />
       </label>
       <Segmented :model-value="viewMode" label="显示方式" size="sm" :disabled="savingView" :options="[{ value: 'table', label: '列表' }, { value: 'cards', label: '卡片' }]" class="max-md:hidden" @update:model-value="setView($event as ViewMode)" />
     </div>
 
     <section class="mt-4" aria-label="转发列表">
-      <div v-if="rules.isLoading.value" class="panel divide-y divide-line overflow-hidden" aria-busy="true">
+      <div v-if="rules.isLoading.value" class="panel group-list overflow-hidden" aria-busy="true">
         <div v-for="index in 5" :key="index" class="flex items-center gap-4 px-4 py-4"><span class="skeleton size-3.5 rounded-full" /><span class="skeleton h-4 w-40" /><span class="skeleton h-4 w-56 max-md:hidden" /><span class="skeleton ml-auto h-5 w-9 rounded-full" /></div>
       </div>
 
@@ -198,31 +198,37 @@ const cloneSource = computed(() => (route.name === 'rule-new' && route.query.fro
       </div>
 
       <div v-else-if="viewMode === 'cards'" class="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-        <article v-for="rule in visible" :key="rule.id" class="panel flex min-w-0 flex-col p-4 transition-colors duration-150 hover:border-line-strong">
-          <div class="flex items-center justify-between gap-3">
-            <StatusMark :status="rule.runtime_status" label />
+        <article v-for="rule in visible" :key="rule.id" class="panel flex min-w-0 flex-col gap-3 p-4 transition-colors duration-200 hover:border-line-strong">
+          <div class="flex items-start justify-between gap-3">
+            <div class="min-w-0">
+              <RouterLink :to="{ path: `/rules/${rule.id}`, query: route.query }" class="block truncate text-base font-semibold hover:text-accent">{{ rule.name }}</RouterLink>
+              <div class="mt-1.5 flex flex-wrap gap-1.5">
+                <span class="chip" :class="cardTone[rule.runtime_status]"><StatusMark :status="rule.runtime_status" />{{ statusLabels[rule.runtime_status] }}</span>
+                <span class="chip chip-blue">{{ protocolLabels[rule.protocol] }}</span>
+                <span v-if="isAdmin" class="chip chip-violet">{{ rule.owner_username }}</span>
+              </div>
+            </div>
             <UiSwitch :model-value="rule.enabled" :label="`${rule.enabled ? '停用' : '启用'}「${rule.name}」`" :disabled="toggle.isPending.value" @update:model-value="toggle.mutate({ rule, enabled: $event })" />
           </div>
-          <RouterLink :to="{ path: `/rules/${rule.id}`, query: route.query }" class="mt-3 truncate font-medium hover:underline hover:underline-offset-4">{{ rule.name }}</RouterLink>
-          <RuleEndpoint class="mt-1.5" :port="rule.listen_port" :host="rule.target_host" :target-port="rule.target_port" :resolved="rule.target_ip" />
-          <p v-if="rule.runtime_error" class="mt-2 line-clamp-2 font-mono text-xs text-danger">{{ rule.runtime_error }}</p>
-          <dl class="mt-4 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 border-t border-line pt-3 text-xs">
-            <template v-if="isAdmin"><dt class="text-muted">账户</dt><dd class="truncate">{{ rule.owner_username }}</dd></template>
-            <dt class="text-muted">协议</dt><dd>{{ protocolLabels[rule.protocol] }}</dd>
+          <dl class="well grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1.5 px-3 py-2.5 text-sm">
+            <dt class="text-muted">入口</dt><dd class="font-medium tabular">{{ rule.listen_port }}</dd>
+            <dt class="text-muted">落地</dt><dd class="truncate tabular" :title="rule.target_ip !== rule.target_host ? rule.target_ip : undefined">{{ hostText(rule.target_host) }}:{{ rule.target_port }}</dd>
             <dt class="text-muted">来源</dt><dd class="truncate">{{ sourcesText(rule.source_cidrs) }}</dd>
           </dl>
+          <p v-if="rule.runtime_error" class="line-clamp-2 font-mono text-xs text-danger">{{ rule.runtime_error }}</p>
+          <p v-else-if="rule.dns_error" class="line-clamp-2 text-xs text-warning">目标解析失败：{{ rule.dns_error }}</p>
         </article>
       </div>
 
       <div v-else class="panel overflow-hidden">
-        <div class="grid grid-cols-[1.25rem_minmax(9rem,1.1fr)_minmax(13rem,1.6fr)_6rem_minmax(7rem,1fr)_2.25rem_2rem] items-center gap-x-4 border-b border-line bg-surface-2/60 px-4 py-2 text-xs font-medium text-muted max-md:hidden">
+        <div class="grid grid-cols-[1.25rem_minmax(9rem,1.1fr)_minmax(13rem,1.6fr)_6rem_minmax(7rem,1fr)_2.25rem_2rem] items-center gap-x-4 border-b border-line px-4 pt-3 pb-2 text-xs text-muted max-md:hidden">
           <input type="checkbox" class="size-4 accent-[var(--accent)]" :checked="allSelected" :indeterminate="selected.size > 0 && !allSelected" aria-label="全选当前列表" @change="toggleAll" />
           <span>名称</span><span>入口 → 落地</span><span>协议</span><span>来源</span><span class="sr-only">启用</span><span class="sr-only">操作</span>
         </div>
-        <ul class="divide-y divide-line">
+        <ul class="group-list">
           <li
             v-for="rule in visible" :key="rule.id"
-            class="group relative grid cursor-pointer items-center gap-x-4 px-4 py-3 transition-colors duration-150 hover:bg-surface-2/60 md:grid-cols-[1.25rem_minmax(9rem,1.1fr)_minmax(13rem,1.6fr)_6rem_minmax(7rem,1fr)_2.25rem_2rem] max-md:grid-cols-[minmax(0,1fr)_auto] max-md:gap-y-1"
+            class="group relative grid cursor-pointer items-center gap-x-4 px-4 py-3 transition-colors duration-150 hover:bg-fill/60 md:grid-cols-[1.25rem_minmax(9rem,1.1fr)_minmax(13rem,1.6fr)_6rem_minmax(7rem,1fr)_2.25rem_2rem] max-md:grid-cols-[minmax(0,1fr)_auto] max-md:gap-y-1"
             :class="selected.has(rule.id) ? 'bg-accent-soft/50' : ''" @click="openRule(rule)"
           >
             <input type="checkbox" class="size-4 accent-[var(--accent)] max-md:hidden" :checked="selected.has(rule.id)" :aria-label="`选择「${rule.name}」`" @click.stop @change="toggleSelected(rule.id)" />
@@ -230,8 +236,9 @@ const cloneSource = computed(() => (route.name === 'rule-new' && route.query.fro
               <StatusMark :status="rule.runtime_status" />
               <div class="min-w-0">
                 <RouterLink :to="{ path: `/rules/${rule.id}`, query: route.query }" class="block truncate font-medium text-fg" @click.stop>{{ rule.name }}</RouterLink>
-                <p class="truncate text-xs" :class="rule.runtime_error ? 'text-danger' : 'text-muted'">
+                <p class="truncate text-xs" :class="rule.runtime_error ? 'text-danger' : rule.dns_error ? 'text-warning' : 'text-muted'">
                   <template v-if="rule.runtime_status === 'failed'">失败{{ rule.runtime_error ? `：${rule.runtime_error}` : '' }}</template>
+                  <template v-else-if="rule.dns_error">{{ rule.enabled ? '目标解析异常' : '因目标解析失败已停用' }}{{ isAdmin ? ` · ${rule.owner_username}` : '' }}</template>
                   <template v-else>{{ statusLabels[rule.runtime_status] }}{{ isAdmin ? ` · ${rule.owner_username}` : '' }}</template>
                 </p>
               </div>
@@ -247,9 +254,7 @@ const cloneSource = computed(() => (route.name === 'rule-new' && route.query.fro
                 <DropdownMenuTrigger class="btn btn-ghost btn-sm btn-icon opacity-70 group-hover:opacity-100 data-[state=open]:opacity-100" :aria-label="`「${rule.name}」的更多操作`"><Ellipsis class="size-4" /></DropdownMenuTrigger>
                 <DropdownMenuPortal>
                   <DropdownMenuContent align="end" :side-offset="4" class="anim-pop pop">
-                    <DropdownMenuItem class="pop-item" @select="openRule(rule)"><Pencil class="size-4 text-muted" />编辑</DropdownMenuItem>
                     <DropdownMenuItem class="pop-item" @select="duplicate(rule)"><Copy class="size-4 text-muted" />复制为新转发</DropdownMenuItem>
-                    <DropdownMenuItem v-if="rule.runtime_status === 'failed'" class="pop-item" @select="retry.mutate(rule.owner_id)"><RotateCw class="size-4 text-muted" />重试生效</DropdownMenuItem>
                     <DropdownMenuSeparator class="pop-sep" />
                     <DropdownMenuItem class="pop-item is-danger" @select="deleting = rule"><Trash2 class="size-4" />删除</DropdownMenuItem>
                   </DropdownMenuContent>

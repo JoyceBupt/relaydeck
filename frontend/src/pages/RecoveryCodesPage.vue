@@ -35,7 +35,7 @@ async function finish() {
 
 <template>
   <AuthFrame title="保存恢复码" description="丢失认证器时，可以用这些恢复码登录，每组只能用一次。它们只显示这一次，请存进密码管理器或打印出来。" wide>
-    <ol class="grid grid-cols-2 gap-x-6 gap-y-2 rounded-xl border border-line bg-surface p-4 font-mono text-sm tabular max-sm:grid-cols-1" aria-label="恢复码">
+    <ol class="grid grid-cols-2 gap-x-6 gap-y-2 well p-4 font-mono text-sm tabular max-sm:grid-cols-1" aria-label="恢复码">
       <li v-for="(code, index) in codes" :key="code" class="flex gap-2 [overflow-wrap:anywhere]"><span class="w-4 text-right text-faint">{{ index + 1 }}</span>{{ code }}</li>
     </ol>
     <div class="mt-3 flex gap-2">

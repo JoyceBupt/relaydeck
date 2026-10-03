@@ -7,7 +7,7 @@ import PortRuler from '../components/PortRuler.vue'
 import type { RuntimeStatus } from '../types'
 import { currentUser, isAdmin } from '../lib/session'
 import { useAudit, useHealth, usePorts, useRetry, useRules, useUsers } from '../lib/queries'
-import { expiry, relative, statusLabels } from '../lib/format'
+import { expiry, MAX_TENANTS, relative, statusLabels } from '../lib/format'
 import { describeAudit } from '../lib/audit'
 
 const rules = useRules()
@@ -35,6 +35,15 @@ const expiring = computed(() => (users.data.value ?? []).filter(user => user.rol
 const full = computed(() => (users.data.value ?? []).filter(user => user.role === 'user' && user.enabled && user.max_rules > 0 && user.rule_count >= user.max_rules))
 const executor = computed(() => health.data.value?.executor)
 const attentionCount = computed(() => failedOwners.value.length + (isAdmin.value ? expiring.value.length + full.value.length : 0) + (executor.value && executor.value !== 'running' ? 1 : 0))
+const meterTone: Record<RuntimeStatus, string> = { active: 'is-ok', pending: 'is-warn', failed: 'is-bad', stopped: '' }
+const meterRules = computed(() => [...all.value].sort((a, b) => statusOrder.indexOf(a.runtime_status) - statusOrder.indexOf(b.runtime_status)))
+const tenants = computed(() => (users.data.value ?? []).filter(user => user.role === 'user'))
+function tenantTone(index: number) {
+  const user = tenants.value[index]
+  if (!user) return ''
+  if (!user.enabled || expiry(user.expires_at).tone === 'expired') return 'is-bad'
+  return expiry(user.expires_at).tone === 'soon' ? 'is-warn' : 'is-on'
+}
 const myExpiry = computed(() => (currentUser.value ? expiry(currentUser.value.expires_at) : null))
 const recent = computed(() => (audit.data.value ?? []).slice(0, 6).map(entry => ({ entry, ...describeAudit(entry) })))
 const greeting = computed(() => {
@@ -47,7 +56,7 @@ const greeting = computed(() => {
   <div class="grid grid-cols-[minmax(0,1fr)] gap-8">
     <div class="flex flex-wrap items-end justify-between gap-4">
       <div>
-        <h1 class="text-2xl font-semibold tracking-[-0.02em]">{{ greeting }}，{{ currentUser?.username }}</h1>
+        <h1 class="page-title">{{ greeting }}，{{ currentUser?.username }}</h1>
         <p class="mt-1 text-muted">
           <template v-if="rules.isLoading.value">正在读取状态…</template>
           <template v-else-if="attentionCount">有 {{ attentionCount }} 件事需要处理。</template>
@@ -58,21 +67,41 @@ const greeting = computed(() => {
       <RouterLink to="/rules/new" class="btn btn-primary"><Plus class="size-4" />新建转发</RouterLink>
     </div>
 
-    <!-- One horizontal status strip rather than a wall of metric tiles. -->
-    <section aria-label="转发状态" class="grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-line bg-line sm:grid-cols-4">
-      <RouterLink
-        v-for="item in counts" :key="item.status" :to="{ path: '/rules', query: { status: item.status } }"
-        class="flex items-center justify-between gap-3 bg-surface px-4 py-3.5 transition-colors duration-150 hover:bg-surface-2"
-      >
-        <StatusMark :status="item.status" label :text="statusLabels[item.status]" />
-        <span class="font-mono text-sm font-medium tabular" :class="item.status === 'failed' && item.count ? 'text-danger' : 'text-fg'">{{ item.count }}</span>
+    <!-- Summary cards: a big number, then one meter block per item, as in the LuminaPlus overview. -->
+    <section aria-label="概况" class="grid grid-cols-[minmax(0,1fr)] gap-3 sm:grid-cols-2">
+      <RouterLink to="/rules" class="panel flex flex-col gap-3 p-4 transition-colors duration-200 hover:border-line-strong">
+        <span class="stat-label">转发运行</span>
+        <span><span class="stat-value">{{ counts[0].count }}</span><span class="stat-unit">/ {{ all.length }} 条</span></span>
+        <span class="meter" aria-hidden="true">
+          <span v-for="rule in meterRules" :key="rule.id" :class="meterTone[rule.runtime_status]" />
+          <span v-if="!all.length" />
+        </span>
+        <span class="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted">
+          <span v-for="item in counts.slice(1)" :key="item.status" class="tabular">{{ statusLabels[item.status] }} <span class="font-medium" :class="item.status === 'failed' && item.count ? 'text-danger' : 'text-fg'">{{ item.count }}</span></span>
+        </span>
       </RouterLink>
+      <RouterLink v-if="isAdmin" to="/accounts" class="panel flex flex-col gap-3 p-4 transition-colors duration-200 hover:border-line-strong">
+        <span class="stat-label">租户</span>
+        <span><span class="stat-value">{{ tenants.length }}</span><span class="stat-unit">/ {{ MAX_TENANTS }} 个</span></span>
+        <span class="meter" aria-hidden="true">
+          <span v-for="index in MAX_TENANTS" :key="index" :class="tenantTone(index - 1)" />
+        </span>
+        <span class="text-xs text-muted">{{ expiring.length ? `${expiring.length} 个即将或已经到期` : '没有即将到期的账户' }}</span>
+      </RouterLink>
+      <div v-else class="panel flex flex-col gap-3 p-4">
+        <span class="stat-label">规则额度</span>
+        <span><span class="stat-value">{{ currentUser?.rule_count ?? 0 }}</span><span class="stat-unit">/ {{ currentUser?.max_rules ?? 0 }} 条</span></span>
+        <span class="meter" aria-hidden="true">
+          <span v-for="index in Math.max(currentUser?.max_rules ?? 0, 1)" :key="index" :class="index <= (currentUser?.rule_count ?? 0) ? 'is-on' : ''" />
+        </span>
+        <span class="text-xs" :class="myExpiry?.tone === 'soon' ? 'text-warning' : myExpiry?.tone === 'expired' ? 'text-danger' : 'text-muted'">{{ myExpiry?.text }}</span>
+      </div>
     </section>
 
     <section aria-labelledby="attention-title">
-      <h2 id="attention-title" class="mb-3 text-sm font-semibold">需要处理</h2>
+      <h2 id="attention-title" class="group-title">需要处理</h2>
       <div v-if="rules.isLoading.value" class="panel p-4"><div class="skeleton h-5 w-1/2" /></div>
-      <ul v-else-if="attentionCount" class="panel divide-y divide-line">
+      <ul v-else-if="attentionCount" class="panel group-list">
         <li v-if="executor && executor !== 'running'" class="flex items-start gap-3 px-4 py-3.5">
           <ServerOff class="mt-0.5 size-4 text-danger" aria-hidden="true" />
           <div class="min-w-0 flex-1">
@@ -117,25 +146,21 @@ const greeting = computed(() => {
 
     <div class="grid grid-cols-[minmax(0,1fr)] gap-8 lg:grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)]">
       <section v-if="!isAdmin && currentUser" aria-labelledby="grant-title">
-        <h2 id="grant-title" class="mb-3 text-sm font-semibold">我的授权</h2>
-        <div class="panel grid gap-4 p-4">
-          <dl class="grid grid-cols-3 gap-4 text-sm max-sm:grid-cols-1">
-            <div><dt class="text-muted">端口段</dt><dd class="mt-0.5 font-mono font-medium tabular">{{ currentUser.port_start }}–{{ currentUser.port_end }}</dd></div>
-            <div><dt class="text-muted">规则额度</dt><dd class="mt-0.5 font-medium tabular">{{ currentUser.rule_count }} / {{ currentUser.max_rules }}</dd></div>
-            <div><dt class="text-muted">有效期</dt><dd class="mt-0.5 font-medium" :class="myExpiry?.tone === 'soon' ? 'text-warning' : myExpiry?.tone === 'expired' ? 'text-danger' : ''">{{ myExpiry?.text }}</dd></div>
-          </dl>
+        <h2 id="grant-title" class="group-title">我的端口</h2>
+        <div class="panel p-4">
           <PortRuler v-if="ports.data.value" :usage="ports.data.value" :statuses="statuses" />
+          <div v-else class="skeleton h-14" />
         </div>
       </section>
 
       <section aria-labelledby="rules-title">
-        <div class="mb-3 flex items-center justify-between">
-          <h2 id="rules-title" class="text-sm font-semibold">{{ isAdmin ? '最近更新的转发' : '我的转发' }}</h2>
-          <RouterLink to="/rules" class="flex items-center gap-1 text-sm font-medium text-muted hover:text-fg">全部<ArrowRight class="size-3.5" /></RouterLink>
+        <div class="mb-2 flex items-center justify-between">
+          <h2 id="rules-title" class="group-title !mb-0">{{ isAdmin ? '最近更新的转发' : '我的转发' }}</h2>
+          <RouterLink to="/rules" class="flex items-center gap-0.5 text-sm text-accent hover:opacity-80">全部<ArrowRight class="size-3.5" /></RouterLink>
         </div>
-        <ul v-if="all.length" class="panel divide-y divide-line">
+        <ul v-if="all.length" class="panel group-list">
           <li v-for="rule in [...all].sort((a, b) => b.updated_at - a.updated_at).slice(0, 6)" :key="rule.id">
-            <RouterLink :to="`/rules/${rule.id}`" class="flex items-center gap-3 px-4 py-3 transition-colors duration-150 hover:bg-surface-2/60">
+            <RouterLink :to="`/rules/${rule.id}`" class="flex items-center gap-3 px-4 py-3 transition-colors duration-200 hover:bg-fill/60">
               <StatusMark :status="rule.runtime_status" />
               <span class="min-w-0 flex-1">
                 <span class="block truncate font-medium">{{ rule.name }}</span>
@@ -149,11 +174,11 @@ const greeting = computed(() => {
       </section>
 
       <section v-if="isAdmin" aria-labelledby="activity-title">
-        <div class="mb-3 flex items-center justify-between">
-          <h2 id="activity-title" class="text-sm font-semibold">最近操作</h2>
-          <RouterLink to="/audit" class="flex items-center gap-1 text-sm font-medium text-muted hover:text-fg">审计<ArrowRight class="size-3.5" /></RouterLink>
+        <div class="mb-2 flex items-center justify-between">
+          <h2 id="activity-title" class="group-title !mb-0">最近操作</h2>
+          <RouterLink to="/audit" class="flex items-center gap-0.5 text-sm text-accent hover:opacity-80">审计<ArrowRight class="size-3.5" /></RouterLink>
         </div>
-        <ol v-if="recent.length" class="panel divide-y divide-line">
+        <ol v-if="recent.length" class="panel group-list">
           <li v-for="item in recent" :key="item.entry.id" class="px-4 py-3 text-sm">
             <p class="[overflow-wrap:anywhere]"><span class="font-medium">{{ item.entry.actor_username }}</span><span class="mx-1 text-muted">{{ item.verb }}</span><span v-if="item.object" class="font-medium">「{{ item.object.name }}」</span></p>
             <p class="mt-0.5 text-xs text-muted">{{ relative(item.entry.created_at) }}</p>

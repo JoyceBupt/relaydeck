@@ -1,3 +1,6 @@
+/** The executor provisions a fixed pool of runtime identities; one is the administrator. */
+export const MAX_TENANTS = 10
+
 import type { Protocol, Rule, RuntimeStatus } from '../types'
 
 const DAY = 86_400

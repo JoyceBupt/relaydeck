@@ -8,9 +8,9 @@ const model = defineModel<boolean>({ required: true })
 <template>
   <SwitchRoot
     v-model="model" :aria-label="label" :disabled="disabled"
-    class="relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border border-transparent bg-surface-3 transition-colors duration-150 data-[state=checked]:bg-accent disabled:opacity-50"
+    class="relative inline-flex h-[1.625rem] w-11 shrink-0 items-center rounded-full bg-surface-3 p-0.5 transition-colors duration-200 data-[state=checked]:bg-[var(--switch-on)] disabled:opacity-50"
     @click.stop
   >
-    <SwitchThumb class="block size-4 translate-x-0.5 rounded-full bg-white shadow-[0_1px_2px_rgb(0_0_0/0.3)] transition-transform duration-150 data-[state=checked]:translate-x-[1.125rem]" />
+    <SwitchThumb class="block size-[1.375rem] rounded-full bg-white shadow-[0_2px_4px_rgb(0_0_0/0.2),0_0_0_0.5px_rgb(0_0_0/0.04)] transition-transform duration-200 ease-[var(--ease-out)] data-[state=checked]:translate-x-[1.125rem]" />
   </SwitchRoot>
 </template>

@@ -52,7 +52,7 @@ async function signOut() {
         <input v-model="form.confirm" class="input" type="password" autocomplete="new-password" required :disabled="busy" :aria-invalid="!!confirmError" />
         <span v-if="confirmError" class="field-error">{{ confirmError }}</span>
       </label>
-      <p v-if="error" class="rounded-md bg-danger-soft px-3 py-2 text-sm text-danger" role="alert">{{ error }}</p>
+      <p v-if="error" class="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger" role="alert">{{ error }}</p>
       <button class="btn btn-primary mt-1 w-full" type="submit" :disabled="busy || !form.current || !form.next || !form.confirm">{{ busy ? '正在保存…' : '更新密码' }}</button>
       <button class="btn btn-ghost w-full" type="button" :disabled="busy" @click="signOut">退出登录</button>
     </form>

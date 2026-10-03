@@ -65,13 +65,13 @@ function pickFromTrack(event: MouseEvent) {
 }
 
 const tone: Record<Cell['kind'], string> = {
-  free: 'bg-surface-2 hover:bg-surface-3',
+  free: 'bg-[var(--meter-off)] hover:bg-line-strong',
   reserved: 'bg-transparent border border-dashed border-line-strong',
   releasing: 'bg-warning-soft border border-warning/60',
   own: 'bg-accent-soft border border-accent/60',
-  active: 'bg-success',
-  pending: 'bg-warning',
-  failed: 'bg-danger',
+  active: 'bg-[var(--meter-ok)]',
+  pending: 'bg-[var(--meter-warn)]',
+  failed: 'bg-[var(--meter-bad)]',
   stopped: 'bg-faint/50',
 }
 </script>
@@ -81,7 +81,7 @@ const tone: Record<Cell['kind'], string> = {
     <div v-if="discrete" class="grid grid-cols-[repeat(auto-fill,minmax(0.875rem,1fr))] gap-[3px]" role="group" :aria-label="`端口 ${usage.port_start}–${usage.port_end} 的占用情况`">
       <button
         v-for="cell in cells" :key="cell.port" type="button"
-        class="h-3.5 rounded-[3px] transition-colors duration-150 disabled:cursor-default"
+        class="h-3.5 rounded-[3.5px] transition-colors duration-150 disabled:cursor-default"
         :class="[tone[cell.kind], selected === cell.port ? '!bg-accent ring-2 ring-accent/30' : '']"
         :title="cell.title" :aria-label="cell.title" :aria-pressed="selected === cell.port"
         :disabled="!interactive || !available(cell.port)"
@@ -89,7 +89,7 @@ const tone: Record<Cell['kind'], string> = {
       />
     </div>
     <div
-      v-else class="relative h-7 rounded-md bg-surface-2" :class="interactive ? 'cursor-crosshair' : ''"
+      v-else class="relative h-7 rounded-lg bg-[var(--meter-off)]" :class="interactive ? 'cursor-crosshair' : ''"
       role="img" :aria-label="`端口 ${usage.port_start}–${usage.port_end}，已占用 ${usage.leases.length} 个`" @click="pickFromTrack"
     >
       <span

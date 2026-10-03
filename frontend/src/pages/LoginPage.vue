@@ -90,7 +90,7 @@ async function toggleRecovery() {
         </label>
       </template>
 
-      <p v-if="error" class="rounded-md bg-danger-soft px-3 py-2 text-sm text-danger" role="alert">{{ error }}</p>
+      <p v-if="error" class="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger" role="alert">{{ error }}</p>
 
       <button class="btn btn-primary mt-1 w-full" type="submit" :disabled="busy || !form.username || (step === 'password' ? !form.password : !form.code)">
         {{ busy ? '正在验证…' : step === 'password' ? '登录' : '验证并登录' }}

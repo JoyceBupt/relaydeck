@@ -40,7 +40,7 @@ const options = computed(() => [
 
 <template>
   <div>
-    <h1 class="text-2xl font-semibold tracking-[-0.02em]">审计</h1>
+    <h1 class="page-title">审计</h1>
     <p class="mt-1 text-muted">最近 200 条操作记录，只有管理员可见。</p>
 
     <div class="mt-6 flex flex-wrap items-center gap-2">
@@ -53,7 +53,7 @@ const options = computed(() => [
     </div>
 
     <section class="mt-4" aria-label="操作记录">
-      <div v-if="audit.isLoading.value" class="panel divide-y divide-line">
+      <div v-if="audit.isLoading.value" class="panel group-list">
         <div v-for="index in 6" :key="index" class="flex items-center gap-4 px-4 py-3.5"><span class="skeleton h-4 w-10" /><span class="skeleton h-4 w-72" /></div>
       </div>
       <div v-else-if="audit.isError.value" class="panel px-6 py-10 text-center">
@@ -69,7 +69,7 @@ const options = computed(() => [
       <div v-else class="grid gap-6">
         <div v-for="[day, items] in groups" :key="day">
           <h2 class="mb-2 text-xs font-medium text-muted">{{ day }}</h2>
-          <ol class="panel divide-y divide-line">
+          <ol class="panel group-list">
             <li v-for="item in items" :key="item.entry.id" class="flex items-start gap-3 px-4 py-3">
               <time class="w-11 shrink-0 pt-px font-mono text-xs text-muted tabular" :datetime="new Date(item.entry.created_at * 1000).toISOString()" :title="dateTime(item.entry.created_at)">{{ clock(item.entry.created_at) }}</time>
               <component :is="icons[item.category]" class="mt-0.5 size-4 text-faint" aria-hidden="true" />

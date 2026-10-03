@@ -3,7 +3,7 @@ import { computed, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useSwipe } from '@vueuse/core'
 import { TagsInputInput, TagsInputItem, TagsInputItemDelete, TagsInputItemText, TagsInputRoot } from 'reka-ui'
-import { ChevronDown, ChevronUp, RotateCw, Trash2, X } from '@lucide/vue'
+import { RotateCw, Trash2, X } from '@lucide/vue'
 import SideDrawer from './SideDrawer.vue'
 import StatusMark from './StatusMark.vue'
 import PortRuler from './PortRuler.vue'
@@ -13,7 +13,7 @@ import ConfirmDialog from './ConfirmDialog.vue'
 import { errorMessage, isStaleError } from '../api/client'
 import type { Health, Protocol, Rule, RuleInput, User } from '../types'
 import { currentUser, isAdmin } from '../lib/session'
-import { useDeleteRule, usePorts, useRetry, useSaveRule } from '../lib/queries'
+import { sharedToggle, useDeleteRule, usePorts, useRetry, useSaveRule } from '../lib/queries'
 import { dateTime, expiry, hostText, protocolLabels, relative, ruleSentence } from '../lib/format'
 import { validateCidr, validatePort, validateRuleName, validateTargetHost } from '../lib/validation'
 import { toast } from '../lib/toast'
@@ -146,6 +146,7 @@ const sentence = computed(() => ruleSentence({ listen_port: form.listen_port, pr
 
 const save = useSaveRule()
 const remove = useDeleteRule()
+const toggle = sharedToggle()
 const retry = useRetry()
 
 async function submit() {
@@ -154,7 +155,8 @@ async function submit() {
   if (!valid.value || save.isPending.value) return
   const input: RuleInput = {
     name: form.name.trim(), listen_port: form.listen_port!, target_host: form.target_host.trim(), target_port: form.target_port!,
-    protocol: form.protocol, source_cidrs: form.sources, enabled: form.enabled,
+    // An existing rule's on/off state is switched live (with undo), never through this form.
+    protocol: form.protocol, source_cidrs: form.sources, enabled: rule.value ? rule.value.enabled : form.enabled,
   }
   if (isNew.value && isAdmin.value && form.owner_id) input.owner_id = form.owner_id
   try {
@@ -245,17 +247,11 @@ defineExpose({ dirty })
 
 <template>
   <SideDrawer :open="open" :title="isNew ? '新建转发' : rule?.name ?? '转发'" :description="isNew ? '把本机的一个端口转发到公网目标。' : rule ? `ID ${rule.id} · ${rule.owner_username}` : undefined" width="lg" @close="requestClose" @before-close="onBeforeClose">
-    <template v-if="!isNew && rule" #header-actions>
-      <div class="flex items-center">
-        <button type="button" class="btn btn-ghost btn-sm btn-icon" :disabled="position <= 0" aria-label="上一条（K）" title="上一条（K）" @click="step(-1)"><ChevronUp class="size-4" /></button>
-        <button type="button" class="btn btn-ghost btn-sm btn-icon" :disabled="position < 0 || position >= sequence.length - 1" aria-label="下一条（J）" title="下一条（J）" @click="step(1)"><ChevronDown class="size-4" /></button>
-      </div>
-    </template>
 
     <div ref="body" class="grid gap-6" @keydown="onKeydown">
-      <div v-if="missing" class="rounded-lg border border-line px-4 py-8 text-center text-muted">这条转发不存在，可能已被删除。</div>
+      <div v-if="missing" class="well px-4 py-8 text-center text-muted">这条转发不存在，可能已被删除。</div>
       <template v-else>
-        <section v-if="rule && runtime" aria-label="运行状态" class="rounded-lg border p-3.5" :class="rule.runtime_status === 'failed' ? 'border-danger/40 bg-danger-soft' : 'border-line bg-surface-2/60'">
+        <section v-if="rule && runtime" aria-label="运行状态" class="rounded-xl border p-3.5" :class="rule.runtime_status === 'failed' ? 'border-danger/30 bg-danger-soft' : 'border-line bg-surface-2'">
           <div class="flex items-center gap-2">
             <StatusMark :status="rule.runtime_status" />
             <span class="font-medium" :class="rule.runtime_status === 'failed' ? 'text-danger' : 'text-fg'">{{ runtime.title }}</span>
@@ -264,15 +260,15 @@ defineExpose({ dirty })
             </button>
           </div>
           <p class="mt-1.5 text-sm text-muted">{{ runtime.detail }}</p>
-          <p v-if="rule.runtime_error" class="mt-2 rounded-md bg-surface px-2.5 py-2 font-mono text-xs text-fg [overflow-wrap:anywhere]">执行器报告：{{ rule.runtime_error }}</p>
+          <p v-if="rule.runtime_error" class="mt-2 rounded-lg border border-line bg-surface px-2.5 py-2 font-mono text-xs text-fg [overflow-wrap:anywhere]">执行器报告：{{ rule.runtime_error }}</p>
+          <p v-if="rule.dns_error" class="mt-2 rounded-lg border border-warning/30 bg-warning-soft px-2.5 py-2 text-xs text-fg [overflow-wrap:anywhere]">目标解析失败：{{ rule.dns_error }}</p>
         </section>
 
-        <p class="rounded-lg bg-surface-2 px-3.5 py-3 text-sm leading-6 text-muted" aria-live="polite">
+        <p class="well px-3.5 py-3 text-sm leading-6 text-muted" aria-live="polite">
           访问本机 <span class="font-mono font-medium text-fg tabular">{{ sentence.port }}</span> 端口（{{ sentence.protocol }}，{{ sentence.sources }}）的流量，将被转发到
           <span class="font-mono font-medium text-fg [overflow-wrap:anywhere]">{{ sentence.target }}</span>。
         </p>
 
-        <p v-if="rule?.dns_error" class="field-error" role="alert">{{ rule.dns_error }}</p>
         <form id="rule-form" class="grid gap-5" novalidate @submit.prevent="submit">
           <label class="field">
             <span class="field-label">名称</span>
@@ -327,13 +323,13 @@ defineExpose({ dirty })
             <span id="rule-sources" class="field-label">来源限制</span>
             <TagsInputRoot
               v-model="form.sources" :add-on-paste="true" :add-on-blur="true" :delimiter="/[\s,]+/" :max="32"
-              class="flex min-h-9 flex-wrap items-center gap-1.5 rounded-md border border-line-strong bg-surface px-2 py-1.5 focus-within:border-accent focus-within:shadow-[0_0_0_3px_var(--accent-soft)]"
+              class="flex min-h-[2.375rem] flex-wrap items-center gap-1.5 rounded-[10px] border border-line bg-surface px-2 py-1.5 transition-[border-color,box-shadow] hover:border-line-strong focus-within:!border-accent focus-within:shadow-[0_0_0_4px_var(--accent-soft)]"
               aria-labelledby="rule-sources"
             >
               <TagsInputItem
                 v-for="item in form.sources" :key="item" :value="item"
-                class="inline-flex h-6 items-center gap-1 rounded-md border pl-2 font-mono text-xs"
-                :class="validateCidr(item) ? 'border-line bg-surface-2 text-fg' : 'border-danger/50 bg-danger-soft text-danger'"
+                class="inline-flex h-6 items-center gap-1 rounded-md pl-2 font-mono text-xs"
+                :class="validateCidr(item) ? 'bg-fill text-fg' : 'bg-danger-soft text-danger'"
               >
                 <TagsInputItemText />
                 <TagsInputItemDelete class="rounded p-0.5 pr-1 text-muted hover:text-fg" :aria-label="`移除 ${item}`"><X class="size-3" /></TagsInputItemDelete>
@@ -344,15 +340,16 @@ defineExpose({ dirty })
             <span v-else class="field-hint">只允许这些网段访问入口端口；留空表示任何来源都可以访问。</span>
           </div>
 
-          <div class="flex items-center justify-between gap-4 rounded-lg border border-line px-3.5 py-3">
+          <div class="well flex items-center justify-between gap-4 px-3.5 py-3">
             <div>
               <p class="font-medium">启用转发</p>
-              <p class="text-xs text-muted">停用后保留配置和端口，只是不再转发流量。</p>
+              <p class="text-xs text-muted">{{ rule ? '立即生效，可在提示里撤销。' : '停用后保留配置和端口，只是不再转发流量。' }}</p>
             </div>
-            <UiSwitch v-model="form.enabled" label="启用转发" />
+            <UiSwitch v-if="rule" :model-value="rule.enabled" label="启用转发" :disabled="toggle.isPending.value" @update:model-value="toggle.mutate({ rule, enabled: $event })" />
+            <UiSwitch v-else v-model="form.enabled" label="启用转发" />
           </div>
 
-          <p v-if="serverError" class="rounded-md bg-danger-soft px-3 py-2 text-sm text-danger" role="alert">{{ serverError }}</p>
+          <p v-if="serverError" class="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger" role="alert">{{ serverError }}</p>
         </form>
 
         <dl v-if="rule" class="grid grid-cols-[auto_1fr] gap-x-6 gap-y-2 border-t border-line pt-5 text-sm">
