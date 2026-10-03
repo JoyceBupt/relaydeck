@@ -56,7 +56,7 @@ async function performRequest<T>(path: string, method: string, data?: unknown): 
       body: data === undefined ? undefined : JSON.stringify(data),
     })
   } catch {
-    throw new ApiError(0, 'network_error', '连接失败，请检查网络后重试')
+    throw new ApiError(0, 'network_error', '无法连接服务器')
   }
   const text = await response.text()
   // A delayed response from an earlier session must neither restore its data
@@ -70,11 +70,11 @@ async function performRequest<T>(path: string, method: string, data?: unknown): 
   }
   let value: unknown
   if (text) {
-    try { value = JSON.parse(text) } catch { throw new ApiError(response.status, 'invalid_response', '服务器响应异常，请稍后重试') }
+    try { value = JSON.parse(text) } catch { throw new ApiError(response.status, 'invalid_response', '服务器响应异常') }
   }
   if (!response.ok) {
     const error = value as { error?: { code?: string; message?: string } } | undefined
-    throw new ApiError(response.status, error?.error?.code || 'request_error', error?.error?.message || '操作失败，请重试')
+    throw new ApiError(response.status, error?.error?.code || 'request_error', error?.error?.message || '操作失败')
   }
   return value as T
   } finally {
@@ -83,5 +83,5 @@ async function performRequest<T>(path: string, method: string, data?: unknown): 
 }
 
 export function errorMessage(error: unknown) {
-  return error instanceof Error ? error.message : '操作失败，请重试'
+  return error instanceof Error ? error.message : '操作失败'
 }

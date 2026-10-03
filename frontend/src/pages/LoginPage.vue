@@ -1,8 +1,10 @@
 <script setup lang="ts">
-import { nextTick, reactive, ref } from 'vue'
+import { nextTick, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ArrowLeft } from '@lucide/vue'
+import { LoaderCircle } from '@lucide/vue'
 import AuthFrame from '../components/AuthFrame.vue'
+import PasswordInput from '../components/PasswordInput.vue'
+import OtpInput from '../components/OtpInput.vue'
 import { ApiError, errorMessage } from '../api/client'
 import { api } from '../api/endpoints'
 import { acceptSession, sessionState } from '../lib/session'
@@ -13,14 +15,38 @@ const form = reactive({ username: '', password: '', code: '' })
 const step = ref<'password' | 'code'>('password')
 const useRecovery = ref(false)
 const busy = ref(false)
-const error = ref(sessionState.notice)
-const codeInput = ref<HTMLInputElement | null>(null)
-const passwordInput = ref<HTMLInputElement | null>(null)
+// Why the viewer landed here (signed out, password changed…); shown in place of the subtitle.
+const notice = ref(sessionState.notice)
+const error = ref('')
+const locked = ref(false)
+const codeInvalid = ref(false)
+const otp = ref<InstanceType<typeof OtpInput> | null>(null)
+const recoveryInput = ref<HTMLInputElement | null>(null)
+const passwordInput = ref<InstanceType<typeof PasswordInput> | null>(null)
+
+// Typing again clears the failure styling from the previous attempt.
+watch(() => form.code, code => { if (code) codeInvalid.value = false })
+
+function explain(failure: unknown) {
+  if (failure instanceof ApiError && failure.code === 'rate_limited') return '尝试次数过多，1 分钟后再试'
+  // The API answers every credential failure with the same generic 401 on purpose.
+  if (failure instanceof ApiError && failure.status === 401) return '用户名或密码错误'
+  return errorMessage(failure)
+}
+
+// Fields are disabled while a request runs; focus can only land once that ends.
+async function focusCode() {
+  busy.value = false
+  await nextTick()
+  if (useRecovery.value) recoveryInput.value?.focus()
+  else otp.value?.focus()
+}
 
 async function submit() {
-  if (busy.value) return
+  if (busy.value || !form.username || (step.value === 'password' ? !form.password : !form.code)) return
   busy.value = true
   error.value = ''
+  codeInvalid.value = false
   const epoch = sessionState.epoch
   try {
     const session = await api.login(form.username.trim(), form.password, step.value === 'code' ? form.code.trim() : undefined)
@@ -32,22 +58,27 @@ async function submit() {
     await router.replace(next)
   } catch (failure) {
     if (failure instanceof ApiError && failure.code === 'mfa_required') {
+      notice.value = ''
       step.value = 'code'
-      await nextTick()
-      codeInput.value?.focus()
-    } else {
-      error.value = errorMessage(failure)
-      if (step.value === 'code') { form.code = ''; codeInput.value?.focus() }
+      await focusCode()
+      return
+    }
+    error.value = explain(failure)
+    locked.value = failure instanceof ApiError && failure.code === 'mfa_locked'
+    if (step.value === 'code') {
+      form.code = ''
+      codeInvalid.value = true
+      await focusCode()
     }
   } finally { busy.value = false }
 }
 
 async function back() {
-  step.value = 'password'
-  form.code = ''
-  form.password = ''
+  Object.assign(form, { password: '', code: '' })
   error.value = ''
+  locked.value = false
   useRecovery.value = false
+  step.value = 'password'
   await nextTick()
   passwordInput.value?.focus()
 }
@@ -55,53 +86,53 @@ async function back() {
 async function toggleRecovery() {
   useRecovery.value = !useRecovery.value
   form.code = ''
-  await nextTick()
-  codeInput.value?.focus()
+  error.value = ''
+  codeInvalid.value = false
+  await focusCode()
 }
 </script>
 
 <template>
   <AuthFrame
     :title="step === 'password' ? '登录' : '两步验证'"
-    :description="step === 'password' ? '使用管理员发放的账户登录控制台。' : useRecovery ? '输入一组未使用过的恢复码。' : '打开认证器应用，输入当前显示的 6 位验证码。'"
+    :description="step === 'password' ? notice || undefined : useRecovery ? '输入一组未使用的恢复码' : '输入认证器中的 6 位验证码'"
   >
     <form class="grid gap-4" novalidate @submit.prevent="submit">
-      <template v-if="step === 'password'">
+      <div v-if="step === 'password'" key="password" class="anim-step grid gap-4">
         <label class="field">
           <span class="field-label">用户名</span>
-          <input v-model="form.username" class="input" name="username" autocomplete="username" required maxlength="32" autofocus :disabled="busy" />
+          <input v-model="form.username" class="input" name="username" autocomplete="username" autocapitalize="off" spellcheck="false" required maxlength="32" autofocus :disabled="busy" />
         </label>
         <label class="field">
           <span class="field-label">密码</span>
-          <input ref="passwordInput" v-model="form.password" class="input" type="password" name="password" autocomplete="current-password" required maxlength="128" :disabled="busy" />
+          <PasswordInput ref="passwordInput" v-model="form.password" name="password" autocomplete="current-password" required maxlength="128" :disabled="busy" :aria-invalid="error ? 'true' : undefined" />
         </label>
-      </template>
-      <template v-else>
-        <p class="-mt-2 text-xs text-muted">账户 <span class="font-medium text-fg">{{ form.username }}</span></p>
-        <label class="field">
-          <span class="field-label">{{ useRecovery ? '恢复码' : '验证码' }}</span>
-          <input
-            ref="codeInput" v-model="form.code" class="input input-mono"
-            :class="useRecovery ? '' : 'h-12 text-center !text-2xl tracking-[0.5em]'"
-            name="code" autocomplete="one-time-code" :inputmode="useRecovery ? 'text' : 'numeric'"
-            :maxlength="useRecovery ? 35 : 6" :placeholder="useRecovery ? 'xxxxxxxx-xxxxxxxx-xxxxxxxx-xxxxxxxx' : '000000'"
-            required :disabled="busy" :aria-invalid="!!error"
-          />
-        </label>
-      </template>
+      </div>
 
-      <p v-if="error" class="rounded-md bg-danger-soft px-3 py-2 text-sm text-danger" role="alert">{{ error }}</p>
+      <div v-else key="code" class="anim-step grid gap-4">
+        <p class="flex items-center justify-between gap-3 text-sm">
+          <span class="min-w-0 truncate text-muted">{{ form.username }}</span>
+          <button type="button" class="shrink-0 text-accent hover:underline disabled:opacity-50" :disabled="busy" @click="back">切换账户</button>
+        </p>
+        <OtpInput v-if="!useRecovery" ref="otp" v-model="form.code" label="验证码" :disabled="busy" :invalid="codeInvalid" @complete="submit" />
+        <input
+          v-else ref="recoveryInput" v-model="form.code" class="input input-mono" name="code" aria-label="恢复码" autocomplete="one-time-code" autocapitalize="off" spellcheck="false"
+          maxlength="35" placeholder="xxxxxxxx-xxxxxxxx-xxxxxxxx-xxxxxxxx" required :disabled="busy" :aria-invalid="codeInvalid ? 'true' : undefined"
+        />
+      </div>
 
-      <button class="btn btn-primary mt-1 w-full" type="submit" :disabled="busy || !form.username || (step === 'password' ? !form.password : !form.code)">
-        {{ busy ? '正在验证…' : step === 'password' ? '登录' : '验证并登录' }}
+      <p v-if="error" class="field-error -mt-1" role="alert">
+        {{ error }}<button v-if="locked && !useRecovery" type="button" class="ml-2 text-accent hover:underline" @click="toggleRecovery">使用恢复码</button>
+      </p>
+
+      <button class="btn btn-primary mt-1 h-10 w-full" type="submit" :disabled="busy || !form.username || (step === 'password' ? !form.password : !form.code)">
+        <LoaderCircle v-if="busy" class="anim-spin size-4" aria-hidden="true" />
+        {{ step === 'password' ? '登录' : '验证' }}
       </button>
 
-      <div v-if="step === 'code'" class="flex items-center justify-between">
-        <button type="button" class="btn btn-ghost btn-sm -ml-2.5" :disabled="busy" @click="back"><ArrowLeft class="size-4" />换个账户</button>
-        <button type="button" class="text-sm font-medium text-accent hover:underline" :disabled="busy" @click="toggleRecovery">
-          {{ useRecovery ? '改用验证码' : '改用恢复码' }}
-        </button>
-      </div>
+      <button v-if="step === 'code'" type="button" class="mx-auto text-sm text-muted hover:text-fg disabled:opacity-50" :disabled="busy" @click="toggleRecovery">
+        {{ useRecovery ? '使用验证码' : '使用恢复码' }}
+      </button>
     </form>
   </AuthFrame>
 </template>

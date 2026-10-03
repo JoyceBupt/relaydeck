@@ -3,7 +3,7 @@
 const BYTES = new TextEncoder()
 
 export function validateUsername(value: string) {
-  return /^[A-Za-z][A-Za-z0-9_-]{2,31}$/.test(value) ? '' : '3–32 位字母、数字、下划线或短横线，以字母开头'
+  return /^[A-Za-z][A-Za-z0-9_-]{2,31}$/.test(value) ? '' : '3–32 位，字母开头，可含数字、_ 和 -'
 }
 
 export function validatePassword(value: string) {
@@ -15,10 +15,10 @@ export function validatePassword(value: string) {
 
 export function validateRuleName(value: string) {
   const trimmed = value.trim()
-  if (!trimmed) return '请填写名称'
-  if ([...trimmed].length > 64) return '名称最多 64 个字'
+  if (!trimmed) return '填写名称'
+  if ([...trimmed].length > 64) return '最多 64 个字'
   // eslint-disable-next-line no-control-regex
-  if (/[\u0000-\u001f\u007f]/.test(value)) return '名称不能包含控制字符'
+  if (/[\u0000-\u001f\u007f]/.test(value)) return '含有非法字符'
   return ''
 }
 
@@ -38,21 +38,21 @@ function privateIpv4(value: string) {
 
 export function validateTargetHost(raw: string) {
   const value = raw.trim().replace(/\.$/, '')
-  if (!value) return '请填写目标地址'
-  if (IPV4.test(value)) return privateIpv4(value) ? '目标必须是公网地址' : ''
+  if (!value) return '填写目标地址'
+  if (IPV4.test(value)) return privateIpv4(value) ? '须为公网地址' : ''
   if (isIpv6(value)) {
     const head = value.toLowerCase()
-    return head.startsWith('2') || head.startsWith('3') ? '' : '目标必须是公网 IPv6 地址'
+    return head.startsWith('2') || head.startsWith('3') ? '' : '须为公网 IPv6 地址'
   }
   const labels = value.split('.')
   if (value.length > 253 || labels.length < 2 || !labels.every(label => LABEL.test(label)) || !/[a-z]/i.test(labels[labels.length - 1])) {
-    return '请输入公网 IP 或完整域名，不要带协议、路径或端口'
+    return '公网 IP 或域名，不带协议和端口'
   }
   return ''
 }
 
 export function validatePort(value: number | null, min = 1, max = 65535) {
-  if (value === null || !Number.isInteger(value)) return '请输入端口号'
+  if (value === null || !Number.isInteger(value)) return '填写端口'
   if (value < min || value > max) return `端口须在 ${min}–${max} 之间`
   return ''
 }

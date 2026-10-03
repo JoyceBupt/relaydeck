@@ -27,14 +27,14 @@ const channel = typeof window !== 'undefined' && window.document && 'BroadcastCh
 channel?.addEventListener('message', event => {
   if (event.data?.type !== 'changed' || event.data.ref === sessionState.session?.session_ref) return
   if (!sessionState.session && !sessionState.recoveryCodes.length) return
-  clearSession('账户已在其他标签页切换', false)
+  clearSession('其他标签页切换了账户', false)
   window.dispatchEvent(new Event('relaydeck:session-changed'))
 })
 
 export function acceptSession(session: Session, login = false) {
   const previous = sessionState.session
   if (previous && previous.user.id !== session.user.id && !login) {
-    clearSession('账户已切换，请重新登录', false)
+    clearSession('账户已切换', false)
     window.dispatchEvent(new Event('relaydeck:session-changed'))
     return
   }

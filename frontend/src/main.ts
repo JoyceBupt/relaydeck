@@ -9,7 +9,7 @@ import './styles.css'
 
 window.addEventListener('relaydeck:session-expired', () => {
   if (!sessionState.session) return
-  clearSession('登录已失效，请重新登录', false)
+  clearSession('登录已过期', false)
   router.replace({ name: 'login' })
 })
 window.addEventListener('relaydeck:session-changed', () => router.replace({ name: 'login' }))

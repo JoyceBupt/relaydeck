@@ -26,7 +26,7 @@ function describe(port: number): Cell {
   if (!lease) return { port, kind: 'free', title: `${port} · 空闲` }
   const rule = props.statuses?.[lease.rule_id]
   if (lease.rule_id === props.ownRuleId) return { port, kind: 'own', title: `${port} · 当前规则` }
-  if (lease.state === 'releasing') return { port, kind: 'releasing', title: `${port} · 待释放（等待执行器确认）` }
+  if (lease.state === 'releasing') return { port, kind: 'releasing', title: `${port} · 释放中` }
   return { port, kind: rule?.status ?? 'active', title: `${port} · ${rule?.name ?? '已占用'}` }
 }
 
@@ -65,14 +65,14 @@ function pickFromTrack(event: MouseEvent) {
 }
 
 const tone: Record<Cell['kind'], string> = {
-  free: 'bg-surface-2 hover:bg-surface-3',
+  free: 'bg-[var(--meter-off)] hover:bg-line-strong',
   reserved: 'bg-transparent border border-dashed border-line-strong',
   releasing: 'bg-warning-soft border border-warning/60',
   own: 'bg-accent-soft border border-accent/60',
-  active: 'bg-success',
-  pending: 'bg-warning',
-  failed: 'bg-danger',
-  blocked: 'bg-danger border border-dashed border-surface',
+  active: 'bg-[var(--meter-ok)]',
+  pending: 'bg-[var(--meter-warn)]',
+  failed: 'bg-[var(--meter-bad)]',
+  blocked: 'bg-[var(--meter-bad)] border border-dashed border-surface',
   stopped: 'bg-faint/50',
 }
 </script>
@@ -82,7 +82,7 @@ const tone: Record<Cell['kind'], string> = {
     <div v-if="discrete" class="grid grid-cols-[repeat(auto-fill,minmax(0.875rem,1fr))] gap-[3px]" role="group" :aria-label="`端口 ${usage.port_start}–${usage.port_end} 的占用情况`">
       <button
         v-for="cell in cells" :key="cell.port" type="button"
-        class="h-3.5 rounded-[3px] transition-colors duration-150 disabled:cursor-default"
+        class="h-3.5 rounded-[3.5px] transition-colors duration-150 disabled:cursor-default"
         :class="[tone[cell.kind], selected === cell.port ? '!bg-accent ring-2 ring-accent/30' : '']"
         :title="cell.title" :aria-label="cell.title" :aria-pressed="selected === cell.port"
         :disabled="!interactive || !available(cell.port)"
@@ -90,7 +90,7 @@ const tone: Record<Cell['kind'], string> = {
       />
     </div>
     <div
-      v-else class="relative h-7 rounded-md bg-surface-2" :class="interactive ? 'cursor-crosshair' : ''"
+      v-else class="relative h-7 rounded-lg bg-[var(--meter-off)]" :class="interactive ? 'cursor-crosshair' : ''"
       role="img" :aria-label="`端口 ${usage.port_start}–${usage.port_end}，已占用 ${usage.leases.length} 个`" @click="pickFromTrack"
     >
       <span
@@ -108,7 +108,7 @@ const tone: Record<Cell['kind'], string> = {
       <span class="flex items-center gap-3">
         <span class="tabular">空闲 {{ free }}</span>
         <button v-if="interactive && nextFree !== null" type="button" class="font-medium text-accent hover:underline" @click="emit('select', nextFree)">
-          用下一个空闲端口 {{ nextFree }}
+          下一个空闲 {{ nextFree }}
         </button>
       </span>
     </div>

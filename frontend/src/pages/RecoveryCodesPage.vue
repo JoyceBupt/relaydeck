@@ -13,8 +13,8 @@ const codes = sessionState.recoveryCodes
 async function copy() {
   try {
     await navigator.clipboard.writeText(codes.join('\n'))
-    toast('已复制恢复码', { tone: 'success' })
-  } catch { toast('复制失败', { description: '请手动选中后复制，或下载为文件。', tone: 'danger' }) }
+    toast('已复制')
+  } catch { toast('复制失败', { tone: 'danger' }) }
 }
 
 function download() {
@@ -28,14 +28,14 @@ function download() {
 
 async function finish() {
   clearRecoveryCodes()
-  sessionState.notice = '双因素验证已启用，请重新登录'
+  sessionState.notice = '两步验证已开启'
   await router.replace({ name: 'login' })
 }
 </script>
 
 <template>
-  <AuthFrame title="保存恢复码" description="丢失认证器时，可以用这些恢复码登录，每组只能用一次。它们只显示这一次，请存进密码管理器或打印出来。" wide>
-    <ol class="grid grid-cols-2 gap-x-6 gap-y-2 rounded-xl border border-line bg-surface p-4 font-mono text-sm tabular max-sm:grid-cols-1" aria-label="恢复码">
+  <AuthFrame title="恢复码" description="每组只能用一次，仅显示这一次" wide>
+    <ol class="grid grid-cols-2 gap-x-6 gap-y-2 well p-4 font-mono text-sm tabular max-sm:grid-cols-1" aria-label="恢复码">
       <li v-for="(code, index) in codes" :key="code" class="flex gap-2 [overflow-wrap:anywhere]"><span class="w-4 text-right text-faint">{{ index + 1 }}</span>{{ code }}</li>
     </ol>
     <div class="mt-3 flex gap-2">
@@ -44,8 +44,8 @@ async function finish() {
     </div>
     <label class="mt-6 flex cursor-pointer items-center gap-2.5">
       <input v-model="saved" type="checkbox" class="size-4 accent-[var(--accent)]" />
-      <span>我已妥善保存这些恢复码</span>
+      <span>已保存</span>
     </label>
-    <button class="btn btn-primary mt-4 w-full" type="button" :disabled="!saved" @click="finish">继续并重新登录</button>
+    <button class="btn btn-primary mt-4 w-full" type="button" :disabled="!saved" @click="finish">完成</button>
   </AuthFrame>
 </template>
