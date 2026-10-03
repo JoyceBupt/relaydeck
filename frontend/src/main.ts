@@ -1,5 +1,16 @@
 import { createApp } from 'vue'
+import { VueQueryPlugin } from '@tanstack/vue-query'
 import App from './App.vue'
-import './style.css'
+import { router } from './router'
+import { queryClient } from './lib/queryClient'
+import { clearSession, sessionState } from './lib/session'
+import './lib/theme'
+import './styles.css'
 
-createApp(App).mount('#app')
+window.addEventListener('relaydeck:session-expired', () => {
+  if (!sessionState.session) return
+  clearSession('登录已失效，请重新登录')
+  router.replace({ name: 'login' })
+})
+
+createApp(App).use(VueQueryPlugin, { queryClient }).use(router).mount('#app')
