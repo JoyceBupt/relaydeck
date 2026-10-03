@@ -15,8 +15,11 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24'
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          package_json_file: frontend/package.json
+          cache: true
+          cache_dependency_path: frontend/pnpm-lock.yaml
       - name: Rust checks and offline build
         run: |
           rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy
@@ -27,8 +30,8 @@ jobs:
       - name: Frontend regression tests
         working-directory: frontend
         run: |
-          npm ci
-          npm test
-          npm run build
+          pnpm install --frozen-lockfile
+          pnpm test
+          pnpm run build
       - name: Release validation tests
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py' -v
