@@ -18,12 +18,19 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24'
-      - name: Build and validate release
+      - name: Build frontend and validate packages
         run: |
-          rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy
-          ./scripts/cargo.sh test --locked --all-targets
+          npm ci --prefix frontend
+          npm test --prefix frontend
+          npm run build --prefix frontend
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py'
-          ./scripts/build-release.sh
+      - name: Build Linux binaries on Debian 12
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" \
+            --volume "$PWD:/workspace" --workdir /workspace \
+            --env CARGO_HOME=/tmp/relaydeck-cargo --env RUSTUP_TOOLCHAIN=1.99.0 \
+            rust:1.99-bookworm@sha256:59037199c44290f2befcdd58dcc540164763fc296950255aaefeef096a1866b0 \
+            sh -c 'cargo test --locked --all-targets && cargo build --release --locked && python3 scripts/manage.py package --target "$(rustc -vV | sed -n "s/^host: //p")"'
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: relaydeck-${{ runner.arch }}
