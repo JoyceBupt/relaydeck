@@ -28,6 +28,9 @@ BIN = pathlib.Path('/usr/local/libexec/relaydeck')
 MANAGER = BIN.with_name('relaydeck-manage.py')
 UPDATER = pathlib.Path('/usr/local/sbin/relaydeck-update')
 UNITS = ('relaydeck-broker.service', 'relaydeck-web.service', 'relaydeck-worker.service')
+UPGRADE_UNIT = 'relaydeck-upgrader.service'
+ALL_UNITS = (*UNITS, UPGRADE_UNIT)
+TRANSACTION = STATE / 'upgrade-transaction.json'
 ENV_KEYS = {'RELAYDECK_DATABASE', 'RELAYDECK_MFA_KEY', 'RELAYDECK_LISTEN', 'RELAYDECK_ORIGIN', 'RELAYDECK_TRUST_PROXY', 'RELAYDECK_FRONTEND'}
 SAFE_ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8'}
 
@@ -100,7 +103,7 @@ def extract_release(archive, expected, destination):
             if parts[0] == 'bin' and raw not in ('bin', 'bin/relaydeck'):
                 raise ValueError('Unexpected executable payload')
             seen.add(raw)
-        required = {'bin/relaydeck', 'frontend/index.html', 'release.json', 'deploy/broker.example.json', 'deploy/Caddyfile.example', 'deploy/manage.py', 'deploy/relaydeck-update', *(f'deploy/{unit}' for unit in UNITS)}
+        required = {'bin/relaydeck', 'frontend/index.html', 'release.json', 'deploy/broker.example.json', 'deploy/Caddyfile.example', 'deploy/manage.py', 'deploy/relaydeck-update', 'deploy/relaydeck-upgrader.py', *(f'deploy/{unit}' for unit in ALL_UNITS)}
         if not required <= seen:
             raise ValueError('Incomplete release')
         if not all(tar.getmember(name).isfile() for name in required):
@@ -187,7 +190,42 @@ def current_link(release):
 def management_tools(release):
     atomic_copy(release / 'deploy/manage.py', MANAGER, 0o644)
     atomic_copy(release / 'deploy/relaydeck-update', UPDATER, 0o755)
+    if (release / 'deploy/relaydeck-upgrader.py').is_file():
+        atomic_copy(release / 'deploy/relaydeck-upgrader.py', BIN.with_name('relaydeck-upgrader.py'), 0o644)
 
+
+
+def atomic_json(path, value, mode=0o600):
+    with tempfile.TemporaryDirectory(prefix='relaydeck-record-') as work:
+        source = pathlib.Path(work) / 'record.json'
+        source.write_text(json.dumps(value) + '\n')
+        atomic_copy(source, path, mode)
+    descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def ensure_upgrade_policy():
+    path = CONFIG / 'upgrade.json'
+    (STATE / 'updates').mkdir(mode=0o755, exist_ok=True)
+    root_path(STATE / 'updates')
+    account = pwd.getpwnam('relaydeck')
+    if path.exists() or path.is_symlink():
+        root_path(path)
+        value = json.loads(path.read_text())
+        if set(value) != {'owner_id', 'web_uid', 'web_gid'} or type(value['owner_id']) is not int or value['owner_id'] <= 0 or value['web_uid'] != account.pw_uid or value['web_gid'] != account.pw_gid:
+            raise ValueError('Invalid existing upgrade owner policy')
+        return
+    # The data UID parses SQLite; root receives only the one bootstrap account ID.
+    query = "import sqlite3,sys;d=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True);r=d.execute(\"SELECT id FROM users WHERE role='admin' ORDER BY id\").fetchall();assert len(r)==1,'Bootstrap owner must be unambiguous';print(r[0][0]);d.close()"
+    owner = run('runuser', '-u', 'relaydeck', '--', 'python3', '-c', query, str(STATE / 'data/relaydeck.db'), capture=True).strip()
+    if not re.fullmatch('[1-9][0-9]{0,9}', owner):
+        raise ValueError('Invalid bootstrap owner')
+    atomic_json(path, {'owner_id': int(owner), 'web_uid': account.pw_uid, 'web_gid': account.pw_gid}, 0o644)
+    (STATE / 'updates').mkdir(mode=0o755, exist_ok=True)
+    root_path(STATE / 'updates')
 
 def read_environment():
     path = CONFIG / 'relaydeck.env'
@@ -308,7 +346,7 @@ def install(args):
             realm.seek(0)
             with (pathlib.Path(work) / 'realm').open('xb') as output:
                 shutil.copyfileobj(realm, output)
-        for unit in UNITS:
+        for unit in ALL_UNITS:
             path = pathlib.Path('/etc/systemd/system') / unit
             if path.exists() or path.is_symlink():
                 raise ValueError(f'Existing unit requires review: {unit}')
@@ -366,7 +404,7 @@ def install(args):
         (CONFIG / 'Caddyfile').chmod(0o644)
         reservations = reserve_forwarding_ports(policy)
         hashes = {}
-        for unit in UNITS:
+        for unit in ALL_UNITS:
             destination = pathlib.Path('/etc/systemd/system') / unit
             if destination.exists() or destination.is_symlink():
                 raise ValueError(f'Existing unit requires review: {unit}')
@@ -375,28 +413,110 @@ def install(args):
         (CONFIG / 'installation.json').write_text(json.dumps({'units': hashes, 'port_reservations': reservations}) + '\n')
         (CONFIG / 'installation.json').chmod(0o644)
         as_web(BIN, 'init-admin', args.admin)
+        ensure_upgrade_policy()
         run('systemctl', 'daemon-reload')
-        run('systemctl', 'enable', '--now', *UNITS)
+        run('systemctl', 'enable', '--now', *ALL_UNITS)
         wait_health(manifest['version'])
         print('Installed. Import /etc/relaydeck/Caddyfile into your Caddy configuration before public use. Updates: sudo relaydeck-update --bundle <release.tar.gz> --sha256 <trusted-digest>')
 
 
-def update(args):
+
+def verify_cached_release(existing, stage):
+    root_path(existing)
+    present = {path.relative_to(existing) for path in existing.rglob('*')}
+    expected = {path.relative_to(stage) for path in stage.rglob('*')}
+    if present != expected:
+        raise ValueError('Cached release contents differ from the verified bundle')
+    for relative in expected:
+        path = existing / relative
+        root_path(path)
+        if path.is_symlink():
+            raise ValueError('Cached release contains a link')
+        source = stage / relative
+        if path.is_dir() != source.is_dir() or path.is_file() != source.is_file() or path.is_file() and (path.stat().st_nlink != 1 or digest(path) != digest(source)):
+            raise ValueError('Cached release contents differ from the verified bundle')
+
+class UpdateRolledBack(RuntimeError):
+    pass
+
+
+def restore_transaction(record):
+    previous = pathlib.Path(record['previous'])
+    release = pathlib.Path(record['release'])
+    for path in (previous, release):
+        root_path(path)
+        if path.parent != RELEASES:
+            raise ValueError('Unexpected recovery release path')
+    old_version = json.loads((previous / 'release.json').read_text())['version']
+    run('systemctl', 'stop', *UNITS)
+    if record['backup']:
+        backup = pathlib.Path(record['backup'])
+        if backup.parent != STATE / 'backups' or not re.fullmatch('update-[0-9]+', backup.name):
+            raise ValueError('Unexpected recovery backup path')
+        restore = "import sqlite3,sys;from urllib.parse import quote;s=sqlite3.connect('file:'+quote(sys.argv[1])+'?mode=ro',uri=True);assert s.execute('PRAGMA quick_check').fetchone()[0]=='ok';d=sqlite3.connect(sys.argv[2]);s.backup(d);d.close();s.close()"
+        run('runuser', '-u', 'relaydeck', '--', 'python3', '-c', restore, str(backup / 'relaydeck.db'), str(STATE / 'data/relaydeck.db'), env=SAFE_ENV)
+    atomic_copy(previous / 'bin/relaydeck', BIN)
+    current_link(previous)
+    management_tools(previous)
+    for unit in ALL_UNITS:
+        destination = pathlib.Path('/etc/systemd/system') / unit
+        source = previous / 'deploy' / unit
+        if source.is_file():
+            atomic_copy(source, destination, 0o644)
+        elif unit == UPGRADE_UNIT and destination.exists():
+            root_path(destination)
+            if digest(destination) != digest(release / 'deploy' / unit):
+                raise ValueError('Introduced updater unit was modified; manual recovery required')
+            destination.unlink()
+    run('systemctl', 'daemon-reload')
+    run('systemctl', 'reset-failed', *UNITS)
+    # The service hashes correspond to the restored release as well.
+    atomic_json(CONFIG / 'installation.json', record['installation'], 0o644)
+    record['phase'] = 'rolled_back'
+    atomic_json(TRANSACTION, record)
+    run('systemctl', 'start', *UNITS)
+    wait_health(old_version)
+    TRANSACTION.unlink()
+
+
+def recover_update():
+    preflight()
+    with manage_lock():
+        if not TRANSACTION.exists():
+            return False
+        root_path(TRANSACTION)
+        record = json.loads(TRANSACTION.read_text())
+        if record.get('phase') == 'rolled_back':
+            run('systemctl', 'start', *UNITS)
+            wait_health(json.loads((pathlib.Path(record['previous']) / 'release.json').read_text())['version'])
+            TRANSACTION.unlink()
+            return True
+        if record.get('phase') == 'committed':
+            TRANSACTION.unlink()
+            return False
+        restore_transaction(record)
+        return True
+
+
+def update(args, progress=lambda step: None):
     preflight()
     confirm_update(args.yes)
     with manage_lock(), tempfile.TemporaryDirectory(prefix='relaydeck-update-') as work:
+        if TRANSACTION.exists():
+            raise ValueError('An interrupted upgrade must be recovered before another update')
         stage = pathlib.Path(work) / 'release'
         manifest = prepare(args, stage)
         root_path(CURRENT.resolve())
         previous = CURRENT.resolve()
         if previous.parent != RELEASES:
             raise ValueError('Current release is outside the managed release directory')
-        old_version = json.loads((previous / 'release.json').read_text())['version']
         record_path = CONFIG / 'installation.json'
         root_path(record_path)
         record = json.loads(record_path.read_text())
-        for unit in UNITS:
+        for unit in ALL_UNITS:
             path = pathlib.Path('/etc/systemd/system') / unit
+            if unit == UPGRADE_UNIT and not path.exists() and unit not in record['units']:
+                continue
             root_path(path)
             if digest(path) != record['units'].get(unit):
                 raise ValueError(f'Unit {unit} was customized; preserve it with a systemd drop-in before updating')
@@ -405,47 +525,49 @@ def update(args):
         if not 64 <= policy['limits']['tasks'] <= 256:
             raise ValueError('Set limits.tasks to 64..256 in /etc/relaydeck/broker.json before upgrading the per-rule supervisor (default: 96)')
         record['port_reservations'] = reserve_forwarding_ports(policy)
+        ensure_upgrade_policy()
         release = RELEASES / release_name(manifest)
-        if release.exists():
+        if release == previous:
             raise ValueError('This release is already installed')
-        shutil.copytree(stage, release)
+        if release.exists():
+            verify_cached_release(release, stage)
+        else:
+            shutil.copytree(stage, release)
         backup = STATE / 'backups' / ('update-' + str(time.time_ns()))
-        run('systemctl', 'stop', 'relaydeck-web.service', 'relaydeck-worker.service')
+        transaction = {'previous': str(previous), 'release': str(release), 'backup': None, 'phase': 'prepared', 'installation': record}
+        atomic_json(TRANSACTION, transaction)
         try:
+            progress('backup')
+            run('systemctl', 'stop', 'relaydeck-web.service', 'relaydeck-worker.service')
             as_web(BIN, 'backup', str(backup))
-        except BaseException:
-            run('systemctl', 'reset-failed', *UNITS)
-            run('systemctl', 'start', *UNITS)
-            raise
-        run('systemctl', 'stop', 'relaydeck-broker.service')
-        try:
+            transaction.update(backup=str(backup), phase='backed_up')
+            atomic_json(TRANSACTION, transaction)
+            run('systemctl', 'stop', 'relaydeck-broker.service')
+            progress('install')
             atomic_copy(release / 'bin/relaydeck', BIN)
             current_link(release)
             management_tools(release)
-            for unit in UNITS:
+            for unit in ALL_UNITS:
                 atomic_copy(release / 'deploy' / unit, pathlib.Path('/etc/systemd/system') / unit, 0o644)
             as_web(BIN, 'migrate')
             run('systemctl', 'daemon-reload')
             run('systemctl', 'reset-failed', *UNITS)
             run('systemctl', 'start', *UNITS)
+            progress('health')
             wait_health(manifest['version'])
-        except BaseException:
-            run('systemctl', 'stop', *UNITS)
-            # Restore SQLite through its backup API as the data UID. Root never parses it.
-            restore = "import sqlite3,sys;from urllib.parse import quote;s=sqlite3.connect('file:'+quote(sys.argv[1])+'?mode=ro',uri=True);assert s.execute('PRAGMA quick_check').fetchone()[0]=='ok';d=sqlite3.connect(sys.argv[2]);s.backup(d);d.close();s.close()"
-            run('runuser', '-u', 'relaydeck', '--', 'python3', '-c', restore, str(backup / 'relaydeck.db'), str(STATE / 'data/relaydeck.db'), env=SAFE_ENV)
-            atomic_copy(previous / 'bin/relaydeck', BIN)
-            current_link(previous)
-            management_tools(previous)
-            for unit in UNITS:
-                atomic_copy(previous / 'deploy' / unit, pathlib.Path('/etc/systemd/system') / unit, 0o644)
-            run('systemctl', 'daemon-reload')
-            run('systemctl', 'reset-failed', *UNITS)
-            run('systemctl', 'start', *UNITS)
-            wait_health(old_version)
-            raise RuntimeError(f'Update failed and was rolled back. Backup: {backup}')
-        record['units'] = {unit: digest(pathlib.Path('/etc/systemd/system') / unit) for unit in UNITS}
-        record_path.write_text(json.dumps(record) + '\n')
+            record['units'] = {unit: digest(pathlib.Path('/etc/systemd/system') / unit) for unit in ALL_UNITS}
+            atomic_json(record_path, record, 0o644)
+            run('systemctl', 'enable', '--now', UPGRADE_UNIT)
+            transaction['phase'] = 'committed'
+            atomic_json(TRANSACTION, transaction)
+            TRANSACTION.unlink()
+        except BaseException as error:
+            try:
+                progress('rollback')
+            except Exception:
+                pass  # A progress-reporting failure must never prevent recovery.
+            restore_transaction(transaction)
+            raise UpdateRolledBack('更新失败：' + str(error)) from error
         print(f'Updated to {release.name}. Backup: {backup}')
 
 
@@ -489,11 +611,14 @@ def main():
             sub.add_argument('--realm-sha256', required=True)
             sub.add_argument('--origin', required=True)
             sub.add_argument('--admin', required=True)
+    commands.add_parser('recover')
     sub = commands.add_parser('package')
     sub.add_argument('--target', required=True)
     sub.add_argument('--output', default='dist')
     args = parser.parse_args()
-    if args.command == 'inspect':
+    if args.command == 'recover':
+        recover_update()
+    elif args.command == 'inspect':
         with tempfile.TemporaryDirectory(prefix='relaydeck-inspect-') as work:
             print(json.dumps(extract_release(args.bundle, args.sha256, pathlib.Path(work))))
     else:

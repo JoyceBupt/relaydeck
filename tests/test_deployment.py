@@ -27,8 +27,9 @@ class ReleaseValidation(unittest.TestCase):
             'deploy/broker.example.json': b'{}',
             'deploy/Caddyfile.example': b'panel.example.com {}',
             'deploy/manage.py': MODULE.read_bytes(),
+            'deploy/relaydeck-upgrader.py': b'#!/usr/bin/env python3\n',
             'deploy/relaydeck-update': b'#!/bin/sh\nexec python3 /usr/local/libexec/relaydeck-manage.py update "$@"\n',
-            **{f'deploy/{unit}': b'[Service]\nExecStart=/usr/local/libexec/relaydeck\n' for unit in manage.UNITS},
+            **{f'deploy/{unit}': b'[Service]\nExecStart=/usr/local/libexec/relaydeck\n' for unit in manage.ALL_UNITS},
         }
         with tarfile.open(path, 'w:gz') as tar:
             for name, data in entries.items():
@@ -108,6 +109,28 @@ class PortReservations(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'--yes'):
                 manage.confirm_update(False)
             manage.confirm_update(True)
+
+
+class CachedRelease(unittest.TestCase):
+    def test_verified_failed_release_can_be_retried_without_overwriting_cache(self):
+        with tempfile.TemporaryDirectory() as work, patch.object(manage, 'root_path'):
+            root = pathlib.Path(work)
+            stage = root / 'stage'; stage.mkdir(); (stage / 'bin').mkdir(); (stage / 'bin/app').write_bytes(b'verified')
+            import shutil
+            cached = root / 'cached'; shutil.copytree(stage, cached)
+            manage.verify_cached_release(cached, stage)
+            (cached / 'bin/app').write_bytes(b'changed')
+            with self.assertRaisesRegex(ValueError, 'differ'):
+                manage.verify_cached_release(cached, stage)
+
+    def test_extra_files_and_links_in_cached_releases_are_rejected(self):
+        with tempfile.TemporaryDirectory() as work, patch.object(manage, 'root_path'):
+            root = pathlib.Path(work)
+            stage = root / 'stage'; stage.mkdir(); (stage / 'app').write_bytes(b'verified')
+            cached = root / 'cached'; cached.mkdir(); (cached / 'app').write_bytes(b'verified'); (cached / 'extra').write_bytes(b'extra')
+            with self.assertRaises(ValueError): manage.verify_cached_release(cached, stage)
+            (cached / 'extra').unlink(); (cached / 'app').unlink(); (cached / 'app').symlink_to(stage / 'app')
+            with self.assertRaises(ValueError): manage.verify_cached_release(cached, stage)
 
 
 if __name__ == '__main__':

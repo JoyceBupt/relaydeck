@@ -3,6 +3,9 @@ import type { Audit } from '../types'
 export type AuditCategory = 'rule' | 'account' | 'security'
 
 const phrases: Record<string, { verb: string; category: AuditCategory; self?: boolean }> = {
+  panel_upgrade_requested: { verb: '申请了面板升级', category: 'security', self: true },
+  panel_upgrade_password_failed: { verb: '升级密码验证失败', category: 'security', self: true },
+  panel_upgrade_mfa_failed: { verb: '升级验证失败', category: 'security', self: true },
   login: { verb: '登录了控制台', category: 'security', self: true },
   login_failed: { verb: '登录失败', category: 'security', self: true },
   login_mfa_failed: { verb: '两步验证失败', category: 'security', self: true },

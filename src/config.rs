@@ -15,6 +15,7 @@ pub struct Config {
     pub frontend: PathBuf,
     pub mfa_key: PathBuf,
     pub require_admin_mfa: bool,
+    pub upgrade: Option<crate::upgrade::UpgradeConfig>,
 }
 
 impl Config {
@@ -99,6 +100,7 @@ impl Config {
             database,
             mfa_key,
             require_admin_mfa,
+            upgrade: crate::upgrade::installed_config()?,
             public_origin: url.origin().ascii_serialization(),
             secure_cookie,
             trust_proxy,

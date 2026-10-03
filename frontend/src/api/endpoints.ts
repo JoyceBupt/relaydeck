@@ -1,5 +1,5 @@
 import { request } from './client'
-import type { Audit, Health, MfaEnrollment, NewUserInput, PortUsage, Rule, RuleInput, Session, User, UserGrantInput, ViewMode } from '../types'
+import type { Audit, UpgradeStatus, Health, MfaEnrollment, NewUserInput, PortUsage, Rule, RuleInput, Session, User, UserGrantInput, ViewMode } from '../types'
 
 export const api = {
   session: () => request<Session>('/session'),
@@ -13,6 +13,10 @@ export const api = {
   beginMfa: (password: string) => request<MfaEnrollment>('/mfa/setup', 'POST', { password }),
   confirmMfa: (code: string) => request<{ recovery_codes: string[] }>('/mfa/confirm', 'POST', { code }),
   disableMfa: (password: string, code: string) => request<void>('/mfa/disable', 'POST', { password, code }),
+
+  upgradeStatus: () => request<UpgradeStatus>('/system/update'),
+  checkUpgrade: () => request<UpgradeStatus>('/system/update/check', 'POST'),
+  startUpgrade: (input: { offer: string; password: string; code: string; acknowledge: boolean }) => request<UpgradeStatus>('/system/update', 'POST', input),
 
   health: () => request<Health>('/health'),
   rules: () => request<Rule[]>('/rules'),

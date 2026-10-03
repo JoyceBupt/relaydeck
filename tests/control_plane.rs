@@ -109,6 +109,7 @@ impl Fixture {
             listen: "127.0.0.1:0".parse().unwrap(),
             mfa_key: database.with_file_name("mfa.key"),
             require_admin_mfa: false,
+            upgrade: None,
             database,
             public_origin: ORIGIN.into(),
             secure_cookie: true,
@@ -1484,4 +1485,247 @@ async fn failed_logins_are_aggregated_without_evicting_operation_audit() {
             .sum::<i64>(),
         16
     );
+}
+
+struct TestUpgrader(std::sync::Mutex<Vec<Value>>);
+impl relaydeck::upgrade::UpgradeChannel for TestUpgrader {
+    fn request(&self, request: Value) -> relaydeck::upgrade::UpgradeFuture<'_> {
+        self.0.lock().unwrap().push(request);
+        Box::pin(async {
+            Ok(json!({"current_version":"0.1.0","latest":null,"job":{"phase":"queued"}}))
+        })
+    }
+}
+
+#[tokio::test]
+async fn panel_upgrade_is_scoped_to_the_pinned_owner_even_for_other_administrators() {
+    let mut f = Fixture::new().await;
+    let tenant = f.add_user("upgradeuser", 41000).await;
+    let channel = std::sync::Arc::new(TestUpgrader(std::sync::Mutex::new(vec![])));
+    std::sync::Arc::make_mut(&mut f.state.config).upgrade =
+        Some(relaydeck::upgrade::UpgradeConfig {
+            owner_id: 1,
+            socket: "/unused".into(),
+            maintenance: f._dir.path().join("upgrade-transaction.json"),
+        });
+    f.state.upgrades = Some(channel.clone());
+    f.app = router(f.state.clone());
+    for route in ["/api/system/update", "/api/system/update/check"] {
+        let method = if route.ends_with("check") {
+            "POST"
+        } else {
+            "GET"
+        };
+        let (status, _, _) = call(&f.app, method, route, None, None, false).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _, _) = call(&f.app, method, route, None, Some(&tenant), true).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        sqlx::query("UPDATE users SET role='admin' WHERE id=?")
+            .bind(tenant.user["id"].as_i64().unwrap())
+            .execute(&f.state.pool)
+            .await
+            .unwrap();
+        let (status, _, _) = call(&f.app, method, route, None, Some(&tenant), true).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+    let (_, _, session) = call(&f.app, "GET", "/api/session", None, Some(&tenant), false).await;
+    assert_eq!(session["can_upgrade"], false);
+    assert!(channel.0.lock().unwrap().is_empty());
+    let (status, _, session) =
+        call(&f.app, "GET", "/api/session", None, Some(&f.admin), false).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(session["can_upgrade"], true);
+    let (status, _, _) = call(
+        &f.app,
+        "GET",
+        "/api/system/update",
+        None,
+        Some(&f.admin),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn panel_upgrade_requires_csrf_fresh_password_totp_and_interruption_consent() {
+    let mut f = Fixture::new().await;
+    std::sync::Arc::make_mut(&mut f.state.config).upgrade =
+        Some(relaydeck::upgrade::UpgradeConfig {
+            owner_id: 1,
+            socket: "/unused".into(),
+            maintenance: f._dir.path().join("upgrade-transaction.json"),
+        });
+    let channel = std::sync::Arc::new(TestUpgrader(std::sync::Mutex::new(vec![])));
+    f.state.upgrades = Some(channel.clone());
+    f.app = router(f.state.clone());
+    let payload = json!({"offer":"a".repeat(64),"password":ADMIN_PASSWORD,"code":"123456","acknowledge":true});
+    let (status, _, _) = call(
+        &f.app,
+        "POST",
+        "/api/system/update",
+        Some(payload.clone()),
+        Some(&f.admin),
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _, _) = call(
+        &f.app,
+        "POST",
+        "/api/system/update",
+        Some(payload),
+        Some(&f.admin),
+        true,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "MFA enrollment is mandatory even when local admin MFA policy is optional"
+    );
+    let (status, _, setup) = call(
+        &f.app,
+        "POST",
+        "/api/mfa/setup",
+        Some(json!({"password":ADMIN_PASSWORD})),
+        Some(&f.admin),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let generator = totp_rs::Builder::new()
+        .with_secret(totp_rs::Secret::try_from_base32(setup["secret"].as_str().unwrap()).unwrap())
+        .build()
+        .unwrap();
+    let current = generator.generate(relaydeck::db::now() as u64).to_string();
+    let (_, _, codes) = call(
+        &f.app,
+        "POST",
+        "/api/mfa/confirm",
+        Some(json!({"code":current})),
+        Some(&f.admin),
+        true,
+    )
+    .await;
+    let (status, headers, session) = call(&f.app, "POST", "/api/login", Some(json!({"username":"adminroot","password":ADMIN_PASSWORD,"code":codes["recovery_codes"][0]})), None, false).await;
+    assert_eq!(status, StatusCode::OK);
+    let owner = Login {
+        cookie: headers[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .into(),
+        csrf: session["csrf_token"].as_str().unwrap().into(),
+        user: session["user"].clone(),
+    };
+    // The allowed next time step is fresh and avoids a wall-clock sleep.
+    let fresh = generator
+        .generate((relaydeck::db::now() + 30) as u64)
+        .to_string();
+    for input in [
+        json!({"offer":"a".repeat(64),"password":"wrong-password","code":fresh,"acknowledge":true}),
+        json!({"offer":"a".repeat(64),"password":ADMIN_PASSWORD,"code":fresh,"acknowledge":false}),
+        json!({"offer":"https://attacker.test/archive","password":ADMIN_PASSWORD,"code":fresh,"acknowledge":true}),
+    ] {
+        let (status, _, _) = call(
+            &f.app,
+            "POST",
+            "/api/system/update",
+            Some(input),
+            Some(&owner),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    assert!(channel.0.lock().unwrap().is_empty());
+    let payload =
+        json!({"offer":"a".repeat(64),"password":ADMIN_PASSWORD,"code":fresh,"acknowledge":true});
+    let (status, _, _) = call(
+        &f.app,
+        "POST",
+        "/api/system/update",
+        Some(payload.clone()),
+        Some(&owner),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        *channel.0.lock().unwrap(),
+        vec![json!({"op":"start","offer":"a".repeat(64)})]
+    );
+    let (status, _, _) = call(
+        &f.app,
+        "POST",
+        "/api/system/update",
+        Some(payload),
+        Some(&owner),
+        true,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a consumed upgrade TOTP must not be replayed"
+    );
+    assert_eq!(channel.0.lock().unwrap().len(), 1);
+    let audit: Vec<(String,)> =
+        sqlx::query_as("SELECT action FROM audit_events WHERE action LIKE 'panel_upgrade%'")
+            .fetch_all(&f.state.pool)
+            .await
+            .unwrap();
+    assert_eq!(audit, vec![("panel_upgrade_requested".into(),)]);
+    let failures: i64 = sqlx::query_scalar(
+        "SELECT SUM(count) FROM authentication_failures WHERE action='panel_upgrade_mfa_failed'",
+    )
+    .fetch_one(&f.state.pool)
+    .await
+    .unwrap();
+    assert_eq!(failures, 1);
+}
+
+#[tokio::test]
+async fn panel_upgrade_snapshot_blocks_external_writes_until_commit() {
+    let mut f = Fixture::new().await;
+    let tenant = f.add_user("upgradewriter", 41000).await;
+    let marker = f._dir.path().join("upgrade-transaction.json");
+    std::sync::Arc::make_mut(&mut f.state.config).upgrade =
+        Some(relaydeck::upgrade::UpgradeConfig {
+            owner_id: 1,
+            socket: "/unused".into(),
+            maintenance: marker.clone(),
+        });
+    f.app = router(f.state.clone());
+    std::fs::write(&marker, "{}").unwrap();
+    for login in [&f.admin, &tenant] {
+        let (status, _, _) = call(
+            &f.app,
+            "PUT",
+            "/api/preferences",
+            Some(json!({"view_mode":"cards"})),
+            Some(login),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let (status, _, _) = call(&f.app, "GET", "/api/session", None, Some(login), true).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (status, _, _) = call(&f.app, "GET", "/api/health", None, None, false).await;
+    assert_eq!(status, StatusCode::OK);
+    std::fs::remove_file(marker).unwrap();
+    let (status, _, _) = call(
+        &f.app,
+        "PUT",
+        "/api/preferences",
+        Some(json!({"view_mode":"cards"})),
+        Some(&tenant),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
 }
