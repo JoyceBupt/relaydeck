@@ -7,6 +7,7 @@ import os
 import pathlib
 import platform
 import pwd
+import grp
 import re
 import shutil
 import stat
@@ -133,7 +134,7 @@ def preflight():
         raise ValueError('Installation and updates require root on systemd Linux')
     if not pathlib.Path('/sys/fs/cgroup/cgroup.controllers').is_file():
         raise ValueError('cgroup v2 is required')
-    for command in ('systemctl', 'nft', 'bpftool', 'ss', 'ip', 'runuser'):
+    for command in ('systemctl', 'nft', 'ss', 'ip', 'runuser'):
         if not shutil.which(command, path=SAFE_ENV['PATH']):
             raise ValueError(f'Missing dependency: {command}')
 
@@ -251,12 +252,27 @@ def install(args):
             path = pathlib.Path('/etc/systemd/system') / unit
             if path.exists() or path.is_symlink():
                 raise ValueError(f'Existing unit requires review: {unit}')
+        policy = json.loads((stage / 'deploy/broker.example.json').read_text())
+        for slot in range(1, policy['max_owners'] + 1):
+            uid = policy['uid_start'] + slot - 1
+            name = f'relaydeck-runner-{slot}'
+            for lookup, value in ((pwd.getpwuid, uid), (grp.getgrgid, uid), (pwd.getpwnam, name), (grp.getgrnam, name)):
+                try:
+                    lookup(value)
+                except KeyError:
+                    continue
+                raise ValueError(f'Dedicated runtime identity already exists: {name}/{uid}')
         try:
             account = pwd.getpwnam('relaydeck')
             raise ValueError('Account relaydeck already exists; review its ownership before installation')
         except KeyError:
             run('useradd', '--system', '--user-group', '--home-dir', str(STATE), '--shell', '/usr/sbin/nologin', 'relaydeck')
             account = pwd.getpwnam('relaydeck')
+        for slot in range(1, policy['max_owners'] + 1):
+            uid = policy['uid_start'] + slot - 1
+            name = f'relaydeck-runner-{slot}'
+            run('groupadd', '--gid', str(uid), name)
+            run('useradd', '--uid', str(uid), '--gid', str(uid), '--home-dir', '/nonexistent', '--no-create-home', '--shell', '/usr/sbin/nologin', name)
         for path in (CONFIG, STATE, STATE / 'runtime', RELEASES, BIN.parent):
             path.mkdir(parents=True, exist_ok=True)
             root_path(path)

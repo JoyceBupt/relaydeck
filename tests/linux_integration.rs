@@ -178,6 +178,7 @@ for path in pathlib.Path('/proc').glob('[0-9]*/status'):
         r#"
 import subprocess,pathlib,time
 pathlib.Path('/run/relaydeck-check/authorization').write_text(str(int(time.time())+300))
+pathlib.Path('/run/relaydeck-check/bind-ready').write_text('1')
 result=subprocess.run(['setpriv','--reuid','60000','--regid','60000','--clear-groups','--no-new-privs','relaydeck','tenant','/usr/local/bin/realm','/run/relaydeck-check/realm.json','1','60000'],capture_output=True,timeout=3)
 assert result.returncode!=0 and b'account has expired' in result.stderr, ('expired startup verification',result.stdout,result.stderr)
 "#,

@@ -96,7 +96,7 @@ fn systemd_has_fixed_nonroot_identity_expiry_and_limits() {
         "SocketBindDeny=any\n",
         "SocketBindAllow=tcp:41000\n",
         "SocketBindAllow=udp:41000\n",
-        "ExecStart=/usr/local/libexec/relaydeck tenant /usr/local/libexec/realm /var/lib/relaydeck-runtime/owner-2/realm.json 2000 60001\n",
+        "ExecStart=/usr/local/libexec/relaydeck tenant /usr/local/libexec/realm /var/lib/relaydeck-runtime/owner-2/realm.json 2000 60001 2\n",
         "Slice=relaydeck.slice\n",
     ] {
         assert!(unit.contains(required), "missing {required}");
@@ -138,6 +138,16 @@ fn configurable_resource_limits_and_counter_updates_preserve_policy_checks() {
         relaydeck::linux::firewall_fingerprint(&original).unwrap(),
         relaydeck::linux::firewall_fingerprint(&counted).unwrap()
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fixed_system_tool_aliases_resolve_only_to_immutable_root_executables() {
+    if std::path::Path::new("/usr/sbin/ip").exists() {
+        let target = relaydeck::linux::system_tool(std::path::Path::new("/usr/sbin/ip")).unwrap();
+        assert!(target.is_file());
+    }
+    assert!(relaydeck::linux::system_tool(std::path::Path::new("/tmp/ip")).is_err());
 }
 
 #[test]

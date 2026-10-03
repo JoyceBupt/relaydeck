@@ -3,9 +3,19 @@ use std::path::Path;
 /// Runs inside the broker's systemd unit after all privileges were dropped.
 /// Check the absolute deadline after systemd's own startup work has finished.
 pub async fn run(realm: &Path, config: &Path, expires_at: i64, uid: u32) -> anyhow::Result<()> {
+    run_checked(realm, config, expires_at, uid, None).await
+}
+
+pub async fn run_checked(
+    realm: &Path,
+    config: &Path,
+    expires_at: i64,
+    uid: u32,
+    revision: Option<i64>,
+) -> anyhow::Result<()> {
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (realm, config, expires_at, uid);
+        let _ = (realm, config, expires_at, uid, revision);
         anyhow::bail!("the tenant runner requires Linux");
     }
     #[cfg(target_os = "linux")]
@@ -51,6 +61,31 @@ pub async fn run(realm: &Path, config: &Path, expires_at: i64, uid: u32) -> anyh
                     .context("expiry is out of range")?,
             )
         };
+        let ready = config
+            .parent()
+            .context("missing runtime directory")?
+            .join("bind-ready");
+        let wait_until = Instant::now() + Duration::from_secs(10);
+        loop {
+            if ready.try_exists()? {
+                validate_root_file(&ready)?;
+                let value: i64 = std::fs::read_to_string(&ready)?.parse()?;
+                if value > 0 && revision.is_none_or(|revision| value == revision) {
+                    break;
+                }
+            }
+            ensure!(
+                Instant::now() < wait_until,
+                "bind guard did not become ready"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        ensure!(
+            (expires_at == 0 || expires_at > crate::db::now())
+                && authorized_until > crate::db::now()
+                && Instant::now() < authorization_deadline,
+            "runtime authorization expired during bind-guard startup"
+        );
         let mut child = Command::new(realm)
             .args(["-c", config.to_str().context("invalid configuration path")?])
             .env_clear()

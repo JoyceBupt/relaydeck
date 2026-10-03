@@ -1,4 +1,5 @@
 pub mod api;
+pub mod bindguard;
 pub mod broker;
 pub mod config;
 pub mod credentials;

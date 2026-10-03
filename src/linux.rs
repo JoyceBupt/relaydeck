@@ -19,8 +19,6 @@ const SYSTEMCTL: &str = "/usr/bin/systemctl";
 const NFT: &str = "/usr/sbin/nft";
 const SS: &str = "/usr/bin/ss";
 const IP: &str = "/usr/sbin/ip";
-#[cfg(target_os = "linux")]
-const BPFTOOL: &str = "/usr/sbin/bpftool";
 const UNIT_DIR: &str = "/run/systemd/system";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(4);
 
@@ -267,7 +265,7 @@ pub fn render_systemd(
         .runtime_dir
         .join(format!("owner-{}/realm.json", plan.owner_id()));
     let mut unit = format!(
-        "[Unit]\nDescription=RelayDeck account {}\n\n[Service]\nType=exec\nUser={uid}\nGroup={uid}\nExecStart={} tenant {} {} {} {uid}\nRestart=no\nRuntimeMaxSec={lifetime}\nKillMode=control-group\nTimeoutStartSec=5s\nTimeoutStopSec=3s\nSendSIGKILL=yes\nUMask=0077\nNoNewPrivileges=yes\nCapabilityBoundingSet=\nAmbientCapabilities=\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectControlGroups=yes\nRestrictSUIDSGID=yes\nRestrictRealtime=yes\nLockPersonality=yes\nRestrictAddressFamilies=AF_INET AF_INET6\nSystemCallArchitectures=native\nMemoryHigh={memory_high}M\nMemoryMax={memory_max}M\nMemorySwapMax=0\nTasksMax={tasks}\nCPUQuota={cpu}%\nLimitNOFILE={nofile}\nLimitCORE=0\nSocketBindDeny=any\n",
+        "[Unit]\nDescription=RelayDeck account {}\n\n[Service]\nType=exec\nUser={uid}\nGroup={uid}\nExecStart={} tenant {} {} {} {uid} {revision}\nRestart=no\nRuntimeMaxSec={lifetime}\nKillMode=control-group\nTimeoutStartSec=5s\nTimeoutStopSec=3s\nSendSIGKILL=yes\nUMask=0077\nNoNewPrivileges=yes\nCapabilityBoundingSet=\nAmbientCapabilities=\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectControlGroups=yes\nRestrictSUIDSGID=yes\nRestrictRealtime=yes\nLockPersonality=yes\nRestrictAddressFamilies=AF_INET AF_INET6\nSystemCallArchitectures=native\nMemoryHigh={memory_high}M\nMemoryMax={memory_max}M\nMemorySwapMax=0\nTasksMax={tasks}\nCPUQuota={cpu}%\nLimitNOFILE={nofile}\nLimitCORE=0\nSocketBindDeny=any\n",
         plan.owner_id(),
         policy.runner_binary.display(),
         policy.realm_binary.display(),
@@ -278,6 +276,7 @@ pub fn render_systemd(
         tasks = policy.limits.tasks,
         cpu = policy.limits.cpu_percent,
         nofile = policy.limits.nofile,
+        revision = plan.revision(),
     );
     for rule in plan.rules() {
         if rule.protocol.tcp() {
@@ -453,6 +452,8 @@ pub struct LinuxDriver {
     plans: Mutex<BTreeMap<i64, RuntimePlan>>,
     firewall_digest: Mutex<Option<Vec<u8>>>,
     stop_attempts: Mutex<BTreeMap<i64, u8>>,
+    #[cfg(target_os = "linux")]
+    bindguards: Mutex<BTreeMap<i64, crate::bindguard::BindGuard>>,
 }
 
 pub fn validate_runtime_listeners(
@@ -568,18 +569,49 @@ pub(crate) fn secure_root_path(_path: &Path, _directory: bool) -> anyhow::Result
 #[cfg(target_os = "linux")]
 fn validate_uid_pool(policy: &BrokerPolicy) -> anyhow::Result<()> {
     let passwd = std::fs::read_to_string("/etc/passwd")?;
+    let mut found = HashSet::new();
     for line in passwd.lines() {
         if let Some(uid) = line
             .split(':')
             .nth(2)
             .and_then(|field| field.parse::<u32>().ok())
+            .filter(|uid| (policy.uid_start..policy.uid_start + policy.max_owners).contains(uid))
         {
+            let fields: Vec<_> = line.split(':').collect();
+            let owner = uid - policy.uid_start + 1;
             ensure!(
-                uid < policy.uid_start || uid >= policy.uid_start + policy.max_owners,
-                "dedicated runtime UID already belongs to a system account"
+                fields.len() == 7
+                    && fields[0] == format!("relaydeck-runner-{owner}")
+                    && fields[3].parse::<u32>() == Ok(uid)
+                    && fields[5] == "/nonexistent"
+                    && fields[6] == "/usr/sbin/nologin",
+                "runtime UID belongs to an unexpected account"
             );
+            found.insert(uid);
         }
     }
+    ensure!(
+        found.len() == policy.max_owners as usize,
+        "provision the dedicated runtime accounts before starting the broker"
+    );
+    let group = std::fs::read_to_string("/etc/group")?;
+    let mut groups = HashSet::new();
+    for line in group.lines() {
+        let fields: Vec<_> = line.split(':').collect();
+        if let Some(gid) = fields
+            .get(2)
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|gid| (policy.uid_start..policy.uid_start + policy.max_owners).contains(gid))
+        {
+            ensure!(
+                fields[0] == format!("relaydeck-runner-{}", gid - policy.uid_start + 1)
+                    && fields.get(3) == Some(&""),
+                "runtime group is shared with another account"
+            );
+            groups.insert(gid);
+        }
+    }
+    ensure!(groups == found, "dedicated runtime groups are missing");
     for entry in std::fs::read_dir("/proc")? {
         let entry = entry?;
         if !entry
@@ -613,9 +645,37 @@ fn validate_uid_pool(policy: &BrokerPolicy) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+pub fn system_tool(path: &Path) -> anyhow::Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    ensure!(
+        [SYSTEMCTL, NFT, SS, IP]
+            .iter()
+            .any(|tool| Path::new(tool) == path),
+        "unknown system tool"
+    );
+    validate_absolute_path(path)?;
+    let mut current = PathBuf::from("/");
+    for part in path.components().skip(1) {
+        current.push(part.as_os_str());
+        let meta = std::fs::symlink_metadata(&current)?;
+        ensure!(
+            meta.uid() == 0 && (meta.file_type().is_symlink() || meta.mode() & 0o022 == 0),
+            "system tool alias must be immutable and root owned"
+        );
+    }
+    let target = std::fs::canonicalize(path)?;
+    secure_root_path(&target, false)?;
+    Ok(target)
+}
+
 async fn command(program: &str, args: &[&str], input: Option<&[u8]>) -> anyhow::Result<Vec<u8>> {
     use std::process::Stdio;
-    let mut builder = Command::new(program);
+    #[cfg(target_os = "linux")]
+    let executable = system_tool(Path::new(program))?;
+    #[cfg(not(target_os = "linux"))]
+    let executable = PathBuf::from(program);
+    let mut builder = Command::new(executable);
     builder
         .args(args)
         .env_clear()
@@ -759,8 +819,8 @@ impl LinuxDriver {
                 Path::new("/sys/fs/cgroup/cgroup.controllers").is_file(),
                 "unified cgroups are required"
             );
-            for tool in [SYSTEMCTL, NFT, SS, IP, BPFTOOL] {
-                secure_root_path(Path::new(tool), false)?;
+            for tool in [SYSTEMCTL, NFT, SS, IP] {
+                system_tool(Path::new(tool))?;
             }
             validate_uid_pool(&policy)?;
             for flags in ["-Hlnte", "-Hlnue"] {
@@ -774,6 +834,7 @@ impl LinuxDriver {
                 plans: Mutex::new(BTreeMap::new()),
                 firewall_digest: Mutex::new(None),
                 stop_attempts: Mutex::new(BTreeMap::new()),
+                bindguards: Mutex::new(BTreeMap::new()),
             };
             // On broker restart discard every old runtime first; reconstruct
             // desired state from fresh DB snapshots rather than trusting files.
@@ -979,37 +1040,11 @@ impl LinuxDriver {
                     == quota[1].checked_mul(u64::from(self.policy.limits.cpu_percent)),
             "effective CPU quota differs"
         );
-        let output = command(
-            BPFTOOL,
-            &[
-                "-j",
-                "cgroup",
-                "show",
-                directory.to_str().context("invalid cgroup path")?,
-            ],
-            None,
-        )
-        .await?;
-        let programs: Vec<serde_json::Value> =
-            serde_json::from_slice(&output).context("no socket-bind BPF programs attached")?;
-        for hook in ["cgroup_inet4_bind", "cgroup_inet6_bind"] {
-            let short = if hook == "cgroup_inet4_bind" {
-                "bind4"
-            } else {
-                "bind6"
-            };
-            ensure!(
-                programs.iter().any(|program| program
-                    .get("attach_type")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|value| value == hook || value == short)
-                    && program
-                        .get("id")
-                        .and_then(serde_json::Value::as_u64)
-                        .is_some_and(|id| id > 0)),
-                "socket-bind BPF hook {hook} is not attached"
-            );
-        }
+        let guards = self.bindguards.lock().await;
+        guards
+            .get(&plan.owner_id())
+            .context("missing bind guard")?
+            .verify(&directory)?;
         Ok(())
     }
 
@@ -1192,9 +1227,29 @@ impl LinuxDriver {
                 0,
             )?;
             command(SYSTEMCTL, &["daemon-reload"], None).await?;
-            plans.insert(plan.owner_id(), plan.clone());
-            self.firewall(&plans).await?;
+            write_root_file(&directory.join("bind-ready"), b"0", 0o640, uid)?;
             command(SYSTEMCTL, &["start", &unit], None).await?;
+            let output = command(
+                SYSTEMCTL,
+                &["show", "--property=ControlGroup", "--value", &unit],
+                None,
+            )
+            .await?;
+            let group = std::str::from_utf8(&output)?.trim();
+            validate_absolute_path(Path::new(group))?;
+            ensure!(
+                group.ends_with(&format!("/relaydeck-owner-{}.service", plan.owner_id())),
+                "unexpected bind-guard cgroup"
+            );
+            let cgroup = Path::new("/sys/fs/cgroup").join(group.trim_start_matches('/'));
+            let guard = crate::bindguard::BindGuard::attach(&plan, &cgroup)?;
+            self.bindguards.lock().await.insert(plan.owner_id(), guard);
+            write_root_file(
+                &directory.join("bind-ready"),
+                plan.revision().to_string().as_bytes(),
+                0o640,
+                uid,
+            )?;
             // realm may start successfully before every async listener binds.
             for attempt in 0..3 {
                 if plan.expires_at().is_some_and(|expiry| expiry <= now()) {
@@ -1207,6 +1262,8 @@ impl LinuxDriver {
                 }
             }
             self.confirm_service(&plan).await?;
+            plans.insert(plan.owner_id(), plan.clone());
+            self.firewall(&plans).await?;
             Ok(())
         }
         #[cfg(not(target_os = "linux"))]
@@ -1223,7 +1280,12 @@ impl LinuxDriver {
         }
         let mut plans = self.plans.lock().await;
         plans.remove(&owner_id);
-        fail_closed_cleanup(self.firewall(&plans), self.stop_service(owner_id)).await
+        let result = fail_closed_cleanup(self.firewall(&plans), self.stop_service(owner_id)).await;
+        #[cfg(target_os = "linux")]
+        if result.is_ok() {
+            self.bindguards.lock().await.remove(&owner_id);
+        }
+        result
     }
 
     pub(crate) fn renew_authorization(&self, plan: &RuntimePlan) -> anyhow::Result<()> {
