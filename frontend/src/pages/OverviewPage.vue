@@ -18,7 +18,7 @@ const retry = useRetry()
 const ports = usePorts(computed(() => (isAdmin.value ? null : currentUser.value?.id)))
 
 const all = computed(() => rules.data.value ?? [])
-const statusOrder: RuntimeStatus[] = ['active', 'pending', 'failed', 'stopped']
+const statusOrder: RuntimeStatus[] = ['active', 'pending', 'failed', 'blocked', 'stopped']
 const counts = computed(() => statusOrder.map(status => ({ status, count: all.value.filter(rule => rule.runtime_status === status).length })))
 const statuses = computed(() => Object.fromEntries(all.value.map(rule => [rule.id, { name: rule.name, status: rule.runtime_status }])))
 

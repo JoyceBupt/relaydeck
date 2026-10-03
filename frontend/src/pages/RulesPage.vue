@@ -29,7 +29,7 @@ const retry = useRetry()
 
 type Filter = 'all' | RuntimeStatus
 const filter = computed<Filter>({
-  get: () => (['active', 'pending', 'failed', 'stopped'].includes(String(route.query.status)) ? route.query.status as Filter : 'all'),
+  get: () => (['active', 'pending', 'failed', 'blocked', 'stopped'].includes(String(route.query.status)) ? route.query.status as Filter : 'all'),
   set: value => router.replace({ query: { ...route.query, status: value === 'all' ? undefined : value } }),
 })
 const ownerFilter = computed<number | null>({
@@ -47,11 +47,11 @@ const searched = computed(() => {
 })
 const visible = computed(() => searched.value.filter(rule => filter.value === 'all' || rule.runtime_status === filter.value))
 const counts = computed(() => {
-  const result: Record<Filter, number> = { all: searched.value.length, active: 0, pending: 0, failed: 0, stopped: 0 }
+  const result: Record<Filter, number> = { all: searched.value.length, active: 0, pending: 0, failed: 0, blocked: 0, stopped: 0 }
   for (const rule of searched.value) result[rule.runtime_status]++
   return result
 })
-const filterOptions = computed(() => (['all', 'active', 'pending', 'failed', 'stopped'] as Filter[]).map(value => ({
+const filterOptions = computed(() => (['all', 'active', 'pending', 'failed', 'blocked', 'stopped'] as Filter[]).map(value => ({
   value, label: value === 'all' ? '全部' : statusLabels[value], count: counts.value[value],
 })))
 const ownerOptions = computed(() => (users.data.value ?? []).filter(user => all.value.some(rule => rule.owner_id === user.id) || user.id === ownerFilter.value))
@@ -232,6 +232,7 @@ const cloneSource = computed(() => (route.name === 'rule-new' && route.query.fro
                 <RouterLink :to="{ path: `/rules/${rule.id}`, query: route.query }" class="block truncate font-medium text-fg" @click.stop>{{ rule.name }}</RouterLink>
                 <p class="truncate text-xs" :class="rule.runtime_error ? 'text-danger' : 'text-muted'">
                   <template v-if="rule.runtime_status === 'failed'">失败{{ rule.runtime_error ? `：${rule.runtime_error}` : '' }}</template>
+                  <template v-else-if="rule.runtime_status === 'blocked'">已阻断{{ rule.dns_error ? `：${rule.dns_error}` : '' }}</template>
                   <template v-else>{{ statusLabels[rule.runtime_status] }}{{ isAdmin ? ` · ${rule.owner_username}` : '' }}</template>
                 </p>
               </div>

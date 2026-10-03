@@ -4,7 +4,7 @@ import type { RuntimeStatus } from '../types'
 import { statusLabels } from '../lib/format'
 
 const props = withDefaults(defineProps<{ status: RuntimeStatus; label?: boolean; text?: string }>(), { label: false })
-const tone = computed(() => ({ active: 'text-success', pending: 'text-warning', failed: 'text-danger', stopped: 'text-faint' })[props.status])
+const tone = computed(() => ({ active: 'text-success', pending: 'text-warning', failed: 'text-danger', stopped: 'text-faint', blocked: 'text-danger' })[props.status])
 </script>
 
 <template>
@@ -19,6 +19,10 @@ const tone = computed(() => ({ active: 'text-success', pending: 'text-warning', 
       <g v-else-if="status === 'failed'">
         <circle cx="8" cy="8" r="6" fill="currentColor" />
         <path d="M5.75 5.75l4.5 4.5m0-4.5l-4.5 4.5" class="stroke-surface" stroke-width="1.6" stroke-linecap="round" />
+      </g>
+      <g v-else-if="status === 'blocked'">
+        <circle cx="8" cy="8" r="5.5" fill="none" stroke="currentColor" stroke-width="1.5" />
+        <path d="M4 12l8-8" stroke="currentColor" stroke-width="1.5" />
       </g>
       <circle v-else cx="8" cy="8" r="4.25" fill="none" stroke="currentColor" stroke-width="1.5" />
     </svg>

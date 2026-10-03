@@ -149,7 +149,7 @@ const expiryInfo = computed(() => (user.value ? expiry(user.value.expires_at) : 
 </script>
 
 <template>
-  <SideDrawer :open="open" :title="isNew ? '新建账户' : user?.username ?? '账户'" :description="isNew ? '为租户分配端口段、规则额度和有效期。' : user ? `ID ${user.id} · 租户` : undefined" @close="requestClose" @before-close="onBeforeClose">
+  <SideDrawer :open="open" :title="isNew ? '新建账户' : user?.username ?? '账户'" :description="isNew ? '为租户分配端口段、规则额度和有效期。' : user ? `ID ${user.id} · ${user.role === 'admin' ? '管理员' : '租户'}` : undefined" @close="requestClose" @before-close="onBeforeClose">
     <div v-if="missing" class="rounded-lg border border-line px-4 py-8 text-center text-muted">账户不存在</div>
     <div v-else class="grid gap-6">
       <section v-if="user" class="grid gap-3">
