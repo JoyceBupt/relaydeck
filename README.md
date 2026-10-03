@@ -17,7 +17,7 @@
 
 ## 部署
 
-使用 [Releases](https://github.com/JoyceBupt/relaydeck/releases) 中的预编译包；服务器无需 Rust、Node 或 pnpm。首个正式版本尚未发布。
+使用 [Releases](https://github.com/JoyceBupt/relaydeck/releases) 中的预编译包；服务器无需 Rust、Node 或 pnpm。
 
 要求：Linux、systemd、cgroup v2、内核 cgroup BPF、Python 3.11+、nftables、iproute2 和 Caddy。发布包基于 Debian 12 构建，支持 x86_64 / ARM64；Realm 2.9.6 独立安装。
 
