@@ -30,6 +30,7 @@ pub struct AppState {
     dummy_hash: Arc<String>,
     network_limits: Arc<Mutex<crate::limits::Limits>>,
     account_limits: Arc<Mutex<crate::limits::Limits>>,
+    account_failure_limits: Arc<Mutex<crate::limits::Limits>>,
     mutation_limits: Arc<Mutex<crate::limits::Limits>>,
 }
 
@@ -47,7 +48,8 @@ impl AppState {
             mfa,
             dummy_hash: Arc::new(dummy_hash),
             network_limits: Arc::new(Mutex::new(crate::limits::Limits::new(4096))),
-            account_limits: Arc::new(Mutex::new(crate::limits::Limits::new(1024))),
+            account_limits: Arc::new(Mutex::new(crate::limits::Limits::new(4096))),
+            account_failure_limits: Arc::new(Mutex::new(crate::limits::Limits::new(1024))),
             mutation_limits: Arc::new(Mutex::new(crate::limits::Limits::new(1024))),
         })
     }
@@ -233,6 +235,28 @@ pub async fn record_audit(
     Ok(())
 }
 
+pub async fn record_system_audit(
+    tx: &mut Transaction<'_, Sqlite>,
+    action: &str,
+    rule_id: i64,
+) -> Result<(), ApiError> {
+    sqlx::query("INSERT INTO audit_events(actor_id,actor_username,action,resource_id,created_at,resource_kind,resource_name,resource_port) SELECT NULL,'系统',?,id,?,'rule',name,listen_port FROM rules WHERE id=?")
+        .bind(action).bind(now()).bind(rule_id).execute(&mut **tx).await?;
+    sqlx::query("DELETE FROM audit_events WHERE id IN (SELECT id FROM audit_events ORDER BY id DESC LIMIT -1 OFFSET 10000)").execute(&mut **tx).await?;
+    Ok(())
+}
+
+async fn record_authentication_failure(
+    tx: &mut Transaction<'_, Sqlite>,
+    user: &DbUser,
+    action: &str,
+) -> Result<(), ApiError> {
+    sqlx::query("INSERT INTO authentication_failures(user_id,username,action,bucket,count,last_seen) VALUES(?,?,?,?,1,?) ON CONFLICT(user_id,action,bucket) DO UPDATE SET count=count+1,last_seen=excluded.last_seen")
+        .bind(user.id).bind(&user.username).bind(action).bind(now()/3600).bind(now()).execute(&mut **tx).await?;
+    sqlx::query("DELETE FROM authentication_failures WHERE id IN (SELECT id FROM authentication_failures ORDER BY last_seen DESC,id DESC LIMIT -1 OFFSET 1000)").execute(&mut **tx).await?;
+    Ok(())
+}
+
 pub async fn enqueue_apply(
     tx: &mut Transaction<'_, Sqlite>,
     owner_id: i64,
@@ -312,11 +336,12 @@ async fn login(
     } else {
         peer_ip
     };
+    let network = crate::limits::network_key(ip);
     if !state
         .network_limits
         .lock()
         .await
-        .admit(crate::limits::network_key(ip), 32, now())
+        .admit(network.clone(), 32, now())
     {
         return Err(ApiError::rate_limited());
     }
@@ -329,7 +354,7 @@ async fn login(
             .account_limits
             .lock()
             .await
-            .admit(user.id.to_string(), 8, now())
+            .admit(format!("{}:{network}", user.id), 8, now())
     {
         return Err(ApiError::rate_limited());
     }
@@ -346,7 +371,17 @@ async fn login(
     };
     if !verified || !user.available() {
         let mut tx = state.pool.begin().await?;
-        record_audit(&mut tx, &user, "login_failed", Some(user.id)).await?;
+        // The wider account budget only gates failed credentials: distributed
+        // guesses must never prevent a correct password on another network.
+        if !state
+            .account_failure_limits
+            .lock()
+            .await
+            .admit(user.id.to_string(), 128, now())
+        {
+            return Err(ApiError::rate_limited());
+        }
+        record_authentication_failure(&mut tx, &user, "login_failed").await?;
         tx.commit().await?;
         return Err(ApiError::unauthorized());
     }
@@ -390,6 +425,16 @@ async fn login(
         .bind(token_hash(&token)).bind(user.id).bind(&csrf_token).bind(user.auth_version).bind(now()+8*3600).bind(now()).execute(&mut *tx).await?;
     record_audit(&mut tx, &user, "login", Some(user.id)).await?;
     tx.commit().await?;
+    state
+        .account_limits
+        .lock()
+        .await
+        .reset(&format!("{}:{network}", user.id));
+    state
+        .account_failure_limits
+        .lock()
+        .await
+        .reset(&user.id.to_string());
     let value = SessionView {
         user: user_view(&state.pool, user.id).await?,
         csrf_token,
@@ -552,7 +597,7 @@ async fn record_mfa_failure(
         .bind(user.id)
         .execute(&mut **tx)
         .await?;
-    record_audit(tx, user, action, Some(user.id)).await
+    record_authentication_failure(tx, user, action).await
 }
 
 async fn reauthenticate(
@@ -953,6 +998,7 @@ async fn preferences(
 
 #[derive(Serialize, sqlx::FromRow)]
 struct AuditView {
+    failure_count: i64,
     id: i64,
     actor_username: String,
     action: String,
@@ -971,7 +1017,7 @@ async fn audit(
     auth: AuthContext,
 ) -> Result<Json<Vec<AuditView>>, ApiError> {
     auth.admin()?;
-    Ok(Json(sqlx::query_as("SELECT id,actor_username,action,resource_id,resource_kind,resource_name,resource_port,created_at FROM audit_events ORDER BY id DESC LIMIT 200").fetch_all(&state.pool).await?))
+    Ok(Json(sqlx::query_as("SELECT * FROM (SELECT id,actor_username,action,resource_id,resource_kind,resource_name,resource_port,created_at,0 AS failure_count FROM audit_events ORDER BY id DESC LIMIT 200) UNION ALL SELECT * FROM (SELECT -id,username,action,user_id,'user',username,NULL,last_seen,count FROM authentication_failures ORDER BY last_seen DESC,id DESC LIMIT 50) ORDER BY created_at DESC,id DESC").fetch_all(&state.pool).await?))
 }
 
 #[derive(Serialize)]

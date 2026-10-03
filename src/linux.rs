@@ -123,7 +123,7 @@ impl Default for ResourceLimits {
         Self {
             memory_high_mb: 32,
             memory_max_mb: 64,
-            tasks: 16,
+            tasks: 96,
             cpu_percent: 20,
             nofile: 512,
             total_memory_mb: 384,
@@ -155,10 +155,10 @@ impl BrokerPolicy {
             "invalid memory limits"
         );
         ensure!(
-            (4..=256).contains(&limits.tasks)
+            (64..=256).contains(&limits.tasks)
                 && (128..=65536).contains(&limits.nofile)
                 && (1..=800).contains(&limits.cpu_percent),
-            "invalid tenant limits"
+            "invalid tenant limits: tasks must be 64..256 for the per-rule supervisor"
         );
         ensure!(
             limits.total_memory_mb >= limits.memory_max_mb
@@ -263,9 +263,9 @@ pub fn render_systemd(
     };
     let config = policy
         .runtime_dir
-        .join(format!("owner-{}/realm.json", plan.owner_id()));
+        .join(format!("owner-{}/plan.json", plan.owner_id()));
     let mut unit = format!(
-        "[Unit]\nDescription=RelayDeck account {}\n\n[Service]\nType=exec\nUser={uid}\nGroup={uid}\nExecStart={} tenant {} {} {} {uid} {revision}\nRestart=no\nRuntimeMaxSec={lifetime}\nKillMode=control-group\nTimeoutStartSec=5s\nTimeoutStopSec=3s\nSendSIGKILL=yes\nUMask=0077\nNoNewPrivileges=yes\nCapabilityBoundingSet=\nAmbientCapabilities=\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectControlGroups=yes\nRestrictSUIDSGID=yes\nRestrictRealtime=yes\nLockPersonality=yes\nRestrictAddressFamilies=AF_INET AF_INET6\nSystemCallArchitectures=native\nMemoryHigh={memory_high}M\nMemoryMax={memory_max}M\nMemorySwapMax=0\nTasksMax={tasks}\nCPUQuota={cpu}%\nLimitNOFILE={nofile}\nLimitCORE=0\nSocketBindDeny=any\n",
+        "[Unit]\nDescription=RelayDeck account {}\n\n[Service]\nType=exec\nUser={uid}\nGroup={uid}\nExecStart={} tenant-plan {} {} {} {uid} {revision}\nRestart=no\nRuntimeMaxSec={lifetime}\nKillMode=control-group\nTimeoutStartSec=5s\nTimeoutStopSec=3s\nSendSIGKILL=yes\nUMask=0077\nNoNewPrivileges=yes\nCapabilityBoundingSet=\nAmbientCapabilities=\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectControlGroups=yes\nRestrictSUIDSGID=yes\nRestrictRealtime=yes\nLockPersonality=yes\nRestrictAddressFamilies=AF_INET AF_INET6\nSystemCallArchitectures=native\nMemoryHigh={memory_high}M\nMemoryMax={memory_max}M\nMemorySwapMax=0\nTasksMax={tasks}\nCPUQuota={cpu}%\nLimitNOFILE={nofile}\nLimitCORE=0\nSocketBindDeny=any\n",
         plan.owner_id(),
         policy.runner_binary.display(),
         policy.realm_binary.display(),
@@ -278,14 +278,22 @@ pub fn render_systemd(
         nofile = policy.limits.nofile,
         revision = plan.revision(),
     );
-    for rule in plan.rules() {
-        if rule.protocol.tcp() {
-            unit.push_str(&format!("SocketBindAllow=tcp:{}\n", rule.listen_port));
-        }
-        if rule.protocol.udp() {
-            unit.push_str(&format!("SocketBindAllow=udp:{}\n", rule.listen_port));
-        }
+    // systemd's optional guard covers the account grant; the independent BPF
+    // guard below restricts binds to the currently active rules.
+    for protocol in ["tcp", "udp"] {
+        unit.push_str(&format!(
+            "SocketBindAllow={protocol}:{}-{}\n",
+            plan.port_start(),
+            plan.port_end()
+        ));
     }
+    unit.push_str(&format!(
+        "ReadWritePaths={}\n",
+        policy
+            .runtime_dir
+            .join(format!("owner-{}/applied-revision", plan.owner_id()))
+            .display()
+    ));
     unit.push_str("Slice=relaydeck.slice\n");
     Ok(unit)
 }
@@ -451,7 +459,7 @@ pub struct LinuxDriver {
     policy: BrokerPolicy,
     plans: Mutex<BTreeMap<i64, RuntimePlan>>,
     firewall_digest: Mutex<Option<Vec<u8>>>,
-    stop_attempts: Mutex<BTreeMap<i64, u8>>,
+    global_failures: Mutex<u8>,
     #[cfg(target_os = "linux")]
     bindguards: Mutex<BTreeMap<i64, crate::bindguard::BindGuard>>,
 }
@@ -669,6 +677,10 @@ pub fn system_tool(path: &Path) -> anyhow::Result<PathBuf> {
     Ok(target)
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("runtime command unavailable: {0}")]
+struct CommandUnavailable(String);
+
 async fn command(program: &str, args: &[&str], input: Option<&[u8]>) -> anyhow::Result<Vec<u8>> {
     use std::process::Stdio;
     #[cfg(target_os = "linux")]
@@ -691,26 +703,30 @@ async fn command(program: &str, args: &[&str], input: Option<&[u8]>) -> anyhow::
         .kill_on_drop(true);
     let mut child = builder
         .spawn()
-        .with_context(|| format!("start {program}"))?;
+        .map_err(|error| CommandUnavailable(format!("start {program}: {error}")))?;
     if let Some(input) = input {
         let mut stdin = child.stdin.take().context("missing command stdin")?;
         tokio::time::timeout(COMMAND_TIMEOUT, stdin.write_all(input))
             .await
-            .context("command input timed out")??;
+            .map_err(|_| CommandUnavailable("command input timed out".into()))?
+            .map_err(|error| CommandUnavailable(error.to_string()))?;
         drop(stdin);
     }
     let output = tokio::time::timeout(COMMAND_TIMEOUT, child.wait_with_output())
         .await
-        .context("runtime command timed out")??;
-    ensure!(
-        output.status.success(),
-        "{program} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-            .chars()
-            .filter(|value| !value.is_control())
-            .take(240)
-            .collect::<String>()
-    );
+        .map_err(|_| CommandUnavailable("command timed out".into()))?
+        .map_err(|error| CommandUnavailable(error.to_string()))?;
+    if !output.status.success() {
+        return Err(CommandUnavailable(format!(
+            "{program} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(240)
+                .collect::<String>()
+        ))
+        .into());
+    }
     ensure!(
         output.stdout.len() <= 4 * 1024 * 1024,
         "runtime command response too large"
@@ -822,6 +838,11 @@ impl LinuxDriver {
             for tool in [SYSTEMCTL, NFT, SS, IP] {
                 system_tool(Path::new(tool))?;
             }
+            validate_reserved_ports(
+                &std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_reserved_ports")?,
+                policy.allowed_port_start,
+                policy.allowed_port_end,
+            )?;
             validate_uid_pool(&policy)?;
             for flags in ["-Hlnte", "-Hlnue"] {
                 let listeners = command(SS, &[flags], None).await?;
@@ -833,13 +854,18 @@ impl LinuxDriver {
                 policy,
                 plans: Mutex::new(BTreeMap::new()),
                 firewall_digest: Mutex::new(None),
-                stop_attempts: Mutex::new(BTreeMap::new()),
+                global_failures: Mutex::new(0),
                 bindguards: Mutex::new(BTreeMap::new()),
             };
             // On broker restart discard every old runtime first; reconstruct
             // desired state from fresh DB snapshots rather than trusting files.
             let plans = driver.plans.lock().await;
-            fail_closed_cleanup(driver.firewall(&plans), driver.stop_all_services()).await?;
+            // Install default-drop first. An unkillable tenant remains isolated,
+            // but cannot prevent the broker from serving every other tenant.
+            driver.firewall(&plans).await?;
+            if let Err(error) = driver.stop_all_services().await {
+                tracing::error!(%error,"startup tenant cleanup incomplete; quarantined tenants will be retried on apply");
+            }
             drop(plans);
             Ok(driver)
         }
@@ -864,15 +890,46 @@ impl LinuxDriver {
     pub async fn unhealthy_owners(&self) -> Vec<(i64, i64, String, bool)> {
         let plans = self.plans.lock().await;
         let global = async {
-            let actual = command(NFT, &["-j", "list", "table", "inet", "relaydeck"], None).await?;
+            let actual =
+                match command(NFT, &["-j", "list", "table", "inet", "relaydeck"], None).await {
+                    Ok(actual) => actual,
+                    Err(error) => {
+                        tracing::warn!(%error,"firewall query failed; attempting policy repair");
+                        self.firewall(&plans).await?;
+                        command(NFT, &["-j", "list", "table", "inet", "relaydeck"], None).await?
+                    }
+                };
             let value: serde_json::Value = serde_json::from_slice(&actual)?;
-            ensure!(
-                self.firewall_digest.lock().await.as_ref() == Some(&firewall_fingerprint(&value)?),
-                "runtime firewall changed outside the executor"
-            );
+            let changed =
+                self.firewall_digest.lock().await.as_ref() != Some(&firewall_fingerprint(&value)?);
+            if changed {
+                tracing::warn!("runtime firewall changed; rebuilding root policy");
+                self.firewall(&plans).await?;
+            }
             interface_ips().await
         }
         .await;
+        let mut failures = self.global_failures.lock().await;
+        if let Err(error) = &global {
+            *failures = failures.saturating_add(1);
+            tracing::warn!(consecutive=*failures,%error,"global runtime check failed");
+            if *failures < 3 {
+                return Vec::new();
+            }
+            return plans
+                .values()
+                .map(|plan| {
+                    (
+                        plan.owner_id(),
+                        plan.revision(),
+                        format!("全局检查连续失败：{error}"),
+                        true,
+                    )
+                })
+                .collect();
+        }
+        *failures = 0;
+        drop(failures);
         let mut unhealthy = Vec::new();
         for plan in plans.values() {
             let check = async {
@@ -896,7 +953,8 @@ impl LinuxDriver {
             }
             .await;
             if let Err(error) = check {
-                let retryable = error.downcast_ref::<RuntimeExited>().is_some();
+                let retryable = error.downcast_ref::<RuntimeExited>().is_some()
+                    || error.downcast_ref::<CommandUnavailable>().is_some();
                 unhealthy.push((
                     plan.owner_id(),
                     plan.revision(),
@@ -1049,19 +1107,9 @@ impl LinuxDriver {
     }
 
     async fn stop_service(&self, owner_id: i64) -> anyhow::Result<()> {
-        let mut attempts = self.stop_attempts.lock().await;
-        let count = attempts.entry(owner_id).or_default();
-        ensure!(
-            *count < 3,
-            "runtime stop retry limit reached; operator action required"
-        );
-        *count += 1;
-        drop(attempts);
-        let result = self.stop_service_inner(owner_id).await;
-        if result.is_ok() {
-            self.stop_attempts.lock().await.remove(&owner_id);
-        }
-        result
+        // One bounded command per poll; transient failures do not exhaust a
+        // lifetime budget or prevent future cleanup after the host recovers.
+        self.stop_service_inner(owner_id).await
     }
 
     async fn stop_service_inner(&self, owner_id: i64) -> anyhow::Result<()> {
@@ -1157,6 +1205,37 @@ impl LinuxDriver {
 
     async fn apply_plan(&self, raw: &RuntimePlan) -> anyhow::Result<()> {
         self.policy.uid(raw.owner_id())?;
+        {
+            let mut plans = self.plans.lock().await;
+            if plans.get(&raw.owner_id()).is_some_and(|existing| {
+                existing.rules() == raw.rules()
+                    && existing.expires_at() == raw.expires_at()
+                    && existing.port_start() == raw.port_start()
+                    && existing.port_end() == raw.port_end()
+            }) {
+                if self.runtime_present(raw)? {
+                    // Renewals inspect kernel state without spawning tools.
+                    let plan = raw.validate_again(
+                        &self.policy.boundary(self.policy.local_ips.clone()),
+                        now(),
+                    )?;
+                    ensure!(!plan.stopped(), "runtime authorization expired");
+                    self.renew_authorization(&plan)?;
+                    plans.insert(plan.owner_id(), plan);
+                    return Ok(());
+                }
+                let authorization = self
+                    .policy
+                    .runtime_dir
+                    .join(format!("owner-{}/authorization", raw.owner_id()));
+                let until: i64 = std::fs::read_to_string(authorization)?.parse()?;
+                // A crash consumes the bounded worker retry budget. A known
+                // expired lease can be restarted with this fresh authorization.
+                if until > now() {
+                    return Err(RuntimeExited.into());
+                }
+            }
+        }
         let local_ips = interface_ips().await?;
         let plan = raw.validate_again(
             &self.policy.boundary(
@@ -1176,12 +1255,38 @@ impl LinuxDriver {
             "account grant exceeds root global port boundary"
         );
         let mut plans = self.plans.lock().await;
-        if plans.get(&plan.owner_id()).is_some_and(|existing| {
-            existing.rules() == plan.rules() && existing.expires_at() == plan.expires_at()
-        }) {
-            // Metadata changes and authorization renewals preserve live connections.
+        #[cfg(target_os = "linux")]
+        if let Some(previous) = plans.get(&plan.owner_id())
+            && previous.expires_at() == plan.expires_at()
+            && previous.port_start() == plan.port_start()
+            && previous.port_end() == plan.port_end()
+            && !plan.stopped()
+            && self.runtime_present(previous)?
+        {
+            let directory = self
+                .policy
+                .runtime_dir
+                .join(format!("owner-{}", plan.owner_id()));
+            self.confirm_service(previous).await?;
+            let cgroup = Path::new("/sys/fs/cgroup/relaydeck.slice")
+                .join(format!("relaydeck-owner-{}.service", plan.owner_id()));
+            // Restrict network access first, then bind permissions, then publish
+            // the child plan. Unchanged rules retain their processes and sockets.
+            let mut next = plans.clone();
+            next.insert(plan.owner_id(), plan.clone());
+            self.firewall(&next).await?;
+            let mut guards = self.bindguards.lock().await;
+            let replacement = guards
+                .get(&plan.owner_id())
+                .context("missing bind guard")?
+                .replace(&plan, &cgroup)?;
+            guards.insert(plan.owner_id(), replacement);
+            drop(guards);
+            self.write_plan(&plan, &directory)?;
             self.renew_authorization(&plan)?;
-            plans.insert(plan.owner_id(), plan);
+            self.confirm_applied(&plan, &directory).await?;
+            self.confirm_service(&plan).await?;
+            *plans = next;
             return Ok(());
         }
         plans.remove(&plan.owner_id());
@@ -1212,12 +1317,8 @@ impl LinuxDriver {
             }
             secure_root_path(&directory, true)?;
             std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755))?;
-            write_root_file(
-                &directory.join("realm.json"),
-                &plan.realm_json()?,
-                0o640,
-                uid,
-            )?;
+            self.write_plan(&plan, &directory)?;
+            initialize_ack(&directory.join("applied-revision"), uid)?;
             self.renew_authorization(&plan)?;
             let unit = format!("relaydeck-owner-{}.service", plan.owner_id());
             write_root_file(
@@ -1250,17 +1351,7 @@ impl LinuxDriver {
                 0o640,
                 uid,
             )?;
-            // realm may start successfully before every async listener binds.
-            for attempt in 0..3 {
-                if plan.expires_at().is_some_and(|expiry| expiry <= now()) {
-                    anyhow::bail!("account expired during start");
-                }
-                match self.confirm_listeners(plan.owner_id(), Some(&plan)).await {
-                    Ok(()) => break,
-                    Err(error) if attempt == 2 => return Err(error),
-                    Err(_) => tokio::time::sleep(Duration::from_secs(1)).await,
-                }
-            }
+            self.confirm_applied(&plan, &directory).await?;
             self.confirm_service(&plan).await?;
             plans.insert(plan.owner_id(), plan.clone());
             self.firewall(&plans).await?;
@@ -1272,6 +1363,131 @@ impl LinuxDriver {
         }
     }
 
+    #[cfg(not(target_os = "linux"))]
+    fn runtime_present(&self, _plan: &RuntimePlan) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn runtime_present(&self, plan: &RuntimePlan) -> anyhow::Result<bool> {
+        use std::io::BufRead;
+        let directory = Path::new("/sys/fs/cgroup/relaydeck.slice")
+            .join(format!("relaydeck-owner-{}.service", plan.owner_id()));
+        let pids = match std::fs::read_to_string(directory.join("cgroup.procs")) {
+            Ok(pids) => pids,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let uid = self.policy.uid(plan.owner_id())?;
+        let mut runners = 0;
+        let mut children = 0;
+        for pid in pids.split_whitespace() {
+            let pid: u32 = pid.parse()?;
+            let base = Path::new("/proc").join(pid.to_string());
+            let executable = match std::fs::read_link(base.join("exe")) {
+                Ok(path) => path,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error.into()),
+            };
+            let status = match std::fs::read_to_string(base.join("status")) {
+                Ok(status) => status,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error.into()),
+            };
+            ensure!(
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Uid:"))
+                    .is_some_and(|values| values
+                        .split_whitespace()
+                        .all(|value| value.parse::<u32>() == Ok(uid))),
+                "runtime identity changed"
+            );
+            if executable == self.policy.runner_binary {
+                runners += 1;
+            } else if executable == self.policy.realm_binary {
+                children += 1;
+            } else {
+                anyhow::bail!("unexpected runtime executable");
+            }
+        }
+        if runners != 1 || children != plan.rules().len() {
+            return Ok(false);
+        }
+        let mut sockets = HashSet::new();
+        for (protocol, name) in [
+            ("tcp", "tcp"),
+            ("tcp", "tcp6"),
+            ("udp", "udp"),
+            ("udp", "udp6"),
+        ] {
+            let file = std::fs::File::open(Path::new("/proc/net").join(name))?;
+            for line in std::io::BufReader::new(file).lines().skip(1) {
+                let line = line?;
+                let fields: Vec<_> = line.split_whitespace().collect();
+                if fields.get(7).and_then(|value| value.parse::<u32>().ok()) != Some(uid)
+                    || (protocol == "tcp" && fields.get(3) != Some(&"0A"))
+                {
+                    continue;
+                }
+                let port = fields
+                    .get(1)
+                    .and_then(|address| address.rsplit_once(':'))
+                    .context("invalid kernel socket address")?
+                    .1;
+                sockets.insert((protocol, u16::from_str_radix(port, 16)?));
+            }
+        }
+        Ok(validate_runtime_listeners(Some(plan), &sockets).is_ok())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_plan(&self, plan: &RuntimePlan, directory: &Path) -> anyhow::Result<()> {
+        let uid = self.policy.uid(plan.owner_id())?;
+        for rule in plan.rules() {
+            write_root_file(
+                &directory.join(format!("rule-{}.json", rule.id)),
+                &plan.rule_json(rule.id)?,
+                0o640,
+                uid,
+            )?;
+        }
+        write_root_file(
+            &directory.join("plan.json"),
+            &serde_json::to_vec(plan)?,
+            0o640,
+            uid,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn confirm_applied(&self, plan: &RuntimePlan, directory: &Path) -> anyhow::Result<()> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            ensure!(
+                plan.expires_at().is_none_or(|expiry| expiry > now()),
+                "account expired during apply"
+            );
+            let acknowledged = read_ack(
+                &directory.join("applied-revision"),
+                self.policy.uid(plan.owner_id())?,
+            )?;
+            if acknowledged == Some(plan.revision())
+                && self
+                    .confirm_listeners(plan.owner_id(), Some(plan))
+                    .await
+                    .is_ok()
+            {
+                return Ok(());
+            }
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "realm plan was not confirmed"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     async fn stop_owner(&self, owner_id: i64) -> anyhow::Result<()> {
         // A corrupt DB owner outside the fixed pool cannot have a runtime from
         // this driver. No UID/unit/path is derived from that unbounded value.
@@ -1280,6 +1496,17 @@ impl LinuxDriver {
         }
         let mut plans = self.plans.lock().await;
         plans.remove(&owner_id);
+        // Revoke the tenant's independent monotonic lease before invoking tools.
+        #[cfg(target_os = "linux")]
+        {
+            let path = self
+                .policy
+                .runtime_dir
+                .join(format!("owner-{owner_id}/authorization"));
+            if path.try_exists()? {
+                write_root_file(&path, b"0", 0o640, self.policy.uid(owner_id)?)?;
+            }
+        }
         let result = fail_closed_cleanup(self.firewall(&plans), self.stop_service(owner_id)).await;
         #[cfg(target_os = "linux")]
         if result.is_ok() {
@@ -1320,17 +1547,27 @@ impl LinuxDriver {
 impl ExecutorDriver for LinuxDriver {
     fn apply<'a>(&'a self, plan: &'a RuntimePlan) -> DriverFuture<'a> {
         Box::pin(async move {
-            self.apply_plan(plan)
-                .await
-                .map_err(|error| DriverError::new(error.to_string()))
+            self.apply_plan(plan).await.map_err(|error| {
+                if error.downcast_ref::<RuntimeExited>().is_some() {
+                    DriverError::crashed(error.to_string())
+                } else if error.downcast_ref::<CommandUnavailable>().is_some() {
+                    DriverError::temporary(error.to_string())
+                } else {
+                    DriverError::new(error.to_string())
+                }
+            })
         })
     }
 
     fn stop(&self, owner_id: i64) -> DriverFuture<'_> {
         Box::pin(async move {
-            self.stop_owner(owner_id)
-                .await
-                .map_err(|error| DriverError::new(error.to_string()))
+            self.stop_owner(owner_id).await.map_err(|error| {
+                if error.downcast_ref::<CommandUnavailable>().is_some() {
+                    DriverError::temporary(error.to_string())
+                } else {
+                    DriverError::new(error.to_string())
+                }
+            })
         })
     }
 }
@@ -1346,4 +1583,67 @@ impl ExecutorDriver for Arc<LinuxDriver> {
 
 pub async fn run(policy_path: &Path) -> anyhow::Result<()> {
     crate::broker::run(policy_path).await
+}
+
+#[cfg(target_os = "linux")]
+fn initialize_ack(path: &Path, uid: u32) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if path.try_exists()? {
+        read_ack(path, uid)?;
+        std::fs::remove_file(path)?;
+    }
+    write_root_file(path, b"0", 0o600, uid)?;
+    let meta = std::fs::symlink_metadata(path)?;
+    ensure!(meta.uid() == 0, "unexpected initial ack owner");
+    let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
+    ensure!(
+        unsafe { libc::chown(name.as_ptr(), uid, uid) } == 0,
+        "cannot assign supervisor acknowledgement"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn read_ack(path: &Path, uid: u32) -> anyhow::Result<Option<i64>> {
+    use std::{
+        io::Read,
+        os::unix::fs::{MetadataExt, OpenOptionsExt},
+    };
+    secure_root_path(path.parent().context("missing ack directory")?, true)?;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let meta = file.metadata()?;
+    ensure!(
+        meta.is_file()
+            && meta.uid() == uid
+            && meta.nlink() == 1
+            && meta.mode() & 0o077 == 0
+            && meta.len() <= 20,
+        "invalid supervisor acknowledgement"
+    );
+    let mut value = String::new();
+    file.by_ref().take(21).read_to_string(&mut value)?;
+    Ok(value.parse().ok())
+}
+
+/// The kernel excludes these ports from automatic outbound allocation.
+pub fn validate_reserved_ports(value: &str, start: u16, end: u16) -> anyhow::Result<()> {
+    let mut reserved = HashSet::new();
+    for item in value.trim().split(',').filter(|item| !item.is_empty()) {
+        let mut parts = item.split('-');
+        let low: u16 = parts.next().context("missing reserved port")?.parse()?;
+        let high: u16 = parts.next().unwrap_or(item).parse()?;
+        ensure!(
+            low > 0 && high >= low && parts.next().is_none(),
+            "invalid reserved port range"
+        );
+        reserved.extend(low..=high);
+    }
+    ensure!(
+        (start..=end).all(|port| reserved.contains(&port)),
+        "forwarding range must be included in net.ipv4.ip_local_reserved_ports; rerun the verified installer/updater before starting broker"
+    );
+    Ok(())
 }
