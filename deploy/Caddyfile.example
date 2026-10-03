@@ -1,0 +1,5 @@
+panel.example.com {
+    reverse_proxy 127.0.0.1:7410 {
+        header_up X-RelayDeck-Client-IP {remote_host}
+    }
+}

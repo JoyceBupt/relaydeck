@@ -1,0 +1,33 @@
+[Unit]
+Description=RelayDeck root runtime broker
+After=network.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=exec
+ExecStart=/usr/local/libexec/relaydeck broker /etc/relaydeck/broker.json
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=45
+RuntimeDirectory=relaydeck
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=restart
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+ReadWritePaths=/var/lib/relaydeck/runtime /run/relaydeck /run/systemd/system
+InaccessiblePaths=/var/lib/relaydeck/data /var/lib/relaydeck/secrets /var/lib/relaydeck/backups
+MemoryMax=128M
+TasksMax=32
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,34 @@
+[Unit]
+Description=RelayDeck web API
+After=network.target relaydeck-broker.service
+Wants=relaydeck-broker.service
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=relaydeck
+Group=relaydeck
+EnvironmentFile=/etc/relaydeck/relaydeck.env
+ExecStart=/usr/local/libexec/relaydeck serve
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/relaydeck/data /var/lib/relaydeck/secrets /var/lib/relaydeck/backups
+MemoryMax=256M
+TasksMax=32
+
+[Install]
+WantedBy=multi-user.target
