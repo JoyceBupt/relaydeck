@@ -4,7 +4,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("{code}: {message}")]
 pub struct ApiError {
     pub status: StatusCode,
     pub code: &'static str,
@@ -75,6 +76,9 @@ impl IntoResponse for ApiError {
 
 impl From<sqlx::Error> for ApiError {
     fn from(error: sqlx::Error) -> Self {
+        if crate::worker::transient_database(&error) {
+            return Self::unavailable();
+        }
         if error
             .as_database_error()
             .is_some_and(|e| e.is_unique_violation())

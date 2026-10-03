@@ -24,7 +24,7 @@ use crate::{
 
 static DNS_SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(4)));
 const MAX_DNS_RESULTS: usize = 32;
-const RULE_SELECT: &str = "SELECT r.id,r.owner_id,u.username AS owner_username,r.name,r.listen_port,r.target_host,r.target_ip,r.target_port,r.protocol,r.source_cidrs,r.enabled,r.created_at,r.updated_at,CASE WHEN s.revision=u.desired_revision AND s.status='failed' THEN 'failed' WHEN e.status IS NULL OR e.status!='running' OR e.last_seen<=unixepoch()-10 THEN 'pending' WHEN s.revision!=u.desired_revision OR u.applied_revision!=u.desired_revision THEN 'pending' WHEN s.status='stopped' THEN 'stopped' WHEN s.status='active' AND r.enabled=0 THEN 'stopped' WHEN s.status='active' AND u.enabled=1 AND (u.expires_at IS NULL OR u.expires_at>unixepoch()) THEN 'active' ELSE 'pending' END AS runtime_status,CASE WHEN s.revision=u.desired_revision AND s.status='failed' THEN s.last_error END AS runtime_error,s.updated_at AS runtime_updated_at FROM rules r JOIN users u ON u.id=r.owner_id LEFT JOIN runtime_states s ON s.owner_id=u.id LEFT JOIN executor_status e ON e.id=1";
+const RULE_SELECT: &str = "SELECT r.id,r.owner_id,u.username AS owner_username,r.name,r.listen_port,r.target_host,r.target_ip,r.target_port,r.protocol,r.source_cidrs,r.enabled,r.created_at,r.updated_at,r.dns_error,CASE WHEN s.revision=u.desired_revision AND s.status='failed' THEN 'failed' WHEN e.status IS NULL OR e.status!='running' OR e.last_seen<=unixepoch()-10 THEN 'pending' WHEN s.revision!=u.desired_revision OR u.applied_revision!=u.desired_revision THEN 'pending' WHEN s.status='stopped' THEN 'stopped' WHEN s.status='active' AND r.enabled=0 THEN 'stopped' WHEN s.status='active' AND u.enabled=1 AND (u.expires_at IS NULL OR u.expires_at>unixepoch()) THEN 'active' ELSE 'pending' END AS runtime_status,CASE WHEN s.revision=u.desired_revision AND s.status='failed' THEN s.last_error END AS runtime_error,s.updated_at AS runtime_updated_at FROM rules r JOIN users u ON u.id=r.owner_id LEFT JOIN runtime_states s ON s.owner_id=u.id LEFT JOIN executor_status e ON e.id=1";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -98,6 +98,7 @@ struct DbRule {
     enabled: bool,
     created_at: i64,
     updated_at: i64,
+    dns_error: Option<String>,
     runtime_status: String,
     runtime_error: Option<String>,
     runtime_updated_at: Option<i64>,
@@ -116,6 +117,7 @@ struct RuleView {
     protocol: String,
     source_cidrs: Vec<String>,
     enabled: bool,
+    dns_error: Option<String>,
     runtime_status: String,
     // Executor-reported reason for the current revision's failure; sanitized
     // and bounded by the executor before it is stored.
@@ -143,6 +145,7 @@ impl DbRule {
             protocol: self.protocol,
             source_cidrs,
             enabled: self.enabled,
+            dns_error: self.dns_error,
             runtime_status: self.runtime_status,
             runtime_error: self.runtime_error,
             runtime_updated_at: self.runtime_updated_at,
@@ -273,16 +276,32 @@ where
 }
 
 async fn resolve_target(state: &AppState, input: &RuleInput) -> Result<String, ApiError> {
-    if let Ok(ip) = input.target_host.parse::<IpAddr>() {
-        policy::validate_target_ip(ip, &state.config.local_ips)?;
+    resolve_host(
+        &input.target_host,
+        input.target_port as u16,
+        &state.config.local_ips,
+    )
+    .await
+}
+
+pub async fn resolve_host(host: &str, port: u16, local_ips: &[IpAddr]) -> Result<String, ApiError> {
+    policy::validate_target_port(port)?;
+    let host = policy::validate_target_host(host)?;
+    let validate = |ip| {
+        policy::validate_target_ip(ip, local_ips).map_err(|error| ApiError {
+            status: StatusCode::BAD_REQUEST,
+            code: "target_denied",
+            message: error.to_string(),
+        })
+    };
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        validate(ip)?;
         return Ok(ip.to_string());
     }
     let permit = DNS_SLOTS
         .clone()
         .try_acquire_owned()
         .map_err(|_| ApiError::unavailable())?;
-    let host = input.target_host.clone();
-    let port = input.target_port as u16;
     // Tokio's blocking resolver cannot be cancelled after a timeout. Keep the
     // owned permit in the lookup task until the resolver actually completes, so
     // timed-out requests cannot dispatch more than four lookups concurrently.
@@ -313,7 +332,7 @@ async fn resolve_target(state: &AppState, input: &RuleInput) -> Result<String, A
     // Reject the complete answer if any address is forbidden. Picking one safe
     // result from a mixed private/public answer would hide a policy violation.
     for ip in &ips {
-        policy::validate_target_ip(*ip, &state.config.local_ips)?;
+        validate(*ip)?;
     }
     ips.sort_unstable(); // IpAddr orders IPv4 before IPv6.
     ips.dedup();
@@ -374,7 +393,7 @@ async fn create_rule(
     check_create_quota(&mut *tx, &owner).await?;
     check_lease(&mut *tx, input.listen_port, owner.id, None).await?;
     let timestamp = now();
-    let id = sqlx::query("INSERT INTO rules(owner_id,name,listen_port,target_host,target_ip,target_port,protocol,source_cidrs,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)")
+    let id = sqlx::query("INSERT INTO rules(owner_id,name,listen_port,target_host,target_ip,target_port,protocol,source_cidrs,enabled,created_at,updated_at,dns_checked_at,dns_resolved_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,unixepoch(),unixepoch())")
         .bind(owner.id)
         .bind(&input.name)
         .bind(input.listen_port)
@@ -441,7 +460,7 @@ async fn update_rule(
     validate_owner_rule(&state, &owner, &input)?;
     check_enabled_quota(&mut *tx, &owner, id, input.enabled).await?;
     check_lease(&mut *tx, input.listen_port, owner.id, Some(id)).await?;
-    sqlx::query("UPDATE rules SET name=?,listen_port=?,target_host=?,target_ip=?,target_port=?,protocol=?,source_cidrs=?,enabled=?,updated_at=? WHERE id=? AND deleted_at IS NULL")
+    sqlx::query("UPDATE rules SET name=?,listen_port=?,target_host=?,target_ip=?,target_port=?,protocol=?,source_cidrs=?,enabled=?,updated_at=?,dns_checked_at=unixepoch(),dns_resolved_at=unixepoch(),dns_error=NULL WHERE id=? AND deleted_at IS NULL")
         .bind(&input.name)
         .bind(input.listen_port)
         .bind(&input.target_host)

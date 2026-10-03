@@ -29,6 +29,16 @@ pub enum PolicyError {
     TargetLocalIp,
     #[error("目标须为有效公网IP或完整域名")]
     TargetHost,
+    #[error("目标端口禁止访问")]
+    TargetPort,
+}
+
+pub fn validate_target_port(port: u16) -> Result<(), PolicyError> {
+    if port == 0 || matches!(port, 25 | 465 | 587) {
+        Err(PolicyError::TargetPort)
+    } else {
+        Ok(())
+    }
 }
 
 pub fn validate_username(value: &str) -> Result<(), PolicyError> {

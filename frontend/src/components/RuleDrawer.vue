@@ -272,6 +272,7 @@ defineExpose({ dirty })
           <span class="font-mono font-medium text-fg [overflow-wrap:anywhere]">{{ sentence.target }}</span>。
         </p>
 
+        <p v-if="rule?.dns_error" class="field-error" role="alert">{{ rule.dns_error }}</p>
         <form id="rule-form" class="grid gap-5" novalidate @submit.prevent="submit">
           <label class="field">
             <span class="field-label">名称</span>
@@ -319,7 +320,7 @@ defineExpose({ dirty })
           <p v-if="show('host') || show('targetPort')" class="field-error -mt-3">{{ show('host') || show('targetPort') }}</p>
           <p v-else-if="isDomain || resolvedNote" class="field-hint -mt-3">
             <template v-if="resolvedNote && !dirty">保存时解析为 <span class="font-mono">{{ hostText(resolvedNote) }}</span>。</template>
-            域名只在保存时解析一次，目标 IP 变化后需要重新保存。
+            域名定期刷新。
           </p>
 
           <div class="field">

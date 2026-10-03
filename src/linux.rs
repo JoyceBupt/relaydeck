@@ -8,15 +8,8 @@ use std::{
 
 use anyhow::{Context, ensure};
 use serde::Deserialize;
-#[cfg(target_os = "linux")]
-use sqlx::{
-    SqlitePool,
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
-};
 use tokio::{io::AsyncWriteExt, process::Command, sync::Mutex};
 
-#[cfg(target_os = "linux")]
-use crate::executor::Reconciler;
 use crate::{
     db::now,
     executor::{DriverError, DriverFuture, ExecutorDriver, ExecutorPolicy, RuntimePlan},
@@ -30,6 +23,38 @@ const IP: &str = "/usr/sbin/ip";
 const BPFTOOL: &str = "/usr/sbin/bpftool";
 const UNIT_DIR: &str = "/run/systemd/system";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(4);
+
+pub fn firewall_fingerprint(value: &serde_json::Value) -> Result<Vec<u8>, serde_json::Error> {
+    fn normalize(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(serde_json::Value::Object(counter)) = map.get_mut("counter") {
+                    for name in ["bytes", "packets"] {
+                        if counter.contains_key(name) {
+                            counter.insert(name.into(), 0.into());
+                        }
+                    }
+                }
+                for value in map.values_mut() {
+                    normalize(value);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    normalize(value);
+                }
+            }
+            _ => (),
+        }
+    }
+    let mut value = value.clone();
+    normalize(&mut value);
+    serde_json::to_vec(&value)
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("realm process exited")]
+struct RuntimeExited;
 
 pub async fn fail_closed_cleanup<B, S>(block: B, stop: S) -> anyhow::Result<()>
 where
@@ -57,6 +82,8 @@ where
 pub struct BrokerPolicy {
     pub database: PathBuf,
     pub web_uid: u32,
+    #[serde(default)]
+    pub web_gid: Option<u32>,
     pub runtime_dir: PathBuf,
     pub realm_binary: PathBuf,
     pub runner_binary: PathBuf,
@@ -66,11 +93,81 @@ pub struct BrokerPolicy {
     pub local_ips: Vec<IpAddr>,
     pub uid_start: u32,
     pub max_owners: u32,
+    #[serde(default = "default_socket")]
+    pub socket_path: PathBuf,
+    #[serde(default = "default_authorization_ttl")]
+    pub authorization_ttl_secs: u64,
+    #[serde(default)]
+    pub limits: ResourceLimits,
+}
+
+fn default_socket() -> PathBuf {
+    "/run/relaydeck/broker.sock".into()
+}
+fn default_authorization_ttl() -> u64 {
+    120
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ResourceLimits {
+    pub memory_high_mb: u64,
+    pub memory_max_mb: u64,
+    pub tasks: u32,
+    pub cpu_percent: u32,
+    pub nofile: u32,
+    pub total_memory_mb: u64,
+    pub total_cpu_percent: u32,
+}
+
+impl Default for ResourceLimits {
+    fn default() -> Self {
+        Self {
+            memory_high_mb: 32,
+            memory_max_mb: 64,
+            tasks: 16,
+            cpu_percent: 20,
+            nofile: 512,
+            total_memory_mb: 384,
+            total_cpu_percent: 150,
+        }
+    }
 }
 
 impl BrokerPolicy {
     pub fn validate(&self) -> anyhow::Result<()> {
         ensure!(self.web_uid != 0, "web_uid must not be root");
+        ensure!(self.web_gid != Some(0), "web_gid must not be root");
+        ensure!(
+            (30..=300).contains(&self.authorization_ttl_secs),
+            "authorization TTL must be 30..300 seconds"
+        );
+        validate_absolute_path(&self.socket_path)?;
+        ensure!(
+            self.socket_path
+                .file_name()
+                .is_some_and(|name| name == "broker.sock"),
+            "broker socket must use its fixed name"
+        );
+        let limits = &self.limits;
+        ensure!(
+            limits.memory_high_mb >= 16
+                && limits.memory_high_mb <= limits.memory_max_mb
+                && limits.memory_max_mb <= 4096,
+            "invalid memory limits"
+        );
+        ensure!(
+            (4..=256).contains(&limits.tasks)
+                && (128..=65536).contains(&limits.nofile)
+                && (1..=800).contains(&limits.cpu_percent),
+            "invalid tenant limits"
+        );
+        ensure!(
+            limits.total_memory_mb >= limits.memory_max_mb
+                && limits.total_memory_mb <= 65536
+                && (1..=1600).contains(&limits.total_cpu_percent),
+            "invalid aggregate limits"
+        );
         ensure!(
             self.allowed_port_start >= 1024 && self.allowed_port_end >= self.allowed_port_start,
             "invalid global port boundary"
@@ -116,7 +213,7 @@ impl BrokerPolicy {
         Ok(())
     }
 
-    fn uid(&self, owner_id: i64) -> anyhow::Result<u32> {
+    pub(crate) fn uid(&self, owner_id: i64) -> anyhow::Result<u32> {
         ensure!(
             owner_id > 0 && owner_id <= i64::from(self.max_owners),
             "owner exceeds dedicated UID pool"
@@ -124,7 +221,7 @@ impl BrokerPolicy {
         Ok(self.uid_start + (owner_id as u32) - 1)
     }
 
-    fn boundary(&self, local_ips: Vec<IpAddr>) -> ExecutorPolicy {
+    pub(crate) fn boundary(&self, local_ips: Vec<IpAddr>) -> ExecutorPolicy {
         let mut reserved_ports = self.reserved_ports.clone();
         reserved_ports.extend([22, 80, 443]);
         reserved_ports.sort_unstable();
@@ -170,12 +267,17 @@ pub fn render_systemd(
         .runtime_dir
         .join(format!("owner-{}/realm.json", plan.owner_id()));
     let mut unit = format!(
-        "[Unit]\nDescription=RelayDeck account {}\n\n[Service]\nType=exec\nUser={uid}\nGroup={uid}\nExecStart={} tenant {} {} {} {uid}\nRestart=no\nRuntimeMaxSec={lifetime}\nKillMode=control-group\nTimeoutStartSec=5s\nTimeoutStopSec=3s\nSendSIGKILL=yes\nUMask=0077\nNoNewPrivileges=yes\nCapabilityBoundingSet=\nAmbientCapabilities=\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectControlGroups=yes\nRestrictSUIDSGID=yes\nRestrictRealtime=yes\nLockPersonality=yes\nRestrictAddressFamilies=AF_INET AF_INET6\nSystemCallArchitectures=native\nMemoryHigh=32M\nMemoryMax=64M\nMemorySwapMax=0\nTasksMax=16\nCPUQuota=20%\nLimitNOFILE=512\nLimitCORE=0\nSocketBindDeny=any\n",
+        "[Unit]\nDescription=RelayDeck account {}\n\n[Service]\nType=exec\nUser={uid}\nGroup={uid}\nExecStart={} tenant {} {} {} {uid}\nRestart=no\nRuntimeMaxSec={lifetime}\nKillMode=control-group\nTimeoutStartSec=5s\nTimeoutStopSec=3s\nSendSIGKILL=yes\nUMask=0077\nNoNewPrivileges=yes\nCapabilityBoundingSet=\nAmbientCapabilities=\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectControlGroups=yes\nRestrictSUIDSGID=yes\nRestrictRealtime=yes\nLockPersonality=yes\nRestrictAddressFamilies=AF_INET AF_INET6\nSystemCallArchitectures=native\nMemoryHigh={memory_high}M\nMemoryMax={memory_max}M\nMemorySwapMax=0\nTasksMax={tasks}\nCPUQuota={cpu}%\nLimitNOFILE={nofile}\nLimitCORE=0\nSocketBindDeny=any\n",
         plan.owner_id(),
         policy.runner_binary.display(),
         policy.realm_binary.display(),
         config.display(),
-        plan.expires_at().unwrap_or(0)
+        plan.expires_at().unwrap_or(0),
+        memory_high = policy.limits.memory_high_mb,
+        memory_max = policy.limits.memory_max_mb,
+        tasks = policy.limits.tasks,
+        cpu = policy.limits.cpu_percent,
+        nofile = policy.limits.nofile,
     );
     for rule in plan.rules() {
         if rule.protocol.tcp() {
@@ -427,7 +529,7 @@ pub fn validate_listener_inventory(policy: &BrokerPolicy, output: &str) -> anyho
 }
 
 #[cfg(target_os = "linux")]
-fn secure_root_path(path: &Path, directory: bool) -> anyhow::Result<()> {
+pub(crate) fn secure_root_path(path: &Path, directory: bool) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
     validate_absolute_path(path)?;
     let mut current = PathBuf::from("/");
@@ -459,7 +561,7 @@ fn secure_root_path(path: &Path, directory: bool) -> anyhow::Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn secure_root_path(_path: &Path, _directory: bool) -> anyhow::Result<()> {
+pub(crate) fn secure_root_path(_path: &Path, _directory: bool) -> anyhow::Result<()> {
     anyhow::bail!("the production executor requires Linux")
 }
 
@@ -507,50 +609,6 @@ fn validate_uid_pool(policy: &BrokerPolicy) -> anyhow::Result<()> {
                 "dedicated UID used by an unrelated running process"
             );
         }
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn private_database(policy: &BrokerPolicy) -> anyhow::Result<()> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let parent = policy
-        .database
-        .parent()
-        .context("missing database parent")?;
-    secure_root_path(parent, true)?;
-    // A root-owned, non-writable parent prevents pathname swaps by the Web UID,
-    // including SQLite's automatically opened -wal and -shm names.
-    for suffix in ["", "-wal", "-shm"] {
-        let path = PathBuf::from(format!("{}{suffix}", policy.database.display()));
-        if !path.try_exists()? && !suffix.is_empty() {
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&path)?;
-            use std::os::fd::AsRawFd;
-            // This new file is exclusively inside the verified root directory.
-            ensure!(
-                unsafe { libc::fchown(file.as_raw_fd(), policy.web_uid, policy.web_uid) } == 0,
-                "cannot assign SQLite sidecar owner"
-            );
-        }
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)?;
-        let metadata = file.metadata()?;
-        ensure!(
-            metadata.is_file()
-                && metadata.nlink() == 1
-                && metadata.uid() == policy.web_uid
-                && metadata.mode() & 0o077 == 0,
-            "SQLite files must be private, single-link regular files owned by web_uid"
-        );
     }
     Ok(())
 }
@@ -709,7 +767,7 @@ impl LinuxDriver {
                 let listeners = command(SS, &[flags], None).await?;
                 validate_listener_inventory(&policy, std::str::from_utf8(&listeners)?)?;
             }
-            write_root_file(&Path::new(UNIT_DIR).join("relaydeck.slice"), b"[Unit]\nDescription=RelayDeck runtime budget\n\n[Slice]\nMemoryHigh=256M\nMemoryMax=384M\nMemorySwapMax=0\nTasksMax=176\nCPUQuota=150%\n", 0o644, 0)?;
+            write_root_file(&Path::new(UNIT_DIR).join("relaydeck.slice"), format!("[Unit]\nDescription=RelayDeck runtime budget\n\n[Slice]\nMemoryMax={}M\nMemorySwapMax=0\nTasksMax={}\nCPUQuota={}%\n",policy.limits.total_memory_mb,policy.limits.tasks * policy.max_owners,policy.limits.total_cpu_percent).as_bytes(), 0o644, 0)?;
             command(SYSTEMCTL, &["daemon-reload"], None).await?;
             let driver = Self {
                 policy,
@@ -738,17 +796,17 @@ impl LinuxDriver {
         command(NFT, &["-f", "-"], Some(nft.as_bytes())).await?;
         let actual = command(NFT, &["-j", "list", "table", "inet", "relaydeck"], None).await?;
         let value: serde_json::Value = serde_json::from_slice(&actual)?;
-        *self.firewall_digest.lock().await = Some(serde_json::to_vec(&value)?);
+        *self.firewall_digest.lock().await = Some(firewall_fingerprint(&value)?);
         Ok(())
     }
 
-    pub async fn unhealthy_owners(&self) -> Vec<(i64, i64, String)> {
+    pub async fn unhealthy_owners(&self) -> Vec<(i64, i64, String, bool)> {
         let plans = self.plans.lock().await;
         let global = async {
             let actual = command(NFT, &["-j", "list", "table", "inet", "relaydeck"], None).await?;
             let value: serde_json::Value = serde_json::from_slice(&actual)?;
             ensure!(
-                self.firewall_digest.lock().await.as_ref() == Some(&serde_json::to_vec(&value)?),
+                self.firewall_digest.lock().await.as_ref() == Some(&firewall_fingerprint(&value)?),
                 "runtime firewall changed outside the executor"
             );
             interface_ips().await
@@ -772,12 +830,18 @@ impl LinuxDriver {
                     now(),
                 )?;
                 ensure!(!validated.stopped(), "runtime expired");
-                self.confirm_listeners(plan.owner_id(), Some(plan)).await?;
-                self.confirm_service(plan).await
+                self.confirm_service(plan).await?;
+                self.confirm_listeners(plan.owner_id(), Some(plan)).await
             }
             .await;
             if let Err(error) = check {
-                unhealthy.push((plan.owner_id(), plan.revision(), error.to_string()));
+                let retryable = error.downcast_ref::<RuntimeExited>().is_some();
+                unhealthy.push((
+                    plan.owner_id(),
+                    plan.revision(),
+                    error.to_string(),
+                    retryable,
+                ));
             }
         }
         unhealthy
@@ -797,6 +861,9 @@ impl LinuxDriver {
             .lines()
             .filter_map(|line| line.split_once('='))
             .collect();
+        if matches!(values.get("ActiveState"), Some(&"failed" | &"inactive")) {
+            return Err(RuntimeExited.into());
+        }
         for (name, expected) in [
             ("ActiveState", "active"),
             ("SubState", "running"),
@@ -826,6 +893,19 @@ impl LinuxDriver {
             .lines()
             .filter_map(|line| line.split_once(':').map(|(key, value)| (key, value.trim())))
             .collect();
+        let limits = std::fs::read_to_string(format!("/proc/{pid}/limits"))?;
+        let open_files = limits
+            .lines()
+            .find_map(|line| line.strip_prefix("Max open files"))
+            .context("missing open-file limits")?;
+        let expected_limit = self.policy.limits.nofile.to_string();
+        ensure!(
+            open_files
+                .split_whitespace()
+                .take(2)
+                .all(|value| value == expected_limit),
+            "effective file limit differs"
+        );
         for key in ["Uid", "Gid"] {
             let ids = identity
                 .get(key)
@@ -867,14 +947,20 @@ impl LinuxDriver {
         let directory = Path::new("/sys/fs/cgroup").join(group.trim_start_matches('/'));
         ensure!(
             std::fs::read_to_string("/sys/fs/cgroup/relaydeck.slice/memory.max")?.trim()
-                == "402653184",
+                == (self.policy.limits.total_memory_mb * 1024 * 1024).to_string(),
             "aggregate runtime memory limit is not enforced"
         );
         for (file, expected) in [
-            ("memory.high", "33554432"),
-            ("memory.max", "67108864"),
-            ("memory.swap.max", "0"),
-            ("pids.max", "16"),
+            (
+                "memory.high",
+                (self.policy.limits.memory_high_mb * 1024 * 1024).to_string(),
+            ),
+            (
+                "memory.max",
+                (self.policy.limits.memory_max_mb * 1024 * 1024).to_string(),
+            ),
+            ("memory.swap.max", "0".into()),
+            ("pids.max", self.policy.limits.tasks.to_string()),
         ] {
             ensure!(
                 std::fs::read_to_string(directory.join(file))?.trim() == expected,
@@ -887,7 +973,10 @@ impl LinuxDriver {
             .map(str::parse)
             .collect::<Result<Vec<_>, _>>()?;
         ensure!(
-            quota.len() == 2 && quota[0] > 0 && quota[0].checked_mul(5) == Some(quota[1]),
+            quota.len() == 2
+                && quota[0] > 0
+                && quota[0].checked_mul(100)
+                    == quota[1].checked_mul(u64::from(self.policy.limits.cpu_percent)),
             "effective CPU quota differs"
         );
         let output = command(
@@ -1052,6 +1141,14 @@ impl LinuxDriver {
             "account grant exceeds root global port boundary"
         );
         let mut plans = self.plans.lock().await;
+        if plans.get(&plan.owner_id()).is_some_and(|existing| {
+            existing.rules() == plan.rules() && existing.expires_at() == plan.expires_at()
+        }) {
+            // Metadata changes and authorization renewals preserve live connections.
+            self.renew_authorization(&plan)?;
+            plans.insert(plan.owner_id(), plan);
+            return Ok(());
+        }
         plans.remove(&plan.owner_id());
         fail_closed_cleanup(self.firewall(&plans), self.stop_service(plan.owner_id())).await?;
         if plan.stopped() {
@@ -1086,6 +1183,7 @@ impl LinuxDriver {
                 0o640,
                 uid,
             )?;
+            self.renew_authorization(&plan)?;
             let unit = format!("relaydeck-owner-{}.service", plan.owner_id());
             write_root_file(
                 &Path::new(UNIT_DIR).join(&unit),
@@ -1128,8 +1226,29 @@ impl LinuxDriver {
         fail_closed_cleanup(self.firewall(&plans), self.stop_service(owner_id)).await
     }
 
+    pub(crate) fn renew_authorization(&self, plan: &RuntimePlan) -> anyhow::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let until = now() + self.policy.authorization_ttl_secs as i64;
+            write_root_file(
+                &self
+                    .policy
+                    .runtime_dir
+                    .join(format!("owner-{}/authorization", plan.owner_id())),
+                until.to_string().as_bytes(),
+                0o640,
+                self.policy.uid(plan.owner_id())?,
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = plan;
+            anyhow::bail!("Linux is required")
+        }
+    }
+
     #[cfg(target_os = "linux")]
-    async fn shutdown(&self) -> anyhow::Result<()> {
+    pub(crate) async fn shutdown(&self) -> anyhow::Result<()> {
         let mut plans = self.plans.lock().await;
         plans.clear();
         fail_closed_cleanup(self.firewall(&plans), self.stop_all_services()).await
@@ -1163,184 +1282,6 @@ impl ExecutorDriver for Arc<LinuxDriver> {
     }
 }
 
-#[cfg(target_os = "linux")]
-async fn heartbeat(pool: &SqlitePool, status: &str) -> anyhow::Result<()> {
-    sqlx::query("INSERT INTO executor_status(id,last_seen,status) VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET last_seen=excluded.last_seen,status=excluded.status")
-        .bind(now()).bind(status).execute(pool).await?;
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-async fn stop_previous_units() -> anyhow::Result<()> {
-    // A rejected policy cannot authorize any dynamic command arguments. The
-    // previous generated units have a fixed namespace and root-owned marker.
-    secure_root_path(Path::new(UNIT_DIR), true)?;
-    secure_root_path(Path::new(SYSTEMCTL), false)?;
-    let mut failures = Vec::new();
-    for owner in 1..=11 {
-        let unit = format!("relaydeck-owner-{owner}.service");
-        let path = Path::new(UNIT_DIR).join(&unit);
-        let exists = match path.try_exists() {
-            Ok(value) => value,
-            Err(error) => {
-                failures.push(format!("owner {owner}: {error}"));
-                continue;
-            }
-        };
-        if !exists {
-            continue;
-        }
-        let stopped = async {
-            secure_root_path(&path, false)?;
-            ensure!(
-                std::fs::read_to_string(&path)?
-                    .starts_with(&format!("[Unit]\nDescription=RelayDeck account {owner}\n")),
-                "unit namespace collision"
-            );
-            command(SYSTEMCTL, &["stop", &unit], None).await?;
-            let output = command(
-                SYSTEMCTL,
-                &["show", "--property=ActiveState", "--value", &unit],
-                None,
-            )
-            .await?;
-            ensure!(
-                matches!(std::str::from_utf8(&output)?.trim(), "inactive" | "failed"),
-                "previous runtime still active"
-            );
-            Ok::<_, anyhow::Error>(())
-        }
-        .await;
-        if let Err(error) = stopped {
-            failures.push(format!("owner {owner}: {error}"));
-        }
-    }
-    ensure!(failures.is_empty(), "{}", failures.join("; "));
-    Ok(())
-}
-
 pub async fn run(policy_path: &Path) -> anyhow::Result<()> {
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = policy_path;
-        anyhow::bail!("the production executor requires Linux");
-    }
-    #[cfg(target_os = "linux")]
-    {
-        ensure!(
-            unsafe { libc::geteuid() } == 0,
-            "the production executor requires root"
-        );
-        let setup = async {
-        secure_root_path(policy_path, false)?;
-        ensure!(
-            std::fs::metadata(policy_path)?.len() <= 16 * 1024,
-            "broker policy too large"
-        );
-        let policy: BrokerPolicy = serde_json::from_slice(&std::fs::read(policy_path)?)?;
-        policy.validate()?;
-        private_database(&policy)?;
-        let options = SqliteConnectOptions::new()
-            .filename(&policy.database)
-            .create_if_missing(false)
-            .foreign_keys(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .busy_timeout(Duration::from_secs(3))
-            .pragma("trusted_schema", "OFF")
-            .pragma("temp_store", "MEMORY");
-        let pool = SqlitePoolOptions::new()
-            .max_connections(2)
-            .connect_with(options)
-            .await?;
-        // Migrations are performed by the Web application's normal startup;
-        // root only opens the explicitly provisioned database, never migrates.
-        let expected_tables: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('users','rules','port_leases','apply_jobs','runtime_states','executor_status')").fetch_one(&pool).await?;
-        ensure!(
-            expected_tables == 6,
-            "run the application migrations before the executor"
-        );
-        heartbeat(&pool, "failed").await?;
-        let driver = Arc::new(LinuxDriver::new(policy.clone()).await?);
-        let addresses = interface_ips().await?;
-        let reconciler = Reconciler::new(
-            pool.clone(),
-            policy.boundary(policy.local_ips.iter().copied().chain(addresses).collect()),
-            driver.clone(),
-            Duration::from_secs(30),
-        )?;
-        Ok::<_,anyhow::Error>((pool, driver, reconciler))
-        }.await;
-        let (pool, driver, reconciler) = match setup {
-            Ok(state) => state,
-            Err(error) => {
-                let stopped = stop_previous_units().await;
-                return match stopped {
-                    Ok(()) => {
-                        Err(error.context("executor startup rejected; previous runtimes stopped"))
-                    }
-                    Err(stop) => Err(anyhow::anyhow!(
-                        "executor startup rejected: {error}; previous runtime cleanup failed: {stop}"
-                    )),
-                };
-            }
-        };
-        let result = async {
-        for owner in reconciler.startup_owners().await? { reconciler.reconcile_owner(owner).await?; }
-        let mut interval = tokio::time::interval(Duration::from_secs(2));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        let mut stop_failures: BTreeMap<i64, u8> = BTreeMap::new();
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    let mut failed = !stop_failures.is_empty();
-                    for owner in stop_failures.keys().copied().collect::<Vec<_>>() {
-                        if let Err(error) = driver.stop(owner).await {
-                            let attempts = stop_failures.get_mut(&owner).expect("retry owner exists");
-                            *attempts += 1;
-                            tracing::error!(owner_id=owner, %error, attempts=*attempts, "runtime stop retry failed");
-                            heartbeat(&pool, "failed").await?;
-                            ensure!(*attempts < 3, "runtime stop failed three times; operator action required");
-                        } else { stop_failures.remove(&owner); }
-                    }
-                    for owner in reconciler.pending_owners().await? {
-                        if stop_failures.contains_key(&owner) { continue; }
-                        if let Err(error) = reconciler.reconcile_owner(owner).await {
-                            tracing::error!(owner_id=owner, %error, "runtime reconciliation failed");
-                            if matches!(error, crate::executor::ReconcileError::Stop(_)) { stop_failures.insert(owner, 1); }
-                            failed = true;
-                        }
-                    }
-                    for (owner, revision, message) in driver.unhealthy_owners().await {
-                        failed = true;
-                        if let Err(error) = driver.stop(owner).await {
-                            let attempts = stop_failures.entry(owner).or_default();
-                            *attempts += 1;
-                            tracing::error!(owner_id=owner, %error, attempts=*attempts, "unhealthy runtime stop failed");
-                            heartbeat(&pool, "failed").await?;
-                            ensure!(*attempts < 3, "runtime stop failed three times; operator action required");
-                        } else {
-                            stop_failures.remove(&owner);
-                        }
-                        sqlx::query("UPDATE runtime_states SET status='failed',last_error=?,updated_at=? WHERE owner_id=? AND revision=?")
-                            .bind(message.chars().filter(|value| !value.is_control()).take(240).collect::<String>()).bind(now()).bind(owner).bind(revision).execute(&pool).await?;
-                    }
-                    heartbeat(&pool, if failed { "failed" } else { "running" }).await?;
-                },
-                _ = terminate.recv() => break,
-                _ = tokio::signal::ctrl_c() => break,
-            }
-        }
-        Ok::<_, anyhow::Error>(())
-        }.await;
-        // The tenant runner enforces absolute expiry even when the broker dies.
-        // RuntimeMaxSec is an additional systemd lifetime bound.
-        let pulse = heartbeat(&pool, "failed").await;
-        let shutdown = driver.shutdown().await;
-        pool.close().await;
-        result?;
-        pulse?;
-        shutdown
-    }
+    crate::broker::run(policy_path).await
 }

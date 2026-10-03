@@ -124,7 +124,7 @@ onMounted(() => { if (route.hash === '#security' || forcedMfa.value) security.va
     <section v-if="user && !forcedMfa" class="panel" aria-labelledby="profile-title">
       <div class="px-5 pt-5">
         <h2 id="profile-title" class="text-sm font-semibold">账户</h2>
-        <p class="mt-1 text-sm text-muted">{{ isAdmin ? '管理员的授权固定，不能在面板中修改。' : '授权由管理员分配，如需调整请联系管理员。' }}</p>
+        <p class="mt-1 text-sm text-muted">{{ isAdmin ? '账户授权' : '管理员分配的授权' }}</p>
       </div>
       <dl class="grid grid-cols-2 gap-x-6 gap-y-4 px-5 py-5 text-sm sm:grid-cols-4">
         <div><dt class="text-muted">用户名</dt><dd class="mt-0.5 truncate font-medium">{{ user.username }}</dd></div>

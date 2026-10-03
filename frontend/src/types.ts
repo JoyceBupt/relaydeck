@@ -20,7 +20,7 @@ export interface User {
   mfa_enabled: boolean
 }
 
-export interface Session { user: User; csrf_token: string; mfa_required: boolean }
+export interface Session { user: User; csrf_token: string; session_ref: string; mfa_required: boolean }
 export interface MfaEnrollment { secret: string; otpauth_uri: string }
 export interface Health { status: string; name: string; version: string; executor: ExecutorState }
 
@@ -37,6 +37,7 @@ export interface Rule {
   source_cidrs: string[]
   enabled: boolean
   runtime_status: RuntimeStatus
+  dns_error: string | null
   runtime_error: string | null
   runtime_updated_at: number | null
   created_at: number

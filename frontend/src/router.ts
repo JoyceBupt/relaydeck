@@ -37,7 +37,7 @@ function nextQuery(to: RouteLocationNormalized) {
 }
 
 router.beforeEach(async to => {
-  if (securityMutationPending.value) return false
+  if (securityMutationPending.value && sessionState.session) return false
   await loadSession()
   const session = sessionState.session
   if (to.name === 'recovery') return !session && sessionState.recoveryOwner !== null && sessionState.recoveryCodes.length ? true : { name: 'login' }

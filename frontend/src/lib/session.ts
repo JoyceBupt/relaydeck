@@ -23,15 +23,30 @@ export const isAdmin = computed(() => currentUser.value?.role === 'admin')
 export const mustChangePassword = computed(() => !!currentUser.value?.must_change_password)
 export const forcedMfa = computed(() => !!sessionState.session?.mfa_required && !sessionState.session.user.mfa_enabled)
 
-export function acceptSession(session: Session) {
-  if (sessionState.session?.csrf_token !== session.csrf_token) clearSession()
+const channel = typeof window !== 'undefined' && window.document && 'BroadcastChannel' in window ? new BroadcastChannel('relaydeck-session') : null
+channel?.addEventListener('message', event => {
+  if (event.data?.type !== 'changed' || event.data.ref === sessionState.session?.session_ref) return
+  if (!sessionState.session && !sessionState.recoveryCodes.length) return
+  clearSession('账户已在其他标签页切换', false)
+  window.dispatchEvent(new Event('relaydeck:session-changed'))
+})
+
+export function acceptSession(session: Session, login = false) {
+  const previous = sessionState.session
+  if (previous && previous.user.id !== session.user.id && !login) {
+    clearSession('账户已切换，请重新登录', false)
+    window.dispatchEvent(new Event('relaydeck:session-changed'))
+    return
+  }
+  if (previous?.csrf_token !== session.csrf_token) clearSession('', false)
   sessionState.session = session
   sessionState.notice = ''
   setCsrfToken(session.csrf_token)
+  if (login || (previous && previous.session_ref !== session.session_ref)) channel?.postMessage({ type: 'changed', ref: session.session_ref })
 }
 
 /** Drop every trace of the session: identity, CSRF token and all cached server data. */
-export function clearSession(notice = '') {
+export function clearSession(notice = '', broadcast = true) {
   sessionState.epoch += 1
   sessionState.session = null
   sessionState.notice = notice
@@ -41,6 +56,7 @@ export function clearSession(notice = '') {
   queryClient.clear()
   // Notifications can name rules and accounts; never carry them into the next session.
   toasts.splice(0)
+  if (broadcast) channel?.postMessage({ type: 'changed', ref: null })
 }
 
 export function clearRecoveryCodes() {

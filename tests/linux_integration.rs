@@ -176,7 +176,8 @@ for path in pathlib.Path('/proc').glob('[0-9]*/status'):
     python(
         realm,
         r#"
-import subprocess
+import subprocess,pathlib,time
+pathlib.Path('/run/relaydeck-check/authorization').write_text(str(int(time.time())+300))
 result=subprocess.run(['setpriv','--reuid','60000','--regid','60000','--clear-groups','--no-new-privs','relaydeck','tenant','/usr/local/bin/realm','/run/relaydeck-check/realm.json','1','60000'],capture_output=True,timeout=3)
 assert result.returncode!=0 and b'account has expired' in result.stderr, ('expired startup verification',result.stdout,result.stderr)
 "#,
@@ -379,6 +380,7 @@ fn realm_data_plane_enforces_dual_stack_acl_targets_and_account_uids() {
     let policy = BrokerPolicy {
         database: "/var/lib/relaydeck/relaydeck.db".into(),
         web_uid: 1000,
+        web_gid: None,
         runtime_dir: "/run/relaydeck".into(),
         realm_binary: "/usr/local/bin/realm".into(),
         runner_binary: "/usr/local/bin/relaydeck".into(),
@@ -392,6 +394,9 @@ fn realm_data_plane_enforces_dual_stack_acl_targets_and_account_uids() {
         ],
         uid_start: 60000,
         max_owners: 2,
+        socket_path: "/run/relaydeck/broker.sock".into(),
+        authorization_ttl_secs: 120,
+        limits: relaydeck::linux::ResourceLimits::default(),
     };
     let boundary = ExecutorPolicy {
         reserved_ports: policy.reserved_ports.clone(),

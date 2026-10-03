@@ -24,6 +24,18 @@ pub async fn run(realm: &Path, config: &Path, expires_at: i64, uid: u32) -> anyh
         ensure!(expires_at >= 0, "invalid absolute expiry");
         validate_root_file(realm)?;
         validate_root_file(config)?;
+        let authorization = config
+            .parent()
+            .context("missing runtime directory")?
+            .join("authorization");
+        validate_root_file(&authorization)?;
+        let mut authorized_until: i64 = std::fs::read_to_string(&authorization)?.parse()?;
+        ensure!(
+            authorized_until > crate::db::now() && authorized_until - crate::db::now() <= 300,
+            "invalid runtime authorization"
+        );
+        let mut authorization_deadline = Instant::now()
+            + Duration::from_secs((authorized_until - crate::db::now()).max(0) as u64);
         let deadline = if expires_at == 0 {
             None
         } else {
@@ -64,6 +76,18 @@ pub async fn run(realm: &Path, config: &Path, expires_at: i64, uid: u32) -> anyh
                 _ = clock_check.tick() => {
                     // A forward wall-clock adjustment must also revoke promptly.
                     if expires_at != 0 && crate::db::now() >= expires_at { break; }
+                    let renewed = (|| -> anyhow::Result<i64> {
+                        validate_root_file(&authorization)?;
+                        let value: i64=std::fs::read_to_string(&authorization)?.parse()?;
+                        ensure!(value-crate::db::now()<=300,"invalid authorization deadline");
+                        Ok(value)
+                    })();
+                    let Ok(until)=renewed else { break; };
+                    if until>authorized_until {
+                        authorized_until=until;
+                        authorization_deadline=Instant::now()+Duration::from_secs((until-crate::db::now()).max(0) as u64);
+                    }
+                    if until<=crate::db::now() || Instant::now()>=authorization_deadline { break; }
                 }
                 _ = terminate.recv() => break,
                 _ = tokio::signal::ctrl_c() => break,

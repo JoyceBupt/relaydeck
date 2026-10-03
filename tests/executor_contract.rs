@@ -263,6 +263,45 @@ async fn confirmed_apply_publishes_revision_and_releases_only_historical_leases(
 }
 
 #[tokio::test]
+async fn temporary_database_lock_before_runtime_changes_does_not_stop_accounts() {
+    let fixture = Fixture::new().await;
+    let driver = TestDriver::default();
+    let path: String = sqlx::query_as::<_, (i64, String, String)>("PRAGMA database_list")
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap()
+        .2;
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(path)
+                .busy_timeout(Duration::from_millis(1)),
+        )
+        .await
+        .unwrap();
+    let reconciler = Reconciler::new(
+        pool.clone(),
+        ExecutorPolicy::default(),
+        driver.clone(),
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let tx = fixture.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    let error = reconciler.reconcile_owner(1).await.unwrap_err();
+    assert!(
+        matches!(error,relaydeck::executor::ReconcileError::Database(ref error) if relaydeck::worker::transient_database(error))
+    );
+    assert!(driver.actions.lock().await.is_empty());
+    tx.rollback().await.unwrap();
+    assert_eq!(
+        reconciler.reconcile_owner(1).await.unwrap(),
+        ReconcileOutcome::Applied
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn deleted_rule_releases_port_only_after_confirmed_account_stop() {
     let fixture = Fixture::new().await;
     sqlx::query("UPDATE rules SET deleted_at=?,enabled=0 WHERE id=1")

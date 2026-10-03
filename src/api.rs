@@ -98,7 +98,10 @@ impl FromRequestParts<AppState> for AuthContext {
             .ok_or_else(ApiError::unauthorized)?;
         let token = cookie
             .split(';')
-            .find_map(|item| item.trim().strip_prefix("relaydeck_session="))
+            .find_map(|item| {
+                item.trim()
+                    .strip_prefix(&format!("{}=", cookie_name(&state.config)))
+            })
             .ok_or_else(ApiError::unauthorized)?;
         if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(ApiError::unauthorized());
@@ -108,6 +111,16 @@ impl FromRequestParts<AppState> for AuthContext {
             "SELECT u.*,s.csrf_token FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>? AND s.auth_version=u.auth_version AND u.enabled=1 AND (u.expires_at IS NULL OR u.expires_at>?)"
         ).bind(&session_hash).bind(now()).bind(now()).fetch_optional(&state.pool).await?;
         let AuthRow { user, csrf_token } = row.ok_or_else(ApiError::unauthorized)?;
+        // A tab carrying the previous account's CSRF token must not read data
+        // using a cookie replaced by a different tab's login.
+        if parts.method.is_safe()
+            && parts
+                .headers
+                .get("x-csrf-token")
+                .is_some_and(|value| value.to_str().ok() != Some(csrf_token.as_str()))
+        {
+            return Err(ApiError::unauthorized());
+        }
         if !parts.method.is_safe() {
             check_origin(&parts.headers, state)?;
             if parts
@@ -125,6 +138,14 @@ impl FromRequestParts<AppState> for AuthContext {
             session_hash,
             require_admin_mfa: state.config.require_admin_mfa,
         })
+    }
+}
+
+fn cookie_name(config: &Config) -> &'static str {
+    if config.secure_cookie {
+        "__Host-relaydeck_session"
+    } else {
+        "relaydeck_session"
     }
 }
 
@@ -257,6 +278,7 @@ struct SessionView {
     user: UserView,
     csrf_token: String,
     mfa_required: bool,
+    session_ref: String,
 }
 
 async fn login(
@@ -371,6 +393,7 @@ async fn login(
     let value = SessionView {
         user: user_view(&state.pool, user.id).await?,
         csrf_token,
+        session_ref: token_hash(&token),
         mfa_required: state.config.require_admin_mfa && user.role == "admin",
     };
     let mut response = Json(value).into_response();
@@ -380,7 +403,8 @@ async fn login(
         ""
     };
     let cookie = format!(
-        "relaydeck_session={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=28800{secure}"
+        "{}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=28800{secure}",
+        cookie_name(&state.config)
     );
     response.headers_mut().insert(
         header::SET_COOKIE,
@@ -396,6 +420,7 @@ async fn session(
     Ok(Json(SessionView {
         user: user_view(&state.pool, auth.user.id).await?,
         csrf_token: auth.csrf_token,
+        session_ref: auth.session_hash,
         mfa_required: state.config.require_admin_mfa && auth.user.role == "admin",
     }))
 }
@@ -413,9 +438,12 @@ async fn logout(State(state): State<AppState>, auth: AuthContext) -> Result<Resp
     };
     response.headers_mut().insert(
         header::SET_COOKIE,
-        format!("relaydeck_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{secure}")
-            .parse()
-            .expect("static cookie"),
+        format!(
+            "{}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{secure}",
+            cookie_name(&state.config)
+        )
+        .parse()
+        .expect("static cookie"),
     );
     Ok(response)
 }
@@ -929,7 +957,7 @@ struct AuditView {
     actor_username: String,
     action: String,
     resource_id: Option<i64>,
-    // Current name of the referenced rule or account, so the log reads as
+    // Event-time name of the referenced rule or account, so the log reads as
     // sentences rather than bare identifiers. Rules keep their name after
     // soft deletion; accounts are never deleted.
     resource_kind: Option<String>,

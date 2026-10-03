@@ -1,28 +1,3 @@
-use axum::{
-    body::Body,
-    http::{Request, StatusCode},
-};
-use http_body_util::BodyExt;
-use tower::ServiceExt;
-
-#[tokio::test]
-async fn health_reports_the_runtime_boundary() {
-    let response = relaydeck::health_router()
-        .oneshot(
-            Request::builder()
-                .uri("/api/health")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(body["name"], "RelayDeck");
-    assert_eq!(body["executor"], "unconfigured");
-}
-
 #[tokio::test]
 async fn migrations_are_repeatable_and_constraints_hold() {
     let dir = tempfile::tempdir().unwrap();
@@ -40,6 +15,40 @@ async fn migrations_are_repeatable_and_constraints_hold() {
         .await
         .unwrap();
     assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn live_backup_contains_wal_changes_and_mfa_key_without_sidecars() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("relaydeck.db");
+    let key = dir.path().join("mfa.key");
+    let pool = relaydeck::db::connect(&path).await.unwrap();
+    relaydeck::mfa::MfaService::create_key_file(&key).unwrap();
+    relaydeck::api::initialize_admin(&pool, "adminroot", "test-backup-password".into())
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA wal_autocheckpoint=0")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let backup = dir.path().join("backup");
+    relaydeck::db::backup(&pool, &key, &backup).await.unwrap();
+    assert_eq!(
+        std::fs::read(&key).unwrap(),
+        std::fs::read(backup.join("mfa.key")).unwrap()
+    );
+    assert!(!backup.join("relaydeck.db-wal").exists());
+    let restored = relaydeck::db::connect(&backup.join("relaydeck.db"))
+        .await
+        .unwrap();
+    let name: String = sqlx::query_scalar("SELECT username FROM users")
+        .fetch_one(&restored)
+        .await
+        .unwrap();
+    assert_eq!(name, "adminroot");
+    assert!(relaydeck::db::backup(&pool, &key, &backup).await.is_err());
+    relaydeck::db::close(&restored).await.unwrap();
+    relaydeck::db::close(&pool).await.unwrap();
 }
 
 #[cfg(unix)]

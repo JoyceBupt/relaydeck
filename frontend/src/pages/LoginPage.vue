@@ -27,7 +27,7 @@ async function submit() {
     if (epoch !== sessionState.epoch) return
     form.password = ''
     form.code = ''
-    acceptSession(session)
+    acceptSession(session, true)
     const next = typeof route.query.next === 'string' && route.query.next.startsWith('/') && !route.query.next.startsWith('//') ? route.query.next : '/'
     await router.replace(next)
   } catch (failure) {

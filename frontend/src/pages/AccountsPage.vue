@@ -32,7 +32,7 @@ function state(user: User) {
 }
 function quotaWidth(user: User) { return `${user.max_rules ? Math.min(100, (user.rule_count / user.max_rules) * 100) : 0}%` }
 
-function open(user: User) { router.push(user.role === 'admin' ? '/settings' : `/accounts/${user.id}`) }
+function open(user: User) { router.push(`/accounts/${user.id}`) }
 const drawerOpen = computed(() => route.name === 'account' || route.name === 'account-new')
 const drawerUserId = computed(() => (route.name === 'account' ? Number(route.params.id) : null))
 </script>
@@ -65,7 +65,7 @@ const drawerUserId = computed(() => (route.name === 'account' ? Number(route.par
           <li v-for="user in list" :key="user.id">
             <button
               type="button" class="grid w-full items-center gap-x-4 px-4 py-3 text-left transition-colors duration-150 hover:bg-surface-2/60 md:grid-cols-[minmax(10rem,1.3fr)_minmax(8rem,1fr)_minmax(9rem,1fr)_minmax(8rem,1fr)_minmax(7rem,0.8fr)_1rem] max-md:grid-cols-[minmax(0,1fr)_auto] max-md:gap-y-1.5"
-              :aria-label="user.role === 'admin' ? `${user.username}（管理员），打开设置` : `编辑 ${user.username}`" @click="open(user)"
+              :aria-label="`编辑 ${user.username}`" @click="open(user)"
             >
               <span class="flex min-w-0 items-center gap-3">
                 <span class="flex size-8 shrink-0 items-center justify-center rounded-full border border-line bg-surface-2 text-xs font-semibold">{{ user.username.slice(0, 2).toUpperCase() }}</span>

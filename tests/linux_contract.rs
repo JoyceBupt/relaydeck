@@ -9,6 +9,7 @@ fn policy() -> BrokerPolicy {
     BrokerPolicy {
         database: "/var/lib/relaydeck/relaydeck.db".into(),
         web_uid: 999,
+        web_gid: None,
         runtime_dir: "/var/lib/relaydeck-runtime".into(),
         realm_binary: "/usr/local/libexec/realm".into(),
         runner_binary: "/usr/local/libexec/relaydeck".into(),
@@ -18,6 +19,9 @@ fn policy() -> BrokerPolicy {
         local_ips: vec!["8.8.4.4".parse().unwrap()],
         uid_start: 60000,
         max_owners: 11,
+        socket_path: "/run/relaydeck/broker.sock".into(),
+        authorization_ttl_secs: 120,
+        limits: relaydeck::linux::ResourceLimits::default(),
     }
 }
 
@@ -99,6 +103,41 @@ fn systemd_has_fixed_nonroot_identity_expiry_and_limits() {
     }
     assert!(!unit.contains("/bin/sh"));
     assert!(render_systemd(&policy, &plan, 2000).is_err());
+}
+
+#[test]
+fn configurable_resource_limits_and_counter_updates_preserve_policy_checks() {
+    let mut policy = policy();
+    policy.limits.nofile = 4096;
+    policy.limits.memory_max_mb = 256;
+    policy.limits.memory_high_mb = 128;
+    policy.limits.cpu_percent = 50;
+    let unit = render_systemd(
+        &policy,
+        &plan(1, 41000, "8.8.8.8".parse().unwrap(), vec![]),
+        1000,
+    )
+    .unwrap();
+    for expected in [
+        "LimitNOFILE=4096",
+        "MemoryMax=256M",
+        "MemoryHigh=128M",
+        "CPUQuota=50%",
+    ] {
+        assert!(unit.contains(expected));
+    }
+    let original = serde_json::json!({"nftables":[{"rule":{"expr":[{"counter":{"packets":1,"bytes":100}},{"accept":null}]}}]});
+    let mut counted = original.clone();
+    counted["nftables"][0]["rule"]["expr"][0]["counter"]["bytes"] = serde_json::json!(1000);
+    assert_eq!(
+        relaydeck::linux::firewall_fingerprint(&original).unwrap(),
+        relaydeck::linux::firewall_fingerprint(&counted).unwrap()
+    );
+    counted["nftables"][0]["rule"]["expr"][1] = serde_json::json!({"drop":null});
+    assert_ne!(
+        relaydeck::linux::firewall_fingerprint(&original).unwrap(),
+        relaydeck::linux::firewall_fingerprint(&counted).unwrap()
+    );
 }
 
 #[test]

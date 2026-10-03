@@ -89,6 +89,7 @@ async fn sign_in(app: &Router, username: &str, password: &str) -> Login {
             && cookie.contains("Secure")
             && cookie.contains("SameSite=Strict")
     );
+    assert!(cookie.starts_with("__Host-relaydeck_session="));
     Login {
         cookie: cookie.split(';').next().unwrap().into(),
         csrf: value["csrf_token"].as_str().unwrap().into(),
@@ -407,7 +408,7 @@ async fn runtime_reports_only_current_confirmed_revision_and_scopes_retries() {
         .execute(&f.state.pool)
         .await
         .unwrap();
-    sqlx::query("INSERT INTO runtime_states VALUES(?,1,'active',NULL,?)")
+    sqlx::query("INSERT INTO runtime_states(owner_id,revision,status,last_error,updated_at) VALUES(?,1,'active',NULL,?)")
         .bind(owner)
         .bind(relaydeck::db::now())
         .execute(&f.state.pool)
@@ -935,7 +936,7 @@ async fn rules_audit_and_ports_expose_readable_runtime_context() {
     .await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
     assert_eq!(created["runtime_error"], Value::Null);
-    sqlx::query("INSERT INTO runtime_states SELECT id,desired_revision,'failed','listener mismatch',? FROM users WHERE id=?")
+    sqlx::query("INSERT INTO runtime_states(owner_id,revision,status,last_error,updated_at) SELECT id,desired_revision,'failed','listener mismatch',? FROM users WHERE id=?")
         .bind(relaydeck::db::now())
         .bind(owner)
         .execute(&f.state.pool)
@@ -1200,6 +1201,135 @@ async fn api_roots_are_json_errors_and_audit_keeps_event_time_names() {
         .find(|event| event["action"] == "rule_created")
         .unwrap();
     assert_eq!(event["resource_name"], "测试转发");
+}
+
+#[tokio::test]
+async fn production_health_route_and_outbound_port_policy_are_enforced() {
+    let f = Fixture::new().await;
+    let (status, _, health) = call(&f.app, "GET", "/api/health", None, None, false).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(health["name"], "RelayDeck");
+    assert_eq!(health["executor"], "unconfigured");
+    for target in [25, 465, 587] {
+        let mut input = rule(40000);
+        input["target_port"] = json!(target);
+        assert_eq!(
+            call(
+                &f.app,
+                "POST",
+                "/api/rules",
+                Some(input),
+                Some(&f.admin),
+                true
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+}
+
+#[tokio::test]
+async fn ddns_refresh_revalidates_targets_and_retains_leases_until_stop() {
+    let f = Fixture::new().await;
+    let (_, _, created) = call(
+        &f.app,
+        "POST",
+        "/api/rules",
+        Some(rule(40000)),
+        Some(&f.admin),
+        true,
+    )
+    .await;
+    let id = created["id"].as_i64().unwrap();
+    sqlx::query("UPDATE rules SET target_host='relay.example',dns_checked_at=0 WHERE id=?")
+        .bind(id)
+        .execute(&f.state.pool)
+        .await
+        .unwrap();
+    relaydeck::worker::refresh_dns(&f.state.pool, &[], |_, _| async { Ok("1.1.1.1".into()) })
+        .await
+        .unwrap();
+    let (_, _, rules) = call(&f.app, "GET", "/api/rules", None, Some(&f.admin), false).await;
+    assert_eq!(rules[0]["target_ip"], "1.1.1.1");
+    sqlx::query("UPDATE rules SET dns_checked_at=0 WHERE id=?")
+        .bind(id)
+        .execute(&f.state.pool)
+        .await
+        .unwrap();
+    relaydeck::worker::refresh_dns(&f.state.pool, &[], |_, _| async { Ok("127.0.0.1".into()) })
+        .await
+        .unwrap();
+    let (_, _, rules) = call(&f.app, "GET", "/api/rules", None, Some(&f.admin), false).await;
+    assert_eq!(rules[0]["enabled"], false);
+    assert!(rules[0]["dns_error"].is_string());
+    let leased: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM port_leases WHERE rule_id=?")
+        .bind(id)
+        .fetch_one(&f.state.pool)
+        .await
+        .unwrap();
+    assert_eq!(leased, 1);
+}
+
+#[tokio::test]
+async fn administrator_grants_are_editable_without_allowing_self_revocation() {
+    let f = Fixture::new().await;
+    let id = f.admin.user["id"].as_i64().unwrap();
+    let input =
+        json!({"enabled":true,"port_start":40050,"port_end":40079,"max_rules":8,"expires_at":null});
+    let (status, _, user) = call(
+        &f.app,
+        "PUT",
+        &format!("/api/users/{id}"),
+        Some(input),
+        Some(&f.admin),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(user["max_rules"], 8);
+    assert_eq!(user["port_start"], 40050);
+    let fresh = sign_in(&f.app, "adminroot", ADMIN_PASSWORD).await;
+    let input = json!({"enabled":false,"port_start":40050,"port_end":40079,"max_rules":8,"expires_at":null});
+    assert_eq!(
+        call(
+            &f.app,
+            "PUT",
+            &format!("/api/users/{id}"),
+            Some(input),
+            Some(&fresh),
+            true
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn stale_tab_cannot_read_with_another_accounts_cookie() {
+    let f = Fixture::new().await;
+    let alice = f.add_user("alice", 41000).await;
+    let response = f
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/rules")
+                .header(header::COOKIE, &alice.cookie)
+                .header("x-csrf-token", &f.admin.csrf)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        call(&f.app, "GET", "/api/rules", None, Some(&alice), false)
+            .await
+            .0,
+        StatusCode::OK
+    );
 }
 
 #[tokio::test]

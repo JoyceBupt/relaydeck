@@ -15,7 +15,7 @@ test('account switching and credential mutations preserve isolation', async t =>
   const { api } = await server.ssrLoadModule('/src/api/endpoints.ts')
   const { queryClient } = await server.ssrLoadModule('/src/lib/queryClient.ts')
   const queries = await server.ssrLoadModule('/src/lib/queries.ts')
-  const identity = id => ({ user: { id, role: 'user', username: `user${id}` }, csrf_token: `session-${id}`, mfa_required: false })
+  const identity = id => ({ user: { id, role: 'user', username: `user${id}` }, csrf_token: `session-${id}`, session_ref: `ref-${id}`, mfa_required: false })
   const rule = { id: 1, name: 'private rule A', listen_port: 41000, target_host: '8.8.8.8', target_port: 443, protocol: 'tcp', source_cidrs: [], enabled: true }
   try {
     await t.test('new login clears recovery codes and old cached data', () => {
@@ -24,14 +24,14 @@ test('account switching and credential mutations preserve isolation', async t =>
       session.sessionState.recoveryCodes = ['private-recovery-code']
       session.sessionState.recoveryOwner = 1
       queryClient.setQueryData(['rules'], [rule])
-      session.acceptSession(identity(2))
+      session.acceptSession(identity(2), true)
       assert.deepEqual([...session.sessionState.recoveryCodes], [])
       assert.equal(session.sessionState.recoveryOwner, null)
       assert.equal(queryClient.getQueryData(['rules']), undefined)
     })
 
     await t.test('late toggle failure cannot restore account A into account B', async () => {
-      session.acceptSession(identity(1))
+      session.acceptSession(identity(1), true)
       queryClient.setQueryData(['rules'], [rule])
       let answer
       globalThis.fetch = () => new Promise(resolve => { answer = resolve })
@@ -43,7 +43,7 @@ test('account switching and credential mutations preserve isolation', async t =>
       const rejected = assert.rejects(pending, error => client.isStaleError(error))
       while (!answer) await new Promise(resolve => setTimeout(resolve, 0))
       session.clearSession()
-      session.acceptSession(identity(2))
+      session.acceptSession(identity(2), true)
       queryClient.setQueryData(['rules'], [{ ...rule, id: 2, name: 'rule B' }])
       answer(new Response(JSON.stringify({ ...rule, enabled: false }), { status: 200 }))
       await rejected
@@ -51,7 +51,7 @@ test('account switching and credential mutations preserve isolation', async t =>
     })
 
     await t.test('polling and logout wait while MFA response delivers recovery codes', async () => {
-      session.acceptSession(identity(1))
+      session.acceptSession(identity(1), true)
       let answer
       globalThis.fetch = () => new Promise(resolve => { answer = resolve })
       let expired = false
@@ -66,6 +66,19 @@ test('account switching and credential mutations preserve isolation', async t =>
       assert.equal(expired, false)
       assert.equal(client.securityMutationPending.value, false)
       window.removeEventListener('relaydeck:session-expired', listener)
+    })
+    await t.test('identity refresh cannot retain forms from another account', async () => {
+      session.acceptSession(identity(1), true)
+      queryClient.setQueryData(['rules'], [rule])
+      globalThis.fetch = async () => new Response(JSON.stringify(identity(2)), { status: 200 })
+      let changed = false
+      const listener = () => { changed = true }
+      window.addEventListener('relaydeck:session-changed', listener)
+      await session.refreshIdentity()
+      assert.equal(session.sessionState.session, null)
+      assert.equal(queryClient.getQueryData(['rules']), undefined)
+      assert.equal(changed, true)
+      window.removeEventListener('relaydeck:session-changed', listener)
     })
   } finally {
     session.clearSession()

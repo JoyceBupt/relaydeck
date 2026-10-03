@@ -23,6 +23,22 @@ export async function request<T>(path: string, method = 'GET', data?: unknown): 
   if (securityMutationPending.value && path !== '/health') {
     throw new ApiError(409, method === 'GET' ? 'stale_read' : 'security_pending', '安全设置正在保存')
   }
+  const generation = sessionGeneration
+  const changesCookie = method !== 'GET' && ['/login', '/logout', '/password', '/mfa/confirm', '/mfa/disable'].includes(path)
+  const execute = () => {
+    if (generation !== sessionGeneration) throw new ApiError(0, 'stale_session', '会话已变更')
+    return performRequest<T>(path, method, data)
+  }
+  if (changesCookie && typeof window !== 'undefined' && window.document && typeof navigator !== 'undefined' && navigator.locks) {
+    return navigator.locks.request('relaydeck-authentication', execute)
+  }
+  return execute()
+}
+
+async function performRequest<T>(path: string, method: string, data?: unknown): Promise<T> {
+  if (securityMutationPending.value && path !== '/health') {
+    throw new ApiError(409, method === 'GET' ? 'stale_read' : 'security_pending', '安全设置正在保存')
+  }
   const security = method !== 'GET' && ['/password', '/mfa/confirm', '/mfa/disable'].includes(path)
   if (security) securityMutationPending.value = true
   try {
@@ -30,6 +46,7 @@ export async function request<T>(path: string, method = 'GET', data?: unknown): 
   const generation = sessionGeneration
   const mutation = mutationGeneration
   const headers: Record<string, string> = { Accept: 'application/json' }
+  if (method === 'GET' && path !== '/session' && csrfToken) headers['X-CSRF-Token'] = csrfToken
   if (data !== undefined) headers['Content-Type'] = 'application/json'
   if (method !== 'GET') headers['X-CSRF-Token'] = csrfToken
   let response: Response

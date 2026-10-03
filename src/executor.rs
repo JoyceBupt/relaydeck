@@ -138,6 +138,7 @@ impl DesiredPlan {
             if rule.id <= 0 || rule.target_port == 0 {
                 return Err(PlanError::RuleIdentity);
             }
+            policy::validate_target_port(rule.target_port)?;
             if !identifiers.insert(rule.id) || !ports.insert(rule.listen_port) {
                 return Err(PlanError::Duplicate);
             }
@@ -463,7 +464,7 @@ impl<D: ExecutorDriver> Reconciler<D> {
         // Expiry is independent of a queued HTTP change. A stopped runtime is
         // excluded so an expired account does not cause endless repeated stops.
         Ok(sqlx::query_scalar(
-            "SELECT DISTINCT u.id FROM users u LEFT JOIN runtime_states s ON s.owner_id=u.id WHERE EXISTS (SELECT 1 FROM apply_jobs j WHERE j.owner_id=u.id AND j.status='pending') OR ((u.enabled=0 OR (u.expires_at IS NOT NULL AND u.expires_at<=?)) AND (s.status IS NULL OR s.status='active')) ORDER BY CASE WHEN u.enabled=0 OR (u.expires_at IS NOT NULL AND u.expires_at<=?) THEN 0 ELSE 1 END,u.id",
+            "SELECT DISTINCT u.id FROM users u LEFT JOIN runtime_states s ON s.owner_id=u.id WHERE EXISTS (SELECT 1 FROM apply_jobs j WHERE j.owner_id=u.id AND j.status='pending') OR ((u.enabled=0 OR (u.expires_at IS NOT NULL AND u.expires_at<=?)) AND (s.status IS NULL OR s.status IN ('active','failed'))) ORDER BY CASE WHEN u.enabled=0 OR (u.expires_at IS NOT NULL AND u.expires_at<=?) THEN 0 ELSE 1 END,u.id",
         )
         .bind(now())
         .bind(now())
@@ -487,8 +488,10 @@ impl<D: ExecutorDriver> Reconciler<D> {
             return Err(ReconcileError::Owner);
         }
         let _guard = self.operation_lock.lock().await;
-        let result = self.reconcile_locked(owner_id).await;
-        if result.is_err() {
+        let mut runtime_changed = false;
+        let result = self.reconcile_locked(owner_id, &mut runtime_changed).await;
+        let untouched_busy = matches!(&result,Err(ReconcileError::Database(error)) if !runtime_changed && crate::worker::transient_database(error));
+        if result.is_err() && !untouched_busy {
             // A failed DB read/finalization may conceal a revocation. Keep the
             // runtime stopped rather than continuing an unconfirmed revision.
             // Stop implementations are idempotent and must be cancellation-safe.
@@ -497,7 +500,11 @@ impl<D: ExecutorDriver> Reconciler<D> {
         result
     }
 
-    async fn reconcile_locked(&self, owner_id: i64) -> Result<ReconcileOutcome, ReconcileError> {
+    async fn reconcile_locked(
+        &self,
+        owner_id: i64,
+        runtime_changed: &mut bool,
+    ) -> Result<ReconcileOutcome, ReconcileError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let Some(desired) = load_plan(&mut tx, owner_id, now()).await? else {
             tx.rollback().await?;
@@ -527,6 +534,7 @@ impl<D: ExecutorDriver> Reconciler<D> {
             self.confirm_stop(owner_id).await?;
             return Ok(ReconcileOutcome::StaleStopped);
         }
+        *runtime_changed = true;
         let result = if plan.stopped() {
             tokio::time::timeout(self.timeout, self.driver.stop(owner_id)).await
         } else {

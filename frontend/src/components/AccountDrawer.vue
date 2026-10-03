@@ -22,7 +22,7 @@ const router = useRouter()
 
 const user = computed(() => (props.userId === null ? null : props.users.find(item => item.id === props.userId) ?? null))
 const isNew = computed(() => props.userId === null)
-const missing = computed(() => !isNew.value && props.loaded && (!user.value || user.value.role !== 'user'))
+const missing = computed(() => !isNew.value && props.loaded && !user.value)
 const ports = usePorts(computed(() => (user.value ? user.value.id : null)))
 const statuses = computed(() => Object.fromEntries(props.rules.map(rule => [rule.id, { name: rule.name, status: rule.runtime_status }])))
 const ownRules = computed(() => props.rules.filter(rule => rule.owner_id === props.userId))
@@ -150,7 +150,7 @@ const expiryInfo = computed(() => (user.value ? expiry(user.value.expires_at) : 
 
 <template>
   <SideDrawer :open="open" :title="isNew ? '新建账户' : user?.username ?? '账户'" :description="isNew ? '为租户分配端口段、规则额度和有效期。' : user ? `ID ${user.id} · 租户` : undefined" @close="requestClose" @before-close="onBeforeClose">
-    <div v-if="missing" class="rounded-lg border border-line px-4 py-8 text-center text-muted">没有找到这个租户账户。</div>
+    <div v-if="missing" class="rounded-lg border border-line px-4 py-8 text-center text-muted">账户不存在</div>
     <div v-else class="grid gap-6">
       <section v-if="user" class="grid gap-3">
         <div class="flex flex-wrap gap-1.5">
@@ -169,7 +169,7 @@ const expiryInfo = computed(() => (user.value ? expiry(user.value.expires_at) : 
         </div>
         <div class="flex flex-wrap gap-2">
           <RouterLink :to="{ path: '/rules', query: { owner: String(user.id) } }" class="btn btn-secondary btn-sm"><ArrowRightLeft class="size-4" />查看 {{ user.rule_count }} 条转发</RouterLink>
-          <button type="button" class="btn btn-secondary btn-sm" @click="openReset"><KeyRound class="size-4" />重置密码</button>
+          <button v-if="user?.role !== 'admin'" type="button" class="btn btn-secondary btn-sm" @click="openReset"><KeyRound class="size-4" />重置密码</button>
         </div>
       </section>
 
@@ -210,7 +210,7 @@ const expiryInfo = computed(() => (user.value ? expiry(user.value.expires_at) : 
             <input v-model.number="form.max_rules" class="input input-mono" type="number" min="0" max="30" :aria-invalid="!!show('maxRules')" />
             <span v-if="show('maxRules')" class="field-error">{{ show('maxRules') }}</span>
           </label>
-          <div class="field">
+          <div v-if="user?.role !== 'admin'" class="field">
             <label class="field-label" for="account-expiry">到期日</label>
             <input id="account-expiry" v-model="form.expires" class="input" type="date" :aria-invalid="!!show('expires')" />
             <span v-if="show('expires')" class="field-error">{{ show('expires') }}</span>
@@ -219,7 +219,7 @@ const expiryInfo = computed(() => (user.value ? expiry(user.value.expires_at) : 
           </div>
         </div>
 
-        <div v-if="!isNew" class="flex items-center justify-between gap-4 rounded-lg border border-line px-3.5 py-3">
+        <div v-if="!isNew && user?.role !== 'admin'" class="flex items-center justify-between gap-4 rounded-lg border border-line px-3.5 py-3">
           <div>
             <p class="font-medium">启用账户</p>
             <p class="text-xs text-muted">停用后无法登录，名下转发全部停止。</p>
