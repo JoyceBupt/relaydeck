@@ -20,7 +20,7 @@ export interface User {
   mfa_enabled: boolean
 }
 
-export interface Session { user: User; csrf_token: string; session_ref: string; mfa_required: boolean }
+export interface Session { can_upgrade?: boolean; user: User; csrf_token: string; session_ref: string; mfa_required: boolean }
 export interface MfaEnrollment { secret: string; otpauth_uri: string }
 export interface Health { status: string; name: string; version: string; executor: ExecutorState }
 
@@ -91,3 +91,8 @@ export interface NewUserInput {
   max_rules: number
   expires_at: number | null
 }
+
+
+export interface UpgradeOffer { version: string; release_url: string; offer: string; expires_at: number }
+export interface UpgradeJob { id: string; version: string; phase: 'queued' | 'downloading' | 'verifying' | 'updating' | 'recovering' | 'succeeded' | 'failed' | 'rolled_back'; step: string; progress?: number; started_at: number; updated_at: number; error: string | null }
+export interface UpgradeStatus { current_version: string; latest: UpgradeOffer | null; job: UpgradeJob | null; checked_at: number; maintenance: boolean; recovery_required: boolean }

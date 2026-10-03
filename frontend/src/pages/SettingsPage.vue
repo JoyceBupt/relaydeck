@@ -2,6 +2,7 @@
 import { computed, nextTick, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { Copy, ShieldCheck } from '@lucide/vue'
+import UpgradePanel from '../components/UpgradePanel.vue'
 import QrCode from '../components/QrCode.vue'
 import OtpInput from '../components/OtpInput.vue'
 import PasswordInput from '../components/PasswordInput.vue'
@@ -103,6 +104,8 @@ onMounted(() => { if (route.hash === '#security' || forcedMfa.value) security.va
       <h1 class="page-title">设置</h1>
       <p v-if="forcedMfa" class="mt-1 text-warning">管理员须先开启两步验证</p>
     </div>
+
+    <UpgradePanel v-if="sessionState.session?.can_upgrade" />
 
     <section id="security" ref="security" class="panel scroll-mt-24" :class="forcedMfa ? 'border-warning/50' : ''" aria-labelledby="mfa-title">
       <div class="flex items-center justify-between gap-4 px-5 pt-5">

@@ -1,0 +1,33 @@
+[Unit]
+Description=RelayDeck owner-only release updater
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/python3 -B /usr/local/libexec/relaydeck-upgrader.py serve
+Restart=on-failure
+RestartSec=3
+RuntimeDirectory=relaydeck-upgrade
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=restart
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/relaydeck/updates /run/relaydeck-upgrade
+InaccessiblePaths=/var/lib/relaydeck/data /var/lib/relaydeck/secrets /var/lib/relaydeck/backups
+MemoryMax=64M
+TasksMax=16
+
+[Install]
+WantedBy=multi-user.target

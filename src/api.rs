@@ -27,6 +27,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub credentials: Credentials,
     pub mfa: crate::mfa::MfaService,
+    pub upgrades: Option<Arc<dyn crate::upgrade::UpgradeChannel>>,
     dummy_hash: Arc<String>,
     network_limits: Arc<Mutex<crate::limits::Limits>>,
     account_limits: Arc<Mutex<crate::limits::Limits>>,
@@ -41,7 +42,12 @@ impl AppState {
             anyhow::anyhow!("cannot load MFA key (initialize once with init-key): {error}")
         })?;
         let dummy_hash = credentials.hash_password(new_session_token()).await?;
+        let upgrades = config.upgrade.as_ref().map(|config| {
+            Arc::new(crate::upgrade::SocketChannel(config.socket.clone()))
+                as Arc<dyn crate::upgrade::UpgradeChannel>
+        });
         Ok(Self {
+            upgrades,
             pool,
             config: Arc::new(config),
             credentials,
@@ -299,6 +305,7 @@ struct LoginRequest {
 
 #[derive(Serialize)]
 struct SessionView {
+    can_upgrade: bool,
     user: UserView,
     csrf_token: String,
     mfa_required: bool,
@@ -436,6 +443,7 @@ async fn login(
         .await
         .reset(&user.id.to_string());
     let value = SessionView {
+        can_upgrade: owner_identity(&state, &user),
         user: user_view(&state.pool, user.id).await?,
         csrf_token,
         session_ref: token_hash(&token),
@@ -463,6 +471,7 @@ async fn session(
     auth: AuthContext,
 ) -> Result<Json<SessionView>, ApiError> {
     Ok(Json(SessionView {
+        can_upgrade: owner_identity(&state, &auth.user),
         user: user_view(&state.pool, auth.user.id).await?,
         csrf_token: auth.csrf_token,
         session_ref: auth.session_hash,
@@ -1097,6 +1106,115 @@ pub async fn initialize_admin(
     Ok(())
 }
 
+fn owner_identity(state: &AppState, user: &DbUser) -> bool {
+    user.role == "admin"
+        && state
+            .config
+            .upgrade
+            .as_ref()
+            .is_some_and(|config| config.owner_id == user.id)
+}
+
+fn upgrade_owner(state: &AppState, auth: &AuthContext) -> Result<(), ApiError> {
+    auth.admin()?;
+    if !owner_identity(state, &auth.user) {
+        return Err(ApiError::forbidden());
+    }
+    Ok(())
+}
+
+async fn upgrade_request(
+    state: &AppState,
+    request: serde_json::Value,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let channel = state.upgrades.as_ref().ok_or_else(ApiError::unavailable)?;
+    Ok(Json(channel.request(request).await?))
+}
+
+async fn upgrade_status(
+    State(state): State<AppState>,
+    auth: AuthContext,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    upgrade_owner(&state, &auth)?;
+    upgrade_request(&state, crate::upgrade::status_request()).await
+}
+
+async fn check_upgrade(
+    State(state): State<AppState>,
+    auth: AuthContext,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    upgrade_owner(&state, &auth)?;
+    sensitive_limit(&state, auth.user.id).await?;
+    upgrade_request(&state, serde_json::json!({"op":"check"})).await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpgradeRequest {
+    offer: String,
+    password: String,
+    code: String,
+    acknowledge: bool,
+}
+
+async fn start_upgrade(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Json(input): Json<UpgradeRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    upgrade_owner(&state, &auth)?;
+    if !input.acknowledge
+        || input.offer.len() != 64
+        || !input.offer.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || input.code.len() != 6
+        || !input.code.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(ApiError::bad_request("请确认转发中断并输入验证码"));
+    }
+    if let Err(mut error) = reauthenticate(&state, &auth, input.password).await {
+        if error.code == "invalid_input" {
+            let mut tx = state.pool.begin_with("BEGIN IMMEDIATE").await?;
+            let actor = mfa_actor(&mut tx, &auth).await?;
+            record_authentication_failure(&mut tx, &actor, "panel_upgrade_password_failed").await?;
+            tx.commit().await?;
+            error.code = "password_invalid";
+        }
+        return Err(error);
+    }
+    let mut tx = state.pool.begin_with("BEGIN IMMEDIATE").await?;
+    let actor = mfa_actor(&mut tx, &auth).await?;
+    if !owner_identity(&state, &actor) || actor.mfa_secret.is_none() {
+        return Err(ApiError::forbidden());
+    }
+    // Password verification must refer to this transaction's still-current credentials.
+    if actor.password_hash != auth.user.password_hash {
+        return Err(ApiError::unauthorized());
+    }
+    check_mfa_budget(&actor, &input.code)?;
+    if !state
+        .mfa
+        .verify(&mut tx, actor.id, &input.code, now())
+        .await?
+    {
+        record_mfa_failure(&mut tx, &actor, "panel_upgrade_mfa_failed").await?;
+        tx.commit().await?;
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            code: "mfa_invalid",
+            message: "验证码无效或已过期".into(),
+        });
+    }
+    clear_mfa_failures(&mut tx, actor.id).await?;
+    record_audit(&mut tx, &actor, "panel_upgrade_requested", Some(actor.id)).await?;
+    tx.commit().await?;
+    // The root-owned offer expires once accepted. No URLs, checksums, paths or commands cross this boundary.
+    upgrade_request(
+        &state,
+        serde_json::json!({"op":"start","offer":input.offer}),
+    )
+    .await
+}
+
 async fn api_not_found() -> ApiError {
     ApiError::not_found()
 }
@@ -1107,6 +1225,11 @@ pub fn router(state: AppState) -> Router {
     let static_files = tower_http::services::ServeDir::new(&state.config.frontend).fallback(
         tower_http::services::ServeFile::new(state.config.frontend.join("index.html")),
     );
+    let maintenance = state
+        .config
+        .upgrade
+        .as_ref()
+        .map(|config| config.maintenance.clone());
     Router::new()
         .route("/api/login",post(login))
         .route("/api/session",get(session))
@@ -1123,20 +1246,28 @@ pub fn router(state: AppState) -> Router {
         .route("/api/preferences",put(preferences))
         .route("/api/audit",get(audit))
         .route("/api/health",get(health))
+        .route("/api/system/update",get(upgrade_status).post(start_upgrade))
+        .route("/api/system/update/check",post(check_upgrade))
         .merge(crate::rules::routes())
         .route("/api",axum::routing::any(api_not_found))
         .route("/api/",axum::routing::any(api_not_found))
         .route("/api/{*path}",axum::routing::any(api_not_found))
         .fallback_service(static_files)
         .layer(axum::extract::DefaultBodyLimit::max(16*1024))
-        .layer(axum::middleware::from_fn(|request:axum::extract::Request,next:axum::middleware::Next|async move{
-            let mut response=next.run(request).await;
+        .layer(axum::middleware::from_fn(move |request:axum::extract::Request,next:axum::middleware::Next| {
+            let maintenance = maintenance.clone();
+            async move {
+            // Once the snapshot is taken, reject external writes until commit or recovery completes.
+            // New services may be serving health/read requests before the upgrade's final decision.
+            let writing_api = request.uri().path().starts_with("/api/") && !matches!(*request.method(), axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS);
+            let locked = match maintenance { Some(path) if writing_api => tokio::fs::try_exists(path).await.unwrap_or(true), _ => false };
+            let mut response=if locked { ApiError::unavailable().into_response() } else { next.run(request).await };
             let headers=response.headers_mut();
             headers.insert(header::CACHE_CONTROL,"no-store".parse().unwrap());
             headers.insert("x-content-type-options","nosniff".parse().unwrap());
             headers.insert("referrer-policy","no-referrer".parse().unwrap());
             headers.insert("content-security-policy","default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'".parse().unwrap());
             response
-        }))
+        }}))
         .with_state(state)
 }
