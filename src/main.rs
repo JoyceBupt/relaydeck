@@ -6,21 +6,52 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "relaydeck=info".into()),
         )
         .init();
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if let [command, realm, config, expires_at, uid] = arguments.as_slice()
+        && command == "tenant"
+    {
+        return relaydeck::tenant::run(
+            std::path::Path::new(realm),
+            std::path::Path::new(config),
+            expires_at.parse()?,
+            uid.parse()?,
+        )
+        .await;
+    }
+    if let [command, path] = arguments.as_slice()
+        && command == "worker"
+    {
+        return relaydeck::linux::run(std::path::Path::new(path)).await;
+    }
     let config = relaydeck::config::Config::from_env()?;
     let pool = relaydeck::db::connect(&config.database).await?;
-    let arguments: Vec<String> = std::env::args().skip(1).collect();
     match arguments.as_slice() {
+        [command] if command == "init-key" => {
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE mfa_secret IS NOT NULL OR mfa_pending_secret IS NOT NULL").fetch_one(&pool).await?;
+            anyhow::ensure!(
+                count == 0,
+                "existing MFA enrollment requires the original key; restore its backup"
+            );
+            relaydeck::mfa::MfaService::create_key_file(&config.mfa_key)?;
+            println!("MFA key initialized. Back up this key together with the database.");
+            return Ok(());
+        }
         [command, username] if command == "init-admin" => {
             let password = rpassword::prompt_password("Administrator password: ")?;
             let confirmation = rpassword::prompt_password("Confirm password: ")?;
             anyhow::ensure!(password == confirmation, "passwords do not match");
             relaydeck::api::initialize_admin(&pool, username, password).await?;
+            if !config.mfa_key.try_exists()? {
+                relaydeck::mfa::MfaService::create_key_file(&config.mfa_key)?;
+            }
             println!("Administrator initialized. No password was stored in command arguments.");
             return Ok(());
         }
         [] => (),
         [command] if command == "serve" => (),
-        _ => anyhow::bail!("usage: relaydeck [serve | init-admin <username>]"),
+        _ => anyhow::bail!(
+            "usage: relaydeck [serve | init-admin <username> | init-key | worker <policy.json>]"
+        ),
     }
     let state = relaydeck::api::AppState::new(pool, config.clone()).await?;
     let listener = tokio::net::TcpListener::bind(config.listen).await?;

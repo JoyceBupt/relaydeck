@@ -27,6 +27,7 @@ pub struct AppState {
     pub pool: SqlitePool,
     pub config: Arc<Config>,
     pub credentials: Credentials,
+    pub mfa: crate::mfa::MfaService,
     dummy_hash: Arc<String>,
     login_limits: Arc<Mutex<HashMap<String, (i64, u32)>>>,
 }
@@ -34,11 +35,15 @@ pub struct AppState {
 impl AppState {
     pub async fn new(pool: SqlitePool, config: Config) -> anyhow::Result<Self> {
         let credentials = Credentials::new();
+        let mfa = crate::mfa::MfaService::from_key_file(&config.mfa_key).map_err(|error| {
+            anyhow::anyhow!("cannot load MFA key (initialize once with init-key): {error}")
+        })?;
         let dummy_hash = credentials.hash_password(new_session_token()).await?;
         Ok(Self {
             pool,
             config: Arc::new(config),
             credentials,
+            mfa,
             dummy_hash: Arc::new(dummy_hash),
             login_limits: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -49,6 +54,14 @@ pub struct AuthContext {
     pub user: DbUser,
     pub csrf_token: String,
     pub session_hash: String,
+    require_admin_mfa: bool,
+}
+
+#[derive(sqlx::FromRow)]
+struct AuthRow {
+    #[sqlx(flatten)]
+    user: DbUser,
+    csrf_token: String,
 }
 
 impl AuthContext {
@@ -60,6 +73,7 @@ impl AuthContext {
                 message: "请先修改密码".into(),
             });
         }
+        check_mfa_ready(&self.user, self.require_admin_mfa)?;
         Ok(())
     }
     pub fn admin(&self) -> Result<(), ApiError> {
@@ -87,14 +101,10 @@ impl FromRequestParts<AppState> for AuthContext {
             return Err(ApiError::unauthorized());
         }
         let session_hash = token_hash(token);
-        let row: Option<(i64, String)> = sqlx::query_as(
-            "SELECT s.user_id,s.csrf_token FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>? AND s.auth_version=u.auth_version AND u.enabled=1 AND (u.expires_at IS NULL OR u.expires_at>?)"
+        let row: Option<AuthRow> = sqlx::query_as(
+            "SELECT u.*,s.csrf_token FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>? AND s.auth_version=u.auth_version AND u.enabled=1 AND (u.expires_at IS NULL OR u.expires_at>?)"
         ).bind(&session_hash).bind(now()).bind(now()).fetch_optional(&state.pool).await?;
-        let (id, csrf_token) = row.ok_or_else(ApiError::unauthorized)?;
-        let user: DbUser = sqlx::query_as("SELECT * FROM users WHERE id=?")
-            .bind(id)
-            .fetch_one(&state.pool)
-            .await?;
+        let AuthRow { user, csrf_token } = row.ok_or_else(ApiError::unauthorized)?;
         if !parts.method.is_safe() {
             check_origin(&parts.headers, state)?;
             if parts
@@ -110,6 +120,7 @@ impl FromRequestParts<AppState> for AuthContext {
             user,
             csrf_token,
             session_hash,
+            require_admin_mfa: state.config.require_admin_mfa,
         })
     }
 }
@@ -129,11 +140,7 @@ pub async fn write_actor(
     tx: &mut Transaction<'_, Sqlite>,
     auth: &AuthContext,
 ) -> Result<DbUser, ApiError> {
-    let user: Option<DbUser> = sqlx::query_as("SELECT u.* FROM users u JOIN sessions s ON s.user_id=u.id WHERE u.id=? AND s.token_hash=? AND s.auth_version=u.auth_version AND s.expires_at>?")
-        .bind(auth.user.id).bind(&auth.session_hash).bind(now()).fetch_optional(&mut **tx).await?;
-    let user = user
-        .filter(DbUser::available)
-        .ok_or_else(ApiError::unauthorized)?;
+    let user = session_actor(tx, auth).await?;
     if user.must_change_password {
         return Err(ApiError {
             status: StatusCode::FORBIDDEN,
@@ -141,6 +148,30 @@ pub async fn write_actor(
             message: "请先修改密码".into(),
         });
     }
+    check_mfa_ready(&user, auth.require_admin_mfa)?;
+    Ok(user)
+}
+
+fn check_mfa_ready(user: &DbUser, required: bool) -> Result<(), ApiError> {
+    if required && user.role == "admin" && user.mfa_secret.is_none() {
+        return Err(ApiError {
+            status: StatusCode::FORBIDDEN,
+            code: "mfa_enrollment_required",
+            message: "请启用双因素".into(),
+        });
+    }
+    Ok(())
+}
+
+async fn session_actor(
+    tx: &mut Transaction<'_, Sqlite>,
+    auth: &AuthContext,
+) -> Result<DbUser, ApiError> {
+    let user: Option<DbUser> = sqlx::query_as("SELECT u.* FROM users u JOIN sessions s ON s.user_id=u.id WHERE u.id=? AND s.token_hash=? AND s.auth_version=u.auth_version AND s.expires_at>?")
+        .bind(auth.user.id).bind(&auth.session_hash).bind(now()).fetch_optional(&mut **tx).await?;
+    let user = user
+        .filter(DbUser::available)
+        .ok_or_else(ApiError::unauthorized)?;
     Ok(user)
 }
 
@@ -161,6 +192,10 @@ pub async fn enqueue_apply(
 ) -> Result<(), ApiError> {
     let revision: i64 = sqlx::query_scalar("UPDATE users SET desired_revision=desired_revision+1 WHERE id=? RETURNING desired_revision")
         .bind(owner_id).fetch_one(&mut **tx).await?;
+    sqlx::query("DELETE FROM apply_jobs WHERE owner_id=? AND status='pending'")
+        .bind(owner_id)
+        .execute(&mut **tx)
+        .await?;
     sqlx::query("INSERT INTO apply_jobs(owner_id,revision,created_at) VALUES(?,?,?)")
         .bind(owner_id)
         .bind(revision)
@@ -188,12 +223,14 @@ async fn user_view(pool: &SqlitePool, id: i64) -> Result<UserView, ApiError> {
 struct LoginRequest {
     username: String,
     password: String,
+    code: Option<String>,
 }
 
 #[derive(Serialize)]
 struct SessionView {
     user: UserView,
     csrf_token: String,
+    mfa_required: bool,
 }
 
 async fn login(
@@ -278,6 +315,20 @@ async fn login(
     if !current.available() || current.auth_version != user.auth_version {
         return Err(ApiError::unauthorized());
     }
+    if current.mfa_secret.is_some() {
+        let code = input
+            .code
+            .as_deref()
+            .filter(|code| !code.is_empty())
+            .ok_or_else(|| ApiError {
+                status: StatusCode::UNAUTHORIZED,
+                code: "mfa_required",
+                message: "请输入验证码".into(),
+            })?;
+        if !state.mfa.verify(&mut tx, current.id, code, now()).await? {
+            return Err(ApiError::bad_request("验证码无效"));
+        }
+    }
     sqlx::query("DELETE FROM sessions WHERE expires_at<=?")
         .bind(now())
         .execute(&mut *tx)
@@ -291,6 +342,7 @@ async fn login(
     let value = SessionView {
         user: user_view(&state.pool, user.id).await?,
         csrf_token,
+        mfa_required: state.config.require_admin_mfa && user.role == "admin",
     };
     let mut response = Json(value).into_response();
     let secure = if state.config.secure_cookie {
@@ -315,6 +367,7 @@ async fn session(
     Ok(Json(SessionView {
         user: user_view(&state.pool, auth.user.id).await?,
         csrf_token: auth.csrf_token,
+        mfa_required: state.config.require_admin_mfa && auth.user.role == "admin",
     }))
 }
 
@@ -350,6 +403,7 @@ async fn change_password(
     auth: AuthContext,
     Json(input): Json<PasswordRequest>,
 ) -> Result<StatusCode, ApiError> {
+    sensitive_limit(&state, auth.user.id).await?;
     policy::validate_password(&input.new_password)?;
     if !state
         .credentials
@@ -377,6 +431,226 @@ async fn change_password(
     record_audit(&mut tx, &current, "password_changed", Some(current.id)).await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MfaSetupRequest {
+    password: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MfaCodeRequest {
+    code: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MfaDisableRequest {
+    password: String,
+    code: String,
+}
+
+async fn sensitive_limit(state: &AppState, user_id: i64) -> Result<(), ApiError> {
+    let mut limits = state.login_limits.lock().await;
+    let timestamp = now();
+    limits.retain(|_, (start, _)| timestamp.saturating_sub(*start) < 60);
+    let key = format!("mfa:{user_id}");
+    if limits.len() >= 1024 || limits.get(&key).is_some_and(|(_, n)| *n >= 8) {
+        return Err(ApiError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            code: "rate_limited",
+            message: "操作过于频繁".into(),
+        });
+    }
+    limits.entry(key).or_insert((timestamp, 0)).1 += 1;
+    Ok(())
+}
+
+async fn reauthenticate(
+    state: &AppState,
+    auth: &AuthContext,
+    password: String,
+) -> Result<(), ApiError> {
+    sensitive_limit(state, auth.user.id).await?;
+    if password.len() > 128
+        || !state
+            .credentials
+            .verify_password(password, auth.user.password_hash.clone())
+            .await?
+    {
+        return Err(ApiError::bad_request("密码不正确"));
+    }
+    Ok(())
+}
+
+async fn mfa_actor(
+    tx: &mut Transaction<'_, Sqlite>,
+    auth: &AuthContext,
+) -> Result<DbUser, ApiError> {
+    let user = session_actor(tx, auth).await?;
+    if user.must_change_password {
+        return Err(ApiError {
+            status: StatusCode::FORBIDDEN,
+            code: "password_change_required",
+            message: "请先修改密码".into(),
+        });
+    }
+    if user.auth_version != auth.user.auth_version {
+        return Err(ApiError::unauthorized());
+    }
+    Ok(user)
+}
+
+async fn begin_mfa(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Json(input): Json<MfaSetupRequest>,
+) -> Result<Json<crate::mfa::Enrollment>, ApiError> {
+    reauthenticate(&state, &auth, input.password).await?;
+    let mut tx = state.pool.begin_with("BEGIN IMMEDIATE").await?;
+    let actor = mfa_actor(&mut tx, &auth).await?;
+    let enrollment = state
+        .mfa
+        .begin_enrollment(&mut tx, actor.id, &actor.username, now())
+        .await?;
+    record_audit(&mut tx, &actor, "mfa_setup", Some(actor.id)).await?;
+    tx.commit().await?;
+    Ok(Json(enrollment))
+}
+
+async fn revoke_sessions(tx: &mut Transaction<'_, Sqlite>, user_id: i64) -> Result<(), ApiError> {
+    sqlx::query("UPDATE users SET auth_version=auth_version+1 WHERE id=?")
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM sessions WHERE user_id=?")
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn confirm_mfa(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Json(input): Json<MfaCodeRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    sensitive_limit(&state, auth.user.id).await?;
+    let mut tx = state.pool.begin_with("BEGIN IMMEDIATE").await?;
+    let actor = mfa_actor(&mut tx, &auth).await?;
+    let codes = state
+        .mfa
+        .confirm_enrollment(&mut tx, actor.id, &input.code, now())
+        .await?
+        .ok_or_else(|| ApiError::bad_request("验证码无效或已过期"))?;
+    revoke_sessions(&mut tx, actor.id).await?;
+    record_audit(&mut tx, &actor, "mfa_enabled", Some(actor.id)).await?;
+    tx.commit().await?;
+    Ok(Json(serde_json::json!({"recovery_codes": codes})))
+}
+
+async fn disable_mfa(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Json(input): Json<MfaDisableRequest>,
+) -> Result<StatusCode, ApiError> {
+    reauthenticate(&state, &auth, input.password).await?;
+    let mut tx = state.pool.begin_with("BEGIN IMMEDIATE").await?;
+    let actor = mfa_actor(&mut tx, &auth).await?;
+    if state.config.require_admin_mfa && actor.role == "admin" {
+        return Err(ApiError::forbidden());
+    }
+    if !state
+        .mfa
+        .verify(&mut tx, actor.id, &input.code, now())
+        .await?
+    {
+        return Err(ApiError::bad_request("验证码无效"));
+    }
+    sqlx::query("UPDATE users SET mfa_secret=NULL,mfa_pending_secret=NULL,mfa_pending_at=NULL,mfa_last_step=NULL WHERE id=?").bind(actor.id).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM mfa_recovery_codes WHERE user_id=?")
+        .bind(actor.id)
+        .execute(&mut *tx)
+        .await?;
+    revoke_sessions(&mut tx, actor.id).await?;
+    record_audit(&mut tx, &actor, "mfa_disabled", Some(actor.id)).await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn health(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let runtime: Option<(i64, String)> =
+        sqlx::query_as("SELECT last_seen,status FROM executor_status WHERE id=1")
+            .fetch_optional(&state.pool)
+            .await?;
+    let executor = match runtime {
+        None => "unconfigured",
+        Some((seen, status)) if status == "running" && now().saturating_sub(seen) < 10 => "running",
+        Some(_) => "offline",
+    };
+    Ok(Json(
+        serde_json::json!({"status":"ok","name":"RelayDeck","version":env!("CARGO_PKG_VERSION"),"executor":executor}),
+    ))
+}
+
+async fn retry_apply(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    auth.ready()?;
+    mutation_limit(&state, auth.user.id, "retry", 8).await?;
+    let mut tx = state.pool.begin_with("BEGIN IMMEDIATE").await?;
+    let actor = write_actor(&mut tx, &auth).await?;
+    if actor.role != "admin" && actor.id != id {
+        return Err(ApiError::not_found());
+    }
+    let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id=?")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if exists != 1 {
+        return Err(ApiError::not_found());
+    }
+    let pending: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM apply_jobs WHERE owner_id=? AND status='pending'")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if pending != 0 {
+        return Ok(StatusCode::ACCEPTED);
+    }
+    let failed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runtime_states s JOIN users u ON u.id=s.owner_id WHERE s.owner_id=? AND s.revision=u.desired_revision AND s.status='failed'").bind(id).fetch_one(&mut *tx).await?;
+    if failed != 1 {
+        return Err(ApiError::conflict("当前无需重试"));
+    }
+    enqueue_apply(&mut tx, id).await?;
+    record_audit(&mut tx, &actor, "apply_retry", Some(id)).await?;
+    tx.commit().await?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+pub async fn mutation_limit(
+    state: &AppState,
+    user_id: i64,
+    action: &str,
+    maximum: u32,
+) -> Result<(), ApiError> {
+    let mut limits = state.login_limits.lock().await;
+    let timestamp = now();
+    limits.retain(|_, (start, _)| timestamp.saturating_sub(*start) < 60);
+    let key = format!("mutation:{action}:{user_id}");
+    if limits.len() >= 1024 || limits.get(&key).is_some_and(|(_, n)| *n >= maximum) {
+        return Err(ApiError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            code: "rate_limited",
+            message: "操作过于频繁".into(),
+        });
+    }
+    limits.entry(key).or_insert((timestamp, 0)).1 += 1;
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -628,12 +902,16 @@ pub fn router(state: AppState) -> Router {
         .route("/api/session",get(session))
         .route("/api/logout",post(logout))
         .route("/api/password",put(change_password))
+        .route("/api/mfa/setup",post(begin_mfa))
+        .route("/api/mfa/confirm",post(confirm_mfa))
+        .route("/api/mfa/disable",post(disable_mfa))
         .route("/api/users",get(list_users).post(create_user))
         .route("/api/users/{id}",put(update_user))
         .route("/api/users/{id}/password",post(reset_password))
+        .route("/api/users/{id}/apply",post(retry_apply))
         .route("/api/preferences",put(preferences))
         .route("/api/audit",get(audit))
-        .route("/api/health",get(||async{Json(serde_json::json!({"status":"ok","name":"RelayDeck","version":env!("CARGO_PKG_VERSION"),"executor":"unconfigured"}))}))
+        .route("/api/health",get(health))
         .merge(crate::rules::routes())
         .fallback_service(static_files)
         .layer(axum::extract::DefaultBodyLimit::max(16*1024))

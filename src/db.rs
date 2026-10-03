@@ -22,8 +22,8 @@ pub async fn connect(path: &Path) -> anyhow::Result<SqlitePool> {
                     use std::os::unix::fs::{MetadataExt, PermissionsExt};
                     let metadata = std::fs::metadata(parent)?;
                     anyhow::ensure!(
-                        metadata.uid() == unsafe { libc::geteuid() },
-                        "database directory must be owned by the current user"
+                        metadata.uid() == unsafe { libc::geteuid() } || metadata.uid() == 0,
+                        "database directory must be owned by the current user or root"
                     );
                     anyhow::ensure!(
                         metadata.permissions().mode() & 0o022 == 0,
@@ -56,6 +56,10 @@ pub async fn connect(path: &Path) -> anyhow::Result<SqlitePool> {
                 anyhow::ensure!(
                     file.metadata()?.uid() == unsafe { libc::geteuid() },
                     "database must be owned by the current user"
+                );
+                anyhow::ensure!(
+                    file.metadata()?.nlink() == 1,
+                    "database must not have hard links"
                 );
                 file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
             }

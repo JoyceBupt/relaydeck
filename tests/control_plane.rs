@@ -106,6 +106,8 @@ impl Fixture {
             .unwrap();
         let config = Config {
             listen: "127.0.0.1:0".parse().unwrap(),
+            mfa_key: database.with_file_name("mfa.key"),
+            require_admin_mfa: false,
             database,
             public_origin: ORIGIN.into(),
             secure_cookie: true,
@@ -114,6 +116,7 @@ impl Fixture {
             local_ips: vec!["8.8.4.4".parse().unwrap()],
             frontend: dir.path().join("missing"),
         };
+        relaydeck::mfa::MfaService::create_key_file(&config.mfa_key).unwrap();
         let state = AppState::new(pool, config).await.unwrap();
         let app = router(state.clone());
         let admin = sign_in(&app, "adminroot", ADMIN_PASSWORD).await;
@@ -154,6 +157,314 @@ impl Fixture {
 
 fn rule(port: i64) -> Value {
     json!({"name":"测试转发","listen_port":port,"target_host":"8.8.8.8","target_port":443,"protocol":"both","source_cidrs":["203.0.113.7/24"],"enabled":true})
+}
+
+async fn enroll(f: &Fixture, login: &Login, password: &str) -> (String, Vec<String>) {
+    let (status, _, setup) = call(
+        &f.app,
+        "POST",
+        "/api/mfa/setup",
+        Some(json!({"password":password})),
+        Some(login),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{setup}");
+    let secret = setup["secret"].as_str().unwrap();
+    let generator = totp_rs::Builder::new()
+        .with_secret(totp_rs::Secret::try_from_base32(secret).unwrap())
+        .build()
+        .unwrap();
+    let code = generator.generate(relaydeck::db::now() as u64).to_string();
+    let (status, _, confirmed) = call(
+        &f.app,
+        "POST",
+        "/api/mfa/confirm",
+        Some(json!({"code":code})),
+        Some(login),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{confirmed}");
+    let codes = confirmed["recovery_codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c.as_str().unwrap().to_owned())
+        .collect();
+    (code, codes)
+}
+
+#[tokio::test]
+async fn mfa_login_requires_password_and_fresh_second_factor() {
+    let f = Fixture::new().await;
+    let (consumed_code, codes) = enroll(&f, &f.admin, ADMIN_PASSWORD).await;
+    assert_eq!(codes.len(), 10);
+    let (status, _, _) = call(&f.app, "GET", "/api/session", None, Some(&f.admin), false).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, headers, result) = call(
+        &f.app,
+        "POST",
+        "/api/login",
+        Some(json!({"username":"adminroot","password":ADMIN_PASSWORD})),
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(result["error"]["code"], "mfa_required");
+    assert!(!headers.contains_key(header::SET_COOKIE));
+    let (status, headers, _) = call(
+        &f.app,
+        "POST",
+        "/api/login",
+        Some(json!({"username":"adminroot","password":"incorrect-password","code":codes[0]})),
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(!headers.contains_key(header::SET_COOKIE));
+    let (status, headers, _) = call(
+        &f.app,
+        "POST",
+        "/api/login",
+        Some(json!({"username":"adminroot","password":ADMIN_PASSWORD,"code":consumed_code})),
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(!headers.contains_key(header::SET_COOKIE));
+    let (status, _, value) = call(
+        &f.app,
+        "POST",
+        "/api/login",
+        Some(json!({"username":"adminroot","password":ADMIN_PASSWORD,"code":codes[0]})),
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["user"]["mfa_enabled"], true);
+    assert!(value["user"].get("mfa_secret").is_none());
+    let (status, headers, _) = call(
+        &f.app,
+        "POST",
+        "/api/login",
+        Some(json!({"username":"adminroot","password":ADMIN_PASSWORD,"code":codes[0]})),
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(!headers.contains_key(header::SET_COOKIE));
+    let hashes: Vec<String> = sqlx::query_scalar("SELECT code_hash FROM mfa_recovery_codes")
+        .fetch_all(&f.state.pool)
+        .await
+        .unwrap();
+    assert!(
+        hashes
+            .iter()
+            .all(|hash| !codes.iter().any(|code| code == hash))
+    );
+}
+
+#[tokio::test]
+async fn public_administrator_must_enroll_and_cannot_disable_mfa() {
+    let mut f = Fixture::new().await;
+    std::sync::Arc::make_mut(&mut f.state.config).require_admin_mfa = true;
+    f.app = router(f.state.clone());
+    let (status, _, value) = call(&f.app, "GET", "/api/users", None, Some(&f.admin), false).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(value["error"]["code"], "mfa_enrollment_required");
+    let (_, codes) = enroll(&f, &f.admin, ADMIN_PASSWORD).await;
+    let (status, headers, value) = call(
+        &f.app,
+        "POST",
+        "/api/login",
+        Some(json!({"username":"adminroot","password":ADMIN_PASSWORD,"code":codes[0]})),
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let admin = Login {
+        cookie: headers[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .into(),
+        csrf: value["csrf_token"].as_str().unwrap().into(),
+        user: value["user"].clone(),
+    };
+    let (status, _, _) = call(&f.app, "GET", "/api/users", None, Some(&admin), false).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = call(
+        &f.app,
+        "POST",
+        "/api/mfa/disable",
+        Some(json!({"password":ADMIN_PASSWORD,"code":codes[1]})),
+        Some(&admin),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn mfa_mutations_require_csrf_password_and_revoke_sessions() {
+    let f = Fixture::new().await;
+    let alice = f.add_user("alice", 41000).await;
+    let (status, _, _) = call(
+        &f.app,
+        "POST",
+        "/api/mfa/setup",
+        Some(json!({"password":USER_PASSWORD})),
+        Some(&alice),
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _, _) = call(
+        &f.app,
+        "POST",
+        "/api/mfa/setup",
+        Some(json!({"password":"bad-password"})),
+        Some(&alice),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (_, codes) = enroll(&f, &alice, USER_PASSWORD).await;
+    let (status, headers, value) = call(
+        &f.app,
+        "POST",
+        "/api/login",
+        Some(json!({"username":"alice","password":USER_PASSWORD,"code":codes[0]})),
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let active = Login {
+        cookie: headers[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .into(),
+        csrf: value["csrf_token"].as_str().unwrap().into(),
+        user: value["user"].clone(),
+    };
+    let (status, _, _) = call(
+        &f.app,
+        "POST",
+        "/api/mfa/disable",
+        Some(json!({"password":USER_PASSWORD,"code":codes[1]})),
+        Some(&active),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _, _) = call(&f.app, "GET", "/api/session", None, Some(&active), false).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let after = sign_in(&f.app, "alice", USER_PASSWORD).await;
+    assert_eq!(after.user["mfa_enabled"], false);
+}
+
+#[tokio::test]
+async fn runtime_reports_only_current_confirmed_revision_and_scopes_retries() {
+    let f = Fixture::new().await;
+    let alice = f.add_user("alice", 41000).await;
+    let bob = f.add_user("bob", 42000).await;
+    let (_, _, created) = call(
+        &f.app,
+        "POST",
+        "/api/rules",
+        Some(rule(41000)),
+        Some(&alice),
+        true,
+    )
+    .await;
+    assert_eq!(created["runtime_status"], "pending");
+    let (status, _, _) = call(
+        &f.app,
+        "POST",
+        &format!("/api/users/{}/apply", bob.user["id"]),
+        None,
+        Some(&alice),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let owner = alice.user["id"].as_i64().unwrap();
+    sqlx::query("INSERT INTO executor_status VALUES(1,?,'running')")
+        .bind(relaydeck::db::now())
+        .execute(&f.state.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO runtime_states VALUES(?,1,'active',NULL,?)")
+        .bind(owner)
+        .bind(relaydeck::db::now())
+        .execute(&f.state.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE users SET applied_revision=desired_revision WHERE id=?")
+        .bind(owner)
+        .execute(&f.state.pool)
+        .await
+        .unwrap();
+    let (_, _, rules) = call(&f.app, "GET", "/api/rules", None, Some(&alice), false).await;
+    assert_eq!(rules[0]["runtime_status"], "active");
+    sqlx::query("UPDATE apply_jobs SET status='applied' WHERE owner_id=?")
+        .bind(owner)
+        .execute(&f.state.pool)
+        .await
+        .unwrap();
+    let (status, _, _) = call(
+        &f.app,
+        "POST",
+        &format!("/api/users/{owner}/apply"),
+        None,
+        Some(&alice),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    sqlx::query("UPDATE runtime_states SET status='failed' WHERE owner_id=?")
+        .bind(owner)
+        .execute(&f.state.pool)
+        .await
+        .unwrap();
+    let (status, _, _) = call(
+        &f.app,
+        "POST",
+        &format!("/api/users/{owner}/apply"),
+        None,
+        Some(&alice),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let (_, _, rules) = call(&f.app, "GET", "/api/rules", None, Some(&alice), false).await;
+    assert_eq!(rules[0]["runtime_status"], "pending");
+    sqlx::query("UPDATE runtime_states SET revision=2,status='failed' WHERE owner_id=?")
+        .bind(owner)
+        .execute(&f.state.pool)
+        .await
+        .unwrap();
+    let (_, _, rules) = call(&f.app, "GET", "/api/rules", None, Some(&alice), false).await;
+    assert_eq!(rules[0]["runtime_status"], "failed");
+    sqlx::query("UPDATE executor_status SET last_seen=0")
+        .execute(&f.state.pool)
+        .await
+        .unwrap();
+    let (_, _, health) = call(&f.app, "GET", "/api/health", None, None, false).await;
+    assert_eq!(health["executor"], "offline");
 }
 
 #[tokio::test]

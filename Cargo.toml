@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 anyhow = "1"
+aes-gcm = "0.10.3"
 argon2 = "0.5"
 axum = "0.8"
 hex = "0.4"
@@ -18,12 +19,14 @@ serde_json = "1"
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "process", "io-util", "fs"] }
+totp-rs = { version = "6.0.0", default-features = false, features = ["std", "otpauth", "zeroize"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["fs", "limit", "set-header"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
+zeroize = "1.9"
 
 [dev-dependencies]
 http-body-util = "0.1"

@@ -24,7 +24,7 @@ use crate::{
 
 static DNS_SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(4)));
 const MAX_DNS_RESULTS: usize = 32;
-const RULE_SELECT: &str = "SELECT r.id,r.owner_id,u.username AS owner_username,r.name,r.listen_port,r.target_host,r.target_ip,r.target_port,r.protocol,r.source_cidrs,r.enabled,r.created_at,r.updated_at FROM rules r JOIN users u ON u.id=r.owner_id";
+const RULE_SELECT: &str = "SELECT r.id,r.owner_id,u.username AS owner_username,r.name,r.listen_port,r.target_host,r.target_ip,r.target_port,r.protocol,r.source_cidrs,r.enabled,r.created_at,r.updated_at,CASE WHEN s.revision=u.desired_revision AND s.status='failed' THEN 'failed' WHEN e.status IS NULL OR e.status!='running' OR e.last_seen<=unixepoch()-10 THEN 'pending' WHEN s.revision!=u.desired_revision OR u.applied_revision!=u.desired_revision THEN 'pending' WHEN s.status='stopped' THEN 'stopped' WHEN s.status='active' AND r.enabled=0 THEN 'stopped' WHEN s.status='active' AND u.enabled=1 AND (u.expires_at IS NULL OR u.expires_at>unixepoch()) THEN 'active' ELSE 'pending' END AS runtime_status FROM rules r JOIN users u ON u.id=r.owner_id LEFT JOIN runtime_states s ON s.owner_id=u.id LEFT JOIN executor_status e ON e.id=1";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -98,6 +98,7 @@ struct DbRule {
     enabled: bool,
     created_at: i64,
     updated_at: i64,
+    runtime_status: String,
 }
 
 #[derive(Serialize)]
@@ -113,7 +114,7 @@ struct RuleView {
     protocol: String,
     source_cidrs: Vec<String>,
     enabled: bool,
-    runtime_status: &'static str,
+    runtime_status: String,
     created_at: i64,
     updated_at: i64,
 }
@@ -136,9 +137,7 @@ impl DbRule {
             protocol: self.protocol,
             source_cidrs,
             enabled: self.enabled,
-            // This API records desired state only. No executor has confirmed a
-            // listener or network isolation, so it must never report applied.
-            runtime_status: "pending",
+            runtime_status: self.runtime_status,
             created_at: self.created_at,
             updated_at: self.updated_at,
         })
@@ -341,6 +340,7 @@ async fn create_rule(
     auth: AuthContext,
     Json(input): Json<CreateRule>,
 ) -> Result<(StatusCode, Json<RuleView>), ApiError> {
+    crate::api::mutation_limit(&state, auth.user.id, "rules", 60).await?;
     auth.ready()?;
     let owner_override = input.owner_id.is_some();
     if owner_override && auth.user.role != "admin" {
@@ -401,6 +401,7 @@ async fn update_rule(
     Path(id): Path<i64>,
     Json(input): Json<RuleInput>,
 ) -> Result<Json<RuleView>, ApiError> {
+    crate::api::mutation_limit(&state, auth.user.id, "rules", 60).await?;
     auth.ready()?;
     let existing = load_rule(&state.pool, &auth.user, id).await?;
     let input = input.validate()?;
@@ -466,6 +467,7 @@ async fn delete_rule(
     auth: AuthContext,
     Path(id): Path<i64>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    crate::api::mutation_limit(&state, auth.user.id, "rules", 60).await?;
     auth.ready()?;
     let mut tx = state.pool.begin_with("BEGIN IMMEDIATE").await?;
     let actor = write_actor(&mut tx, &auth).await?;

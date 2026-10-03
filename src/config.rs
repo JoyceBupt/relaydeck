@@ -13,6 +13,8 @@ pub struct Config {
     pub reserved_ports: Vec<u16>,
     pub local_ips: Vec<IpAddr>,
     pub frontend: PathBuf,
+    pub mfa_key: PathBuf,
+    pub require_admin_mfa: bool,
 }
 
 impl Config {
@@ -76,11 +78,23 @@ impl Config {
             .filter(|s| !s.trim().is_empty())
             .map(|s| s.trim().parse())
             .collect::<Result<Vec<IpAddr>, _>>()?;
+        let database = std::env::var_os("RELAYDECK_DATABASE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(".local/relaydeck.db"));
+        let mfa_key = std::env::var_os("RELAYDECK_MFA_KEY")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| database.with_file_name("mfa.key"));
+        let require_admin_mfa = match std::env::var("RELAYDECK_REQUIRE_ADMIN_MFA") {
+            Ok(value) if value == "true" => true,
+            Ok(value) if value == "false" && !secure_cookie => false,
+            Ok(_) => anyhow::bail!("administrator MFA cannot be disabled for an HTTPS deployment"),
+            Err(_) => secure_cookie,
+        };
         Ok(Self {
             listen,
-            database: std::env::var_os("RELAYDECK_DATABASE")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(".local/relaydeck.db")),
+            database,
+            mfa_key,
+            require_admin_mfa,
             public_origin: url.origin().ascii_serialization(),
             secure_cookie,
             trust_proxy,

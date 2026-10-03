@@ -16,6 +16,7 @@ pub struct DbUser {
     pub view_mode: String,
     pub desired_revision: i64,
     pub applied_revision: i64,
+    pub mfa_secret: Option<String>,
 }
 
 impl DbUser {
@@ -42,6 +43,7 @@ pub struct UserView {
     pub view_mode: String,
     pub desired_revision: i64,
     pub applied_revision: i64,
+    pub mfa_enabled: bool,
 }
 
 impl UserView {
@@ -60,6 +62,7 @@ impl UserView {
             view_mode: user.view_mode,
             desired_revision: user.desired_revision,
             applied_revision: user.applied_revision,
+            mfa_enabled: user.mfa_secret.is_some(),
         }
     }
 }

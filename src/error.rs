@@ -102,3 +102,16 @@ impl From<crate::credentials::CredentialError> for ApiError {
         }
     }
 }
+
+impl From<crate::mfa::MfaError> for ApiError {
+    fn from(error: crate::mfa::MfaError) -> Self {
+        match error {
+            crate::mfa::MfaError::AlreadyEnabled => Self::conflict("双因素已启用"),
+            crate::mfa::MfaError::Database(error) => error.into(),
+            _ => {
+                tracing::error!("MFA operation failed");
+                Self::unavailable()
+            }
+        }
+    }
+}

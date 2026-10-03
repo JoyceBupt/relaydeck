@@ -3,9 +3,13 @@ pub mod config;
 pub mod credentials;
 pub mod db;
 pub mod error;
+pub mod executor;
+pub mod linux;
+pub mod mfa;
 pub mod models;
 pub mod policy;
 pub mod rules;
+pub mod tenant;
 
 pub fn health_router() -> axum::Router {
     axum::Router::new().route(
