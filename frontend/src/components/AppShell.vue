@@ -8,7 +8,7 @@ import BrandMark from './BrandMark.vue'
 import ExecutorStatus from './ExecutorStatus.vue'
 import CommandPalette from './CommandPalette.vue'
 import { api } from '../api/endpoints'
-import { errorMessage } from '../api/client'
+import { errorMessage, securityMutationPending } from '../api/client'
 import { clearSession, currentUser, forcedMfa, isAdmin } from '../lib/session'
 import { provideToggle } from '../lib/queries'
 import { theme, themeLabels, type ThemePreference } from '../lib/theme'
@@ -33,7 +33,7 @@ const mobileNav = computed(() => [...nav.value, { to: '/settings', label: '设�
 const initials = computed(() => (currentUser.value?.username ?? '?').slice(0, 2).toUpperCase())
 
 async function signOut() {
-  if (signingOut.value) return
+  if (signingOut.value || securityMutationPending.value) return
   signingOut.value = true
   try {
     await api.logout()
@@ -114,7 +114,7 @@ useEventListener(window, 'keydown', (event: KeyboardEvent) => {
                   </DropdownMenuRadioItem>
                 </DropdownMenuRadioGroup>
                 <DropdownMenuSeparator class="pop-sep" />
-                <DropdownMenuItem class="pop-item" :disabled="signingOut" @select="signOut"><LogOut class="size-4 text-muted" />退出登录</DropdownMenuItem>
+                <DropdownMenuItem class="pop-item" :disabled="signingOut || securityMutationPending" @select="signOut"><LogOut class="size-4 text-muted" />退出登录</DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenuPortal>
           </DropdownMenuRoot>

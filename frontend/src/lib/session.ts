@@ -12,10 +12,11 @@ interface SessionState {
   notice: string
   /** One-time recovery codes; held in memory only until the viewer confirms saving them. */
   recoveryCodes: string[]
+  recoveryOwner: number | null
   epoch: number
 }
 
-export const sessionState = reactive<SessionState>({ session: null, loaded: false, notice: '', recoveryCodes: [], epoch: 0 })
+export const sessionState = reactive<SessionState>({ session: null, loaded: false, notice: '', recoveryCodes: [], recoveryOwner: null, epoch: 0 })
 
 export const currentUser = computed(() => sessionState.session?.user ?? null)
 export const isAdmin = computed(() => currentUser.value?.role === 'admin')
@@ -23,6 +24,7 @@ export const mustChangePassword = computed(() => !!currentUser.value?.must_chang
 export const forcedMfa = computed(() => !!sessionState.session?.mfa_required && !sessionState.session.user.mfa_enabled)
 
 export function acceptSession(session: Session) {
+  if (sessionState.session?.csrf_token !== session.csrf_token) clearSession()
   sessionState.session = session
   sessionState.notice = ''
   setCsrfToken(session.csrf_token)
@@ -33,11 +35,17 @@ export function clearSession(notice = '') {
   sessionState.epoch += 1
   sessionState.session = null
   sessionState.notice = notice
+  clearRecoveryCodes()
   setCsrfToken('')
   queryClient.cancelQueries()
   queryClient.clear()
   // Notifications can name rules and accounts; never carry them into the next session.
   toasts.splice(0)
+}
+
+export function clearRecoveryCodes() {
+  sessionState.recoveryCodes = []
+  sessionState.recoveryOwner = null
 }
 
 export async function loadSession() {

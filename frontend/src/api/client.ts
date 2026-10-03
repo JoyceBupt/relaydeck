@@ -1,3 +1,6 @@
+import { ref } from 'vue'
+
+export const securityMutationPending = ref(false)
 export class ApiError extends Error {
   constructor(public status: number, public code: string, message: string) { super(message) }
 }
@@ -17,6 +20,12 @@ export function isStaleError(error: unknown) {
 }
 
 export async function request<T>(path: string, method = 'GET', data?: unknown): Promise<T> {
+  if (securityMutationPending.value && path !== '/health') {
+    throw new ApiError(409, method === 'GET' ? 'stale_read' : 'security_pending', '安全设置正在保存')
+  }
+  const security = method !== 'GET' && ['/password', '/mfa/confirm', '/mfa/disable'].includes(path)
+  if (security) securityMutationPending.value = true
+  try {
   if (method !== 'GET') mutationGeneration += 1
   const generation = sessionGeneration
   const mutation = mutationGeneration
@@ -39,7 +48,7 @@ export async function request<T>(path: string, method = 'GET', data?: unknown): 
   // A read that began before an MFA/password mutation cannot expire the UI
   // before that mutation's response delivers recovery codes or final state.
   if (method === 'GET' && mutation !== mutationGeneration) throw new ApiError(0, 'stale_read', '数据已变更')
-  if (response.status === 401 && path !== '/login') {
+  if (response.status === 401 && path !== '/login' && !securityMutationPending.value) {
     window.dispatchEvent(new Event('relaydeck:session-expired'))
   }
   let value: unknown
@@ -51,6 +60,9 @@ export async function request<T>(path: string, method = 'GET', data?: unknown): 
     throw new ApiError(response.status, error?.error?.code || 'request_error', error?.error?.message || '操作失败，请重试')
   }
   return value as T
+  } finally {
+    if (security) securityMutationPending.value = false
+  }
 }
 
 export function errorMessage(error: unknown) {

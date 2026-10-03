@@ -17,6 +17,8 @@ pub struct DbUser {
     pub desired_revision: i64,
     pub applied_revision: i64,
     pub mfa_secret: Option<String>,
+    pub mfa_failures: i64,
+    pub mfa_locked_until: i64,
 }
 
 impl DbUser {

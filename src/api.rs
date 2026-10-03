@@ -16,7 +16,6 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use sqlx::{Sqlite, SqlitePool, Transaction};
 use std::{
-    collections::HashMap,
     net::{IpAddr, SocketAddr},
     sync::Arc,
 };
@@ -29,7 +28,9 @@ pub struct AppState {
     pub credentials: Credentials,
     pub mfa: crate::mfa::MfaService,
     dummy_hash: Arc<String>,
-    login_limits: Arc<Mutex<HashMap<String, (i64, u32)>>>,
+    network_limits: Arc<Mutex<crate::limits::Limits>>,
+    account_limits: Arc<Mutex<crate::limits::Limits>>,
+    mutation_limits: Arc<Mutex<crate::limits::Limits>>,
 }
 
 impl AppState {
@@ -45,7 +46,9 @@ impl AppState {
             credentials,
             mfa,
             dummy_hash: Arc::new(dummy_hash),
-            login_limits: Arc::new(Mutex::new(HashMap::new())),
+            network_limits: Arc::new(Mutex::new(crate::limits::Limits::new(4096))),
+            account_limits: Arc::new(Mutex::new(crate::limits::Limits::new(1024))),
+            mutation_limits: Arc::new(Mutex::new(crate::limits::Limits::new(1024))),
         })
     }
 }
@@ -181,8 +184,31 @@ pub async fn record_audit(
     action: &str,
     resource_id: Option<i64>,
 ) -> Result<(), ApiError> {
-    sqlx::query("INSERT INTO audit_events(actor_id,actor_username,action,resource_id,created_at) VALUES(?,?,?,?,?)")
-        .bind(actor.id).bind(&actor.username).bind(action).bind(resource_id).bind(now()).execute(&mut **tx).await?;
+    let kind = resource_id.map(|_| {
+        if action.starts_with("rule_") {
+            "rule"
+        } else {
+            "user"
+        }
+    });
+    let (name, port): (Option<String>, Option<i64>) = match (kind, resource_id) {
+        (Some("rule"), Some(id)) => sqlx::query_as("SELECT name,listen_port FROM rules WHERE id=?")
+            .bind(id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .unwrap_or_default(),
+        (Some("user"), Some(id)) => (
+            sqlx::query_scalar("SELECT username FROM users WHERE id=?")
+                .bind(id)
+                .fetch_optional(&mut **tx)
+                .await?,
+            None,
+        ),
+        _ => (None, None),
+    };
+    sqlx::query("INSERT INTO audit_events(actor_id,actor_username,action,resource_id,created_at,resource_kind,resource_name,resource_port) VALUES(?,?,?,?,?,?,?,?)")
+        .bind(actor.id).bind(&actor.username).bind(action).bind(resource_id).bind(now()).bind(kind).bind(name).bind(port).execute(&mut **tx).await?;
+    sqlx::query("DELETE FROM audit_events WHERE id IN (SELECT id FROM audit_events ORDER BY id DESC LIMIT -1 OFFSET 10000)").execute(&mut **tx).await?;
     Ok(())
 }
 
@@ -264,34 +290,27 @@ async fn login(
     } else {
         peer_ip
     };
+    if !state
+        .network_limits
+        .lock()
+        .await
+        .admit(crate::limits::network_key(ip), 32, now())
     {
-        let mut limits = state.login_limits.lock().await;
-        let timestamp = now();
-        limits.retain(|_, (start, _)| timestamp.saturating_sub(*start) < 60);
-        let keys = [
-            (format!("ip:{ip}"), 32),
-            (format!("user:{}", input.username.to_ascii_lowercase()), 8),
-        ];
-        if limits.len() >= 1024
-            || keys
-                .iter()
-                .any(|(key, max)| limits.get(key).is_some_and(|(_, n)| n >= max))
-        {
-            return Err(ApiError {
-                status: StatusCode::TOO_MANY_REQUESTS,
-                code: "rate_limited",
-                message: "登录过于频繁".into(),
-            });
-        }
-        for (key, _) in keys {
-            let entry = limits.entry(key).or_insert((timestamp, 0));
-            entry.1 += 1;
-        }
+        return Err(ApiError::rate_limited());
     }
     let user: Option<DbUser> = sqlx::query_as("SELECT * FROM users WHERE username=?")
         .bind(&input.username)
         .fetch_optional(&state.pool)
         .await?;
+    if let Some(user) = &user
+        && !state
+            .account_limits
+            .lock()
+            .await
+            .admit(user.id.to_string(), 8, now())
+    {
+        return Err(ApiError::rate_limited());
+    }
     let hash = user
         .as_ref()
         .map(|u| u.password_hash.clone())
@@ -300,9 +319,15 @@ async fn login(
         .credentials
         .verify_password(input.password, hash)
         .await?;
-    let user = user
-        .filter(|u| verified && u.available())
-        .ok_or_else(ApiError::unauthorized)?;
+    let Some(user) = user else {
+        return Err(ApiError::unauthorized());
+    };
+    if !verified || !user.available() {
+        let mut tx = state.pool.begin().await?;
+        record_audit(&mut tx, &user, "login_failed", Some(user.id)).await?;
+        tx.commit().await?;
+        return Err(ApiError::unauthorized());
+    }
     let token = new_session_token();
     let csrf_token = new_session_token();
     let mut tx = state.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -325,9 +350,13 @@ async fn login(
                 code: "mfa_required",
                 message: "请输入验证码".into(),
             })?;
+        check_mfa_budget(&current, code)?;
         if !state.mfa.verify(&mut tx, current.id, code, now()).await? {
+            record_mfa_failure(&mut tx, &current, "login_mfa_failed").await?;
+            tx.commit().await?;
             return Err(ApiError::bad_request("验证码无效"));
         }
+        clear_mfa_failures(&mut tx, current.id).await?;
     }
     sqlx::query("DELETE FROM sessions WHERE expires_at<=?")
         .bind(now())
@@ -453,19 +482,49 @@ struct MfaDisableRequest {
 }
 
 async fn sensitive_limit(state: &AppState, user_id: i64) -> Result<(), ApiError> {
-    let mut limits = state.login_limits.lock().await;
-    let timestamp = now();
-    limits.retain(|_, (start, _)| timestamp.saturating_sub(*start) < 60);
-    let key = format!("mfa:{user_id}");
-    if limits.len() >= 1024 || limits.get(&key).is_some_and(|(_, n)| *n >= 8) {
+    mutation_limit(state, user_id, "security", 8).await
+}
+
+fn check_mfa_budget(user: &DbUser, code: &str) -> Result<(), ApiError> {
+    // Strong recovery codes remain usable during a TOTP lockout.
+    let recovery =
+        matches!(code.len(), 32 | 35) && code.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-');
+    if user.mfa_locked_until > now() && !recovery {
         return Err(ApiError {
             status: StatusCode::TOO_MANY_REQUESTS,
-            code: "rate_limited",
-            message: "操作过于频繁".into(),
+            code: "mfa_locked",
+            message: "验证码已锁定，请稍后重试或使用恢复码".into(),
         });
     }
-    limits.entry(key).or_insert((timestamp, 0)).1 += 1;
     Ok(())
+}
+
+async fn clear_mfa_failures(tx: &mut Transaction<'_, Sqlite>, id: i64) -> Result<(), ApiError> {
+    sqlx::query("UPDATE users SET mfa_failures=0,mfa_locked_until=0 WHERE id=?")
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn record_mfa_failure(
+    tx: &mut Transaction<'_, Sqlite>,
+    user: &DbUser,
+    action: &str,
+) -> Result<(), ApiError> {
+    let failures = user.mfa_failures.saturating_add(1).min(64);
+    let delay = if failures < 5 {
+        0
+    } else {
+        (60_i64 * (1_i64 << (failures - 5).min(11))).min(86400)
+    };
+    sqlx::query("UPDATE users SET mfa_failures=?,mfa_locked_until=? WHERE id=?")
+        .bind(failures)
+        .bind(now().saturating_add(delay))
+        .bind(user.id)
+        .execute(&mut **tx)
+        .await?;
+    record_audit(tx, user, action, Some(user.id)).await
 }
 
 async fn reauthenticate(
@@ -540,11 +599,17 @@ async fn confirm_mfa(
     sensitive_limit(&state, auth.user.id).await?;
     let mut tx = state.pool.begin_with("BEGIN IMMEDIATE").await?;
     let actor = mfa_actor(&mut tx, &auth).await?;
-    let codes = state
+    check_mfa_budget(&actor, &input.code)?;
+    let Some(codes) = state
         .mfa
         .confirm_enrollment(&mut tx, actor.id, &input.code, now())
         .await?
-        .ok_or_else(|| ApiError::bad_request("验证码无效或已过期"))?;
+    else {
+        record_mfa_failure(&mut tx, &actor, "mfa_confirmation_failed").await?;
+        tx.commit().await?;
+        return Err(ApiError::bad_request("验证码无效或已过期"));
+    };
+    clear_mfa_failures(&mut tx, actor.id).await?;
     revoke_sessions(&mut tx, actor.id).await?;
     record_audit(&mut tx, &actor, "mfa_enabled", Some(actor.id)).await?;
     tx.commit().await?;
@@ -562,13 +627,17 @@ async fn disable_mfa(
     if state.config.require_admin_mfa && actor.role == "admin" {
         return Err(ApiError::forbidden());
     }
+    check_mfa_budget(&actor, &input.code)?;
     if !state
         .mfa
         .verify(&mut tx, actor.id, &input.code, now())
         .await?
     {
+        record_mfa_failure(&mut tx, &actor, "mfa_disable_failed").await?;
+        tx.commit().await?;
         return Err(ApiError::bad_request("验证码无效"));
     }
+    clear_mfa_failures(&mut tx, actor.id).await?;
     sqlx::query("UPDATE users SET mfa_secret=NULL,mfa_pending_secret=NULL,mfa_pending_at=NULL,mfa_last_step=NULL WHERE id=?").bind(actor.id).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM mfa_recovery_codes WHERE user_id=?")
         .bind(actor.id)
@@ -638,19 +707,16 @@ pub async fn mutation_limit(
     action: &str,
     maximum: u32,
 ) -> Result<(), ApiError> {
-    let mut limits = state.login_limits.lock().await;
-    let timestamp = now();
-    limits.retain(|_, (start, _)| timestamp.saturating_sub(*start) < 60);
-    let key = format!("mutation:{action}:{user_id}");
-    if limits.len() >= 1024 || limits.get(&key).is_some_and(|(_, n)| *n >= maximum) {
-        return Err(ApiError {
-            status: StatusCode::TOO_MANY_REQUESTS,
-            code: "rate_limited",
-            message: "操作过于频繁".into(),
-        });
+    if state
+        .mutation_limits
+        .lock()
+        .await
+        .admit(format!("{action}:{user_id}"), maximum, now())
+    {
+        Ok(())
+    } else {
+        Err(ApiError::rate_limited())
     }
-    limits.entry(key).or_insert((timestamp, 0)).1 += 1;
-    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -761,8 +827,8 @@ async fn update_user(
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(ApiError::not_found)?;
-    if target.role == "admin" {
-        return Err(ApiError::forbidden());
+    if target.role == "admin" && (!input.enabled || input.expires_at.is_some()) {
+        return Err(ApiError::bad_request("管理员不能停用或设置到期时间"));
     }
     let overlap: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM users WHERE id<>? AND port_start<=? AND port_end>=?",
@@ -825,6 +891,7 @@ async fn reset_password(
         .bind(id)
         .execute(&mut *tx)
         .await?;
+    clear_mfa_failures(&mut tx, id).await?;
     record_audit(&mut tx, &actor, "password_reset", Some(id)).await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
@@ -876,7 +943,7 @@ async fn audit(
     auth: AuthContext,
 ) -> Result<Json<Vec<AuditView>>, ApiError> {
     auth.admin()?;
-    Ok(Json(sqlx::query_as("SELECT a.id,a.actor_username,a.action,a.resource_id,CASE WHEN a.resource_id IS NULL THEN NULL WHEN a.action LIKE 'rule!_%' ESCAPE '!' THEN 'rule' ELSE 'user' END AS resource_kind,CASE WHEN a.action LIKE 'rule!_%' ESCAPE '!' THEN r.name ELSE u.username END AS resource_name,CASE WHEN a.action LIKE 'rule!_%' ESCAPE '!' THEN r.listen_port END AS resource_port,a.created_at FROM audit_events a LEFT JOIN rules r ON r.id=a.resource_id LEFT JOIN users u ON u.id=a.resource_id ORDER BY a.id DESC LIMIT 200").fetch_all(&state.pool).await?))
+    Ok(Json(sqlx::query_as("SELECT id,actor_username,action,resource_id,resource_kind,resource_name,resource_port,created_at FROM audit_events ORDER BY id DESC LIMIT 200").fetch_all(&state.pool).await?))
 }
 
 #[derive(Serialize)]
@@ -983,6 +1050,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/audit",get(audit))
         .route("/api/health",get(health))
         .merge(crate::rules::routes())
+        .route("/api",axum::routing::any(api_not_found))
+        .route("/api/",axum::routing::any(api_not_found))
         .route("/api/{*path}",axum::routing::any(api_not_found))
         .fallback_service(static_files)
         .layer(axum::extract::DefaultBodyLimit::max(16*1024))

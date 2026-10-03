@@ -39,7 +39,7 @@ impl Config {
         );
         let secure_cookie = url.scheme() == "https";
         let trust_proxy = match std::env::var("RELAYDECK_TRUST_PROXY")
-            .unwrap_or_else(|_| "false".into())
+            .unwrap_or_else(|_| secure_cookie.to_string())
             .as_str()
         {
             "true" => true,
@@ -49,6 +49,10 @@ impl Config {
         anyhow::ensure!(
             !trust_proxy || secure_cookie,
             "trusted proxy mode requires an HTTPS public origin"
+        );
+        anyhow::ensure!(
+            !secure_cookie || trust_proxy,
+            "HTTPS deployment requires RELAYDECK_TRUST_PROXY=true and a proxy that overwrites X-RelayDeck-Client-IP"
         );
         let local_origin = match url.host() {
             Some(url::Host::Ipv4(ip)) => ip.is_loopback(),

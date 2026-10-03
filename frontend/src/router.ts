@@ -1,5 +1,6 @@
 import { createRouter, createWebHistory, type RouteLocationNormalized } from 'vue-router'
 import { forcedMfa, isAdmin, loadSession, mustChangePassword, sessionState } from './lib/session'
+import { securityMutationPending } from './api/client'
 
 declare module 'vue-router' {
   interface RouteMeta { public?: boolean; admin?: boolean; title?: string }
@@ -36,9 +37,10 @@ function nextQuery(to: RouteLocationNormalized) {
 }
 
 router.beforeEach(async to => {
+  if (securityMutationPending.value) return false
   await loadSession()
   const session = sessionState.session
-  if (to.name === 'recovery') return sessionState.recoveryCodes.length ? true : { name: 'login' }
+  if (to.name === 'recovery') return !session && sessionState.recoveryOwner !== null && sessionState.recoveryCodes.length ? true : { name: 'login' }
   if (to.meta.public) return session && to.name === 'login' ? { path: '/' } : true
   if (!session) return { name: 'login', query: nextQuery(to) }
   if (mustChangePassword.value) return to.name === 'setup-password' ? true : { name: 'setup-password' }

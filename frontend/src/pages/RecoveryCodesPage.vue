@@ -3,7 +3,7 @@ import { ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { Copy, Download } from '@lucide/vue'
 import AuthFrame from '../components/AuthFrame.vue'
-import { sessionState } from '../lib/session'
+import { clearRecoveryCodes, sessionState } from '../lib/session'
 import { toast } from '../lib/toast'
 
 const router = useRouter()
@@ -27,7 +27,7 @@ function download() {
 }
 
 async function finish() {
-  sessionState.recoveryCodes = []
+  clearRecoveryCodes()
   sessionState.notice = '双因素验证已启用，请重新登录'
   await router.replace({ name: 'login' })
 }

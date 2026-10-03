@@ -3,7 +3,7 @@ import { useDocumentVisibility } from '@vueuse/core'
 import { useMutation, useQuery } from '@tanstack/vue-query'
 import { api, ruleInput } from '../api/endpoints'
 import type { Rule, RuleInput } from '../types'
-import { errorMessage, isStaleError } from '../api/client'
+import { ApiError, errorMessage, isStaleError, securityMutationPending } from '../api/client'
 import { isAdmin, refreshIdentity, sessionState } from './session'
 import { queryClient } from './queryClient'
 import { toast } from './toast'
@@ -17,7 +17,7 @@ export const keys = {
 }
 
 const visibility = useDocumentVisibility()
-const signedIn = computed(() => !!sessionState.session)
+const signedIn = computed(() => !!sessionState.session && !securityMutationPending.value)
 const poll = (ms: number) => () => (visibility.value === 'visible' ? ms : false)
 
 export function useHealth() {
@@ -64,13 +64,15 @@ export function useToggleRule() {
   return useMutation({
     mutationFn: ({ rule, enabled }: { rule: Rule; enabled: boolean }) => api.updateRule(rule.id, ruleInput(rule, { enabled })),
     onMutate: async ({ rule, enabled }) => {
+      const epoch = sessionState.epoch
       await queryClient.cancelQueries({ queryKey: keys.rules })
+      if (epoch !== sessionState.epoch) throw new ApiError(0, 'stale_session', '会话已变更')
       const previous = queryClient.getQueryData<Rule[]>(keys.rules)
       queryClient.setQueryData<Rule[]>(keys.rules, list => list?.map(item => item.id === rule.id ? { ...item, enabled, runtime_status: 'pending', runtime_error: null } : item))
-      return { previous }
+      return { previous, epoch }
     },
     onError: (error, _vars, context) => {
-      if (context?.previous) queryClient.setQueryData(keys.rules, context.previous)
+      if (context?.previous && context.epoch === sessionState.epoch && !isStaleError(error)) queryClient.setQueryData(keys.rules, context.previous)
       reportError(error, '没能保存')
     },
     onSuccess: (_data, { rule, enabled }) => {
@@ -79,7 +81,9 @@ export function useToggleRule() {
         action: { label: '撤销', run: () => toggleRule.mutate({ rule: { ...rule, enabled }, enabled: !enabled }) },
       })
     },
-    onSettled: afterRuleChange,
+    onSettled: (_data, _error, _variables, context) => {
+      if (context?.epoch === sessionState.epoch) return afterRuleChange()
+    },
   })
 }
 // A single shared instance lets the undo action reuse the same optimistic path.

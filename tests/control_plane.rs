@@ -1033,3 +1033,193 @@ async fn unknown_api_paths_answer_json_not_the_spa_shell() {
     );
     assert_eq!(body["error"]["code"], "not_found");
 }
+
+#[tokio::test]
+async fn anonymous_name_flood_does_not_block_other_accounts_or_mutations() {
+    let mut f = Fixture::new().await;
+    let mut config = (*f.state.config).clone();
+    config.trust_proxy = true;
+    f.state.config = std::sync::Arc::new(config);
+    f.app = router(f.state.clone());
+    let mut tasks = tokio::task::JoinSet::new();
+    // The original shared 1024-entry table was exhausted by this exact pattern.
+    for client in 1..=33 {
+        let app = f.app.clone();
+        tasks.spawn(async move {
+            for name in 0..31 {
+                let response = app.clone().oneshot(Request::builder().method("POST").uri("/api/login")
+                    .header(header::ORIGIN, ORIGIN).header(header::CONTENT_TYPE,"application/json")
+                    .header("x-relaydeck-client-ip",format!("198.51.100.{client}"))
+                    .body(Body::from(json!({"username":format!("missing_{client}_{name}"),"password":"invalid-password"}).to_string())).unwrap()).await.unwrap();
+                assert_ne!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            }
+        });
+    }
+    while let Some(task) = tasks.join_next().await {
+        task.unwrap();
+    }
+    let response = f
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/login")
+                .header(header::ORIGIN, ORIGIN)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-relaydeck-client-ip", "203.0.113.1")
+                .body(Body::from(
+                    json!({"username":"adminroot","password":ADMIN_PASSWORD}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        call(
+            &f.app,
+            "PUT",
+            "/api/preferences",
+            Some(json!({"view_mode":"cards"})),
+            Some(&f.admin),
+            true
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn mfa_failures_lock_totp_across_restart_but_recovery_still_works() {
+    let f = Fixture::new().await;
+    let (consumed, codes) = enroll(&f, &f.admin, ADMIN_PASSWORD).await;
+    // Replay is a guaranteed invalid second factor, unlike a random six-digit guess.
+    for _ in 0..5 {
+        assert_eq!(
+            call(
+                &f.app,
+                "POST",
+                "/api/login",
+                Some(json!({"username":"adminroot","password":ADMIN_PASSWORD,"code":consumed})),
+                None,
+                false
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let restarted = router(
+        AppState::new(f.state.pool.clone(), (*f.state.config).clone())
+            .await
+            .unwrap(),
+    );
+    let (status, _, value) = call(
+        &restarted,
+        "POST",
+        "/api/login",
+        Some(json!({"username":"adminroot","password":ADMIN_PASSWORD,"code":consumed})),
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(value["error"]["code"], "mfa_locked");
+    assert_eq!(
+        call(
+            &restarted,
+            "POST",
+            "/api/login",
+            Some(json!({"username":"adminroot","password":ADMIN_PASSWORD,"code":codes[0]})),
+            None,
+            false
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let failures: i64 =
+        sqlx::query_scalar("SELECT mfa_failures FROM users WHERE username='adminroot'")
+            .fetch_one(&f.state.pool)
+            .await
+            .unwrap();
+    assert_eq!(failures, 0);
+    let audited: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE action='login_mfa_failed'")
+            .fetch_one(&f.state.pool)
+            .await
+            .unwrap();
+    assert_eq!(audited, 5);
+}
+
+#[tokio::test]
+async fn api_roots_are_json_errors_and_audit_keeps_event_time_names() {
+    let f = Fixture::new().await;
+    for path in ["/api", "/api/"] {
+        let (status, headers, _) = call(&f.app, "GET", path, None, None, false).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            headers[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("application/json")
+        );
+    }
+    let (_, _, created) = call(
+        &f.app,
+        "POST",
+        "/api/rules",
+        Some(rule(40000)),
+        Some(&f.admin),
+        true,
+    )
+    .await;
+    let id = created["id"].as_i64().unwrap();
+    let mut renamed = rule(40000);
+    renamed["name"] = json!("新名称");
+    assert_eq!(
+        call(
+            &f.app,
+            "PUT",
+            &format!("/api/rules/{id}"),
+            Some(renamed),
+            Some(&f.admin),
+            true
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let (_, _, audit) = call(&f.app, "GET", "/api/audit", None, Some(&f.admin), false).await;
+    let event = audit
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["action"] == "rule_created")
+        .unwrap();
+    assert_eq!(event["resource_name"], "测试转发");
+}
+
+#[tokio::test]
+async fn ipv6_rotation_within_one_subnet_cannot_bypass_network_limit() {
+    let f = Fixture::new().await;
+    let mut config = (*f.state.config).clone();
+    config.trust_proxy = true;
+    let app = router(AppState::new(f.state.pool.clone(), config).await.unwrap());
+    for suffix in 1..=33 {
+        let response=app.clone().oneshot(Request::builder().method("POST").uri("/api/login")
+            .header(header::ORIGIN,ORIGIN).header(header::CONTENT_TYPE,"application/json")
+            .header("x-relaydeck-client-ip",format!("2001:db8:1234:1::{suffix:x}"))
+            .body(Body::from(json!({"username":format!("missing_{suffix}"),"password":"invalid-password"}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(
+            response.status(),
+            if suffix <= 32 {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::TOO_MANY_REQUESTS
+            }
+        );
+    }
+}

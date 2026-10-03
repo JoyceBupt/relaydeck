@@ -97,8 +97,8 @@ async function toggleRecovery() {
       </button>
 
       <div v-if="step === 'code'" class="flex items-center justify-between">
-        <button type="button" class="btn btn-ghost btn-sm -ml-2.5" @click="back"><ArrowLeft class="size-4" />换个账户</button>
-        <button type="button" class="text-sm font-medium text-accent hover:underline" @click="toggleRecovery">
+        <button type="button" class="btn btn-ghost btn-sm -ml-2.5" :disabled="busy" @click="back"><ArrowLeft class="size-4" />换个账户</button>
+        <button type="button" class="text-sm font-medium text-accent hover:underline" :disabled="busy" @click="toggleRecovery">
           {{ useRecovery ? '改用验证码' : '改用恢复码' }}
         </button>
       </div>

@@ -12,6 +12,13 @@ pub struct ApiError {
 }
 
 impl ApiError {
+    pub fn rate_limited() -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            code: "rate_limited",
+            message: "操作过于频繁".into(),
+        }
+    }
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,

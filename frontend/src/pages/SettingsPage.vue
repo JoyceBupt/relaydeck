@@ -62,12 +62,14 @@ async function confirmMfa() {
   mfaBusy.value = true
   mfaError.value = ''
   const epoch = sessionState.epoch
+  const enrollmentOwner = currentUser.value?.id ?? null
   try {
     const result = await api.confirmMfa(mfa.code.trim())
     if (epoch !== sessionState.epoch) return
     // Enrollment revokes every session; the codes are shown once, then the viewer signs in again.
     clearSession()
     sessionState.recoveryCodes = result.recovery_codes
+    sessionState.recoveryOwner = enrollmentOwner
     await router.replace({ name: 'recovery' })
   } catch (error) { if (!isStaleError(error)) { mfaError.value = errorMessage(error); mfa.code = '' } } finally { mfaBusy.value = false }
 }

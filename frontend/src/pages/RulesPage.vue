@@ -64,9 +64,10 @@ async function setView(mode: ViewMode) {
   if (mode === viewMode.value || savingView.value || !sessionState.session) return
   savingView.value = true
   const previous = sessionState.session
+  const epoch = sessionState.epoch
   acceptSession({ ...previous, user: { ...previous.user, view_mode: mode } })
   try { await api.setPreference(mode) } catch (error) {
-    if (sessionState.session) acceptSession({ ...sessionState.session, user: { ...sessionState.session.user, view_mode: previous.user.view_mode } })
+    if (epoch === sessionState.epoch && sessionState.session) acceptSession({ ...sessionState.session, user: { ...sessionState.session.user, view_mode: previous.user.view_mode } })
     reportError(error, '没能保存显示方式')
   } finally { savingView.value = false }
 }
@@ -100,12 +101,14 @@ function toggleAll() { selected.value = allSelected.value ? new Set() : new Set(
 const bulkBusy = ref(false)
 const confirmBulkDelete = ref(false)
 async function bulk(action: 'enable' | 'disable' | 'delete') {
+  const epoch = sessionState.epoch
   const targets = all.value.filter(rule => selected.value.has(rule.id) && (action === 'delete' || rule.enabled !== (action === 'enable')))
   if (!targets.length) { selected.value = new Set(); return }
   bulkBusy.value = true
   let done = 0
   try {
     for (const rule of targets) {
+      if (epoch !== sessionState.epoch) return
       if (action === 'delete') await api.deleteRule(rule.id)
       else await api.updateRule(rule.id, ruleInput(rule, { enabled: action === 'enable' }))
       done++
@@ -117,7 +120,7 @@ async function bulk(action: 'enable' | 'disable' | 'delete') {
   } finally {
     bulkBusy.value = false
     confirmBulkDelete.value = false
-    await afterRuleChange()
+    if (epoch === sessionState.epoch) await afterRuleChange()
   }
 }
 

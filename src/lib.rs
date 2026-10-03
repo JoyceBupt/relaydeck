@@ -4,6 +4,7 @@ pub mod credentials;
 pub mod db;
 pub mod error;
 pub mod executor;
+pub mod limits;
 pub mod linux;
 pub mod mfa;
 pub mod models;
