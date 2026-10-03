@@ -15,6 +15,7 @@ import subprocess
 import tarfile
 import tempfile
 import time
+import sys
 import urllib.parse
 import urllib.request
 
@@ -235,6 +236,58 @@ def manage_lock():
     return os.fdopen(descriptor, 'w')
 
 
+def merged_port_reservations(existing, start, end):
+    if not 1024 <= start <= end <= 65535:
+        raise ValueError('Invalid forwarding port range')
+    ranges = [(start, end)]
+    for item in existing.strip().split(',') if existing.strip() else []:
+        if not re.fullmatch(r'[0-9]+(?:-[0-9]+)?', item):
+            raise ValueError('Invalid existing port reservations')
+        values = item.split('-')
+        low, high = int(values[0]), int(values[-1])
+        if not 1 <= low <= high <= 65535:
+            raise ValueError('Invalid existing port reservations')
+        ranges.append((low, high))
+    merged = []
+    for low, high in sorted(ranges):
+        if merged and low <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(high, merged[-1][1]))
+        else:
+            merged.append((low, high))
+    return ','.join(str(low) if low == high else f'{low}-{high}' for low, high in merged)
+
+
+def reserve_forwarding_ports(policy):
+    # ip_local_reserved_ports replaces, rather than appends to, kernel state.
+    # Preserve every existing reservation, including those of other services.
+    current = pathlib.Path('/proc/sys/net/ipv4/ip_local_reserved_ports')
+    existing = current.read_text().strip()
+    desired = merged_port_reservations(existing, policy['allowed_port_start'], policy['allowed_port_end'])
+    path = pathlib.Path('/etc/sysctl.d/zz-relaydeck-ports.conf')
+    root_path(path.parent)
+    if path.exists() or path.is_symlink():
+        root_path(path)
+        if not path.read_text().startswith('# Managed by RelayDeck\n'):
+            raise ValueError(f'Existing sysctl configuration requires review: {path}')
+    # Persist an atomic root-owned file; avoid following an unexpected link.
+    with tempfile.TemporaryDirectory(prefix='relaydeck-sysctl-') as work:
+        source = pathlib.Path(work) / 'ports.conf'
+        source.write_text(f'# Managed by RelayDeck\nnet.ipv4.ip_local_reserved_ports = {desired}\n')
+        atomic_copy(source, path, 0o644)
+    run('sysctl', '-w', f'net.ipv4.ip_local_reserved_ports={desired}')
+    return {'previous': existing, 'reserved': desired}
+
+
+def confirm_update(yes):
+    print('更新会中断全部转发，完成后恢复。', flush=True)
+    if yes:
+        return
+    if not sys.stdin.isatty():
+        raise ValueError('Use --yes to acknowledge the forwarding interruption in unattended updates')
+    if input('继续更新？[y/N] ').strip().lower() not in ('y', 'yes'):
+        raise ValueError('Update cancelled')
+
+
 def install(args):
     preflight()
     if any(path.exists() or path.is_symlink() for path in (CONFIG, STATE, CURRENT, BIN, BIN.with_name('realm'), MANAGER, UPDATER)):
@@ -311,6 +364,7 @@ def install(args):
         (CONFIG / 'relaydeck.env').chmod(0o640)
         (CONFIG / 'Caddyfile').write_text((release / 'deploy/Caddyfile.example').read_text().replace('panel.example.com', url.netloc))
         (CONFIG / 'Caddyfile').chmod(0o644)
+        reservations = reserve_forwarding_ports(policy)
         hashes = {}
         for unit in UNITS:
             destination = pathlib.Path('/etc/systemd/system') / unit
@@ -318,7 +372,7 @@ def install(args):
                 raise ValueError(f'Existing unit requires review: {unit}')
             atomic_copy(release / 'deploy' / unit, destination, 0o644)
             hashes[unit] = digest(destination)
-        (CONFIG / 'installation.json').write_text(json.dumps({'units': hashes}) + '\n')
+        (CONFIG / 'installation.json').write_text(json.dumps({'units': hashes, 'port_reservations': reservations}) + '\n')
         (CONFIG / 'installation.json').chmod(0o644)
         as_web(BIN, 'init-admin', args.admin)
         run('systemctl', 'daemon-reload')
@@ -329,6 +383,7 @@ def install(args):
 
 def update(args):
     preflight()
+    confirm_update(args.yes)
     with manage_lock(), tempfile.TemporaryDirectory(prefix='relaydeck-update-') as work:
         stage = pathlib.Path(work) / 'release'
         manifest = prepare(args, stage)
@@ -345,6 +400,11 @@ def update(args):
             root_path(path)
             if digest(path) != record['units'].get(unit):
                 raise ValueError(f'Unit {unit} was customized; preserve it with a systemd drop-in before updating')
+        root_path(CONFIG / 'broker.json')
+        policy = json.loads((CONFIG / 'broker.json').read_text())
+        if not 64 <= policy['limits']['tasks'] <= 256:
+            raise ValueError('Set limits.tasks to 64..256 in /etc/relaydeck/broker.json before upgrading the per-rule supervisor (default: 96)')
+        record['port_reservations'] = reserve_forwarding_ports(policy)
         release = RELEASES / release_name(manifest)
         if release.exists():
             raise ValueError('This release is already installed')
@@ -422,6 +482,8 @@ def main():
         sub = commands.add_parser(name)
         sub.add_argument('--bundle', type=pathlib.Path, required=True)
         sub.add_argument('--sha256', required=True, help='SHA-256 from a trusted release channel')
+        if name == 'update':
+            sub.add_argument('--yes', action='store_true', help='Acknowledge interruption of all forwarding')
         if name == 'install':
             sub.add_argument('--realm', type=pathlib.Path, required=True)
             sub.add_argument('--realm-sha256', required=True)

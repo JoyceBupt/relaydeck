@@ -1,6 +1,6 @@
 export type ViewMode = 'table' | 'cards'
 export type Protocol = 'tcp' | 'udp' | 'both'
-export type RuntimeStatus = 'pending' | 'active' | 'stopped' | 'failed'
+export type RuntimeStatus = 'pending' | 'active' | 'stopped' | 'failed' | 'blocked'
 export type ExecutorState = 'unconfigured' | 'running' | 'offline'
 
 export interface User {
@@ -56,6 +56,7 @@ export interface RuleInput {
 }
 
 export interface Audit {
+  failure_count: number
   id: number
   actor_username: string
   action: string

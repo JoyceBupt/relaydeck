@@ -6,6 +6,7 @@ import pathlib
 import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
 
 MODULE = pathlib.Path(__file__).resolve().parents[1] / 'scripts/manage.py'
 spec = importlib.util.spec_from_file_location('relaydeck_manage', MODULE)
@@ -89,6 +90,24 @@ class ReleaseValidation(unittest.TestCase):
             with manage.verified_file(archive, digest) as snapshot:
                 archive.write_bytes(b'replaced after verification')
                 self.assertEqual(snapshot.read(), original)
+
+
+class PortReservations(unittest.TestCase):
+    def test_existing_ranges_are_preserved_and_merged(self):
+        self.assertEqual(manage.merged_port_reservations('8080,39999,60001-60100',40000,60000),'8080,39999-60100')
+        self.assertEqual(manage.merged_port_reservations('',40000,60000),'40000-60000')
+        self.assertEqual(manage.merged_port_reservations('50000-65535',40000,60000),'40000-65535')
+
+    def test_invalid_reservations_cannot_reach_sysctl(self):
+        for value in ('0','65536','9-2','1,,2','1-2-3','22; reboot'):
+            with self.subTest(value=value),self.assertRaises(ValueError):
+                manage.merged_port_reservations(value,40000,60000)
+
+    def test_unattended_upgrade_requires_interruption_acknowledgement(self):
+        with patch.object(manage.sys.stdin,'isatty',return_value=False),patch('builtins.print'):
+            with self.assertRaisesRegex(ValueError,'--yes'):
+                manage.confirm_update(False)
+            manage.confirm_update(True)
 
 
 if __name__ == '__main__':

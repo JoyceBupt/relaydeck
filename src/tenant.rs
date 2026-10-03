@@ -13,19 +13,37 @@ pub async fn run_checked(
     uid: u32,
     revision: Option<i64>,
 ) -> anyhow::Result<()> {
+    run_inner(realm, config, expires_at, uid, revision, false).await
+}
+
+pub async fn run_plan(
+    realm: &Path,
+    config: &Path,
+    expires_at: i64,
+    uid: u32,
+    revision: i64,
+) -> anyhow::Result<()> {
+    run_inner(realm, config, expires_at, uid, Some(revision), true).await
+}
+
+async fn run_inner(
+    realm: &Path,
+    config: &Path,
+    expires_at: i64,
+    uid: u32,
+    revision: Option<i64>,
+    supervisor: bool,
+) -> anyhow::Result<()> {
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (realm, config, expires_at, uid, revision);
+        let _ = (realm, config, expires_at, uid, revision, supervisor);
         anyhow::bail!("the tenant runner requires Linux");
     }
     #[cfg(target_os = "linux")]
     {
         use anyhow::{Context, ensure};
-        use std::{
-            process::Stdio,
-            time::{Duration, SystemTime, UNIX_EPOCH},
-        };
-        use tokio::{process::Command, time::Instant};
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+        use tokio::time::Instant;
         ensure!(uid >= 60000, "invalid tenant identity");
         ensure!(
             unsafe { libc::geteuid() } == uid && unsafe { libc::getegid() } == uid,
@@ -86,24 +104,21 @@ pub async fn run_checked(
                 && Instant::now() < authorization_deadline,
             "runtime authorization expired during bind-guard startup"
         );
-        let mut child = Command::new(realm)
-            .args(["-c", config.to_str().context("invalid configuration path")?])
-            .env_clear()
-            .env("LANG", "C")
-            .stdin(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .context("cannot start realm")?;
+        let mut children = Children::default();
+        let mut applied = 0;
+        if supervisor {
+            applied = children
+                .apply(realm, config, expires_at, uid, revision.unwrap())
+                .await?;
+        } else {
+            children.legacy = Some(spawn(realm, config)?);
+        }
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         let mut clock_check = tokio::time::interval(Duration::from_millis(250));
         clock_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
-                status = child.wait() => {
-                    ensure!(status?.success(), "realm exited unsuccessfully");
-                    return Ok(());
-                }
                 _ = async {
                     if let Some(deadline) = deadline { tokio::time::sleep_until(deadline).await; }
                     else { std::future::pending::<()>().await; }
@@ -123,12 +138,17 @@ pub async fn run_checked(
                         authorization_deadline=Instant::now()+Duration::from_secs((until-crate::db::now()).max(0) as u64);
                     }
                     if until<=crate::db::now() || Instant::now()>=authorization_deadline { break; }
+                    children.check()?;
+                    if supervisor { applied=children.apply(realm,config,expires_at,uid,applied).await?; }
                 }
                 _ = terminate.recv() => break,
                 _ = tokio::signal::ctrl_c() => break,
             }
         }
-        child.kill().await.context("cannot stop expired realm")?;
+        children
+            .stop_all()
+            .await
+            .context("cannot stop expired realm")?;
         Ok(())
     }
 }
@@ -180,4 +200,130 @@ fn validate_root_file(path: &Path) -> anyhow::Result<()> {
         "invalid tenant file"
     );
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn spawn(realm: &Path, config: &Path) -> anyhow::Result<tokio::process::Child> {
+    use anyhow::Context;
+    validate_root_file(config)?;
+    tokio::process::Command::new(realm)
+        .args(["-c", config.to_str().context("invalid config path")?])
+        .env_clear()
+        .env("LANG", "C")
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("cannot start realm")
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct Children {
+    rules: std::collections::BTreeMap<i64, (crate::executor::DesiredRule, tokio::process::Child)>,
+    legacy: Option<tokio::process::Child>,
+}
+
+#[cfg(target_os = "linux")]
+impl Children {
+    fn check(&mut self) -> anyhow::Result<()> {
+        for child in self
+            .legacy
+            .iter_mut()
+            .chain(self.rules.values_mut().map(|(_, child)| child))
+        {
+            anyhow::ensure!(child.try_wait()?.is_none(), "realm child exited");
+        }
+        Ok(())
+    }
+    async fn stop_all(&mut self) -> anyhow::Result<()> {
+        let mut error = None;
+        for child in self
+            .legacy
+            .iter_mut()
+            .chain(self.rules.values_mut().map(|(_, child)| child))
+        {
+            if let Err(failure) = child.kill().await {
+                error = Some(failure);
+            }
+        }
+        if let Some(error) = error {
+            return Err(error.into());
+        }
+        Ok(())
+    }
+    async fn apply(
+        &mut self,
+        realm: &Path,
+        path: &Path,
+        expiry: i64,
+        uid: u32,
+        applied: i64,
+    ) -> anyhow::Result<i64> {
+        use anyhow::{Context, ensure};
+        validate_root_file(path)?;
+        ensure!(
+            std::fs::metadata(path)?.len() <= 128 * 1024,
+            "runtime plan too large"
+        );
+        let plan: crate::executor::RuntimePlan = serde_json::from_slice(&std::fs::read(path)?)?;
+        ensure!(
+            plan.expires_at().unwrap_or(0) == expiry
+                && !plan.stopped()
+                && plan.revision() >= applied,
+            "invalid supervisor plan"
+        );
+        if plan.revision() == applied && !self.rules.is_empty() {
+            return Ok(applied);
+        }
+        let directory = path.parent().context("missing plan directory")?;
+        let changed: Vec<_> = self
+            .rules
+            .iter()
+            .filter(|(id, (old, _))| {
+                !plan.rules().iter().any(|new| {
+                    new.id == **id
+                        && old.listen_port == new.listen_port
+                        && old.target_ip == new.target_ip
+                        && old.target_port == new.target_port
+                        && old.protocol == new.protocol
+                        && old.source_cidrs == new.source_cidrs
+                })
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in changed {
+            let (_, mut child) = self.rules.remove(&id).unwrap();
+            child
+                .kill()
+                .await
+                .context("cannot stop changed realm child")?;
+        }
+        for rule in plan.rules() {
+            if let std::collections::btree_map::Entry::Vacant(entry) = self.rules.entry(rule.id) {
+                let config = directory.join(format!("rule-{}.json", rule.id));
+                entry.insert((rule.clone(), spawn(realm, &config)?));
+            }
+        }
+        // Only this fixed, pre-created file is tenant-writable. The directory,
+        // plans, executables and child configurations stay immutable to tenants.
+        use std::{
+            io::Write,
+            os::unix::fs::{MetadataExt, OpenOptionsExt},
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(directory.join("applied-revision"))?;
+        let metadata = file.metadata()?;
+        ensure!(
+            metadata.is_file()
+                && metadata.uid() == uid
+                && metadata.nlink() == 1
+                && metadata.mode() & 0o077 == 0,
+            "invalid supervisor acknowledgement"
+        );
+        file.set_len(0)?;
+        write!(file, "{}", plan.revision())?;
+        Ok(plan.revision())
+    }
 }

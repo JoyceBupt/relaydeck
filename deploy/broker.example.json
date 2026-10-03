@@ -16,7 +16,7 @@
   "limits": {
     "memory_high_mb": 32,
     "memory_max_mb": 64,
-    "tasks": 16,
+    "tasks": 96,
     "cpu_percent": 20,
     "nofile": 4096,
     "total_memory_mb": 384,

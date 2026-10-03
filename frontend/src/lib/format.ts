@@ -9,7 +9,7 @@ export function targetText(rule: Pick<Rule, 'target_host' | 'target_port'>) { re
 
 export const protocolLabels: Record<Protocol, string> = { tcp: 'TCP', udp: 'UDP', both: 'TCP + UDP' }
 
-export const statusLabels: Record<RuntimeStatus, string> = { active: '运行中', pending: '同步中', failed: '失败', stopped: '已停用' }
+export const statusLabels: Record<RuntimeStatus, string> = { active: '运行中', pending: '同步中', failed: '失败', stopped: '已停用', blocked: '已阻断' }
 
 export function dateTime(value: number) {
   return new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(value * 1000))
