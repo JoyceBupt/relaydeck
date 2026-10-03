@@ -14,7 +14,7 @@ import { errorMessage, isStaleError } from '../api/client'
 import type { Health, Protocol, Rule, RuleInput, User } from '../types'
 import { currentUser, isAdmin } from '../lib/session'
 import { sharedToggle, useDeleteRule, usePorts, useRetry, useSaveRule } from '../lib/queries'
-import { dateTime, expiry, hostText, protocolLabels, relative, ruleSentence } from '../lib/format'
+import { dateTime, expiry, hostText, protocolLabels, relative } from '../lib/format'
 import { validateCidr, validatePort, validateRuleName, validateTargetHost } from '../lib/validation'
 import { toast } from '../lib/toast'
 
@@ -123,11 +123,11 @@ const errors = computed(() => {
   const range = owner.value ? { min: owner.value.port_start, max: owner.value.port_end } : { min: 1024, max: 65535 }
   let port = validatePort(form.listen_port, range.min, range.max)
   if (!port && form.listen_port !== null) {
-    if ([22, 80, 443, ...(usage?.reserved ?? [])].includes(form.listen_port)) port = '这个端口被系统保留'
+    if ([22, 80, 443, ...(usage?.reserved ?? [])].includes(form.listen_port)) port = '系统保留端口'
     const lease = usage?.leases.find(item => item.port === form.listen_port)
     if (lease && lease.rule_id !== props.ruleId) {
       const holder = props.rules.find(item => item.id === lease.rule_id)
-      port = lease.state === 'releasing' ? '这个端口正在等待执行器释放，稍后再试' : `已被「${holder?.name ?? '其他规则'}」占用`
+      port = lease.state === 'releasing' ? '端口释放中，稍后再试' : `已被 ${holder?.name ?? '其他规则'} 占用`
     }
   }
   return {
@@ -136,13 +136,12 @@ const errors = computed(() => {
     port,
     host: validateTargetHost(form.target_host),
     targetPort: validatePort(form.target_port),
-    sources: form.sources.some(value => !validateCidr(value)) ? '标红的网段格式不对，例如 203.0.113.0/24' : form.sources.length > 32 ? '最多 32 个网段' : '',
+    sources: form.sources.some(value => !validateCidr(value)) ? '网段格式错误' : form.sources.length > 32 ? '最多 32 个网段' : '',
   }
 })
 const valid = computed(() => Object.values(errors.value).every(message => !message))
 const show = (field: keyof typeof errors.value) => (submitted.value ? errors.value[field] : '')
 
-const sentence = computed(() => ruleSentence({ listen_port: form.listen_port, protocol: form.protocol, target_host: form.target_host.trim(), target_port: form.target_port, source_cidrs: form.sources }))
 
 const save = useSaveRule()
 const remove = useDeleteRule()
@@ -162,7 +161,7 @@ async function submit() {
   try {
     const saved = await save.mutateAsync({ id: props.ruleId, input })
     baseline.value = snapshot()
-    toast(isNew.value ? `已创建「${saved.name}」` : `已保存「${saved.name}」`, { description: '等待执行器确认生效', tone: 'success' })
+    toast(isNew.value ? `已创建 ${saved.name}` : `已保存 ${saved.name}`)
     if (isNew.value) {
       initializedFor.value = `${saved.id}`
       await router.replace(`/rules/${saved.id}`)
@@ -179,7 +178,7 @@ async function confirmRemoval() {
     await remove.mutateAsync(target)
     confirmDelete.value = false
     baseline.value = snapshot()
-    toast(`已删除「${target.name}」`, { description: `端口 ${target.listen_port} 会在执行器确认后释放` })
+    toast(`已删除 ${target.name}`)
     emit('close')
   } catch (error) {
     confirmDelete.value = false
@@ -221,24 +220,20 @@ function onKeydown(event: KeyboardEvent) {
   else if (event.key === 'k') step(-1)
 }
 
-const executorDown = computed(() => props.health && props.health.executor !== 'running')
 const runtime = computed(() => {
   const value = rule.value
   if (!value) return null
-  const synced = value.runtime_updated_at ? `，同步于${relative(value.runtime_updated_at)}` : ''
   switch (value.runtime_status) {
-    case 'active': return { title: '运行中', detail: `执行器已确认这条转发正在工作${synced}。` }
-    case 'stopped': return { title: '已停用', detail: '配置和端口都保留着，重新启用即可恢复。' }
-    case 'failed': return { title: '生效失败', detail: '执行器没能应用这个账户的最新配置，该账户的转发已暂停。' }
+    case 'active': return { title: '运行中', detail: value.runtime_updated_at ? `${relative(value.runtime_updated_at)}同步` : '' }
+    case 'stopped': return { title: '已停用', detail: '' }
+    case 'failed': return { title: '生效失败', detail: '该账户的转发已暂停' }
     default: return {
       title: '同步中',
-      detail: props.health?.executor === 'running' ? '变更已保存，正在等待执行器确认，通常几秒内完成。'
-        : props.health?.executor === 'offline' ? '执行器离线，变更会在它恢复后生效。' : '还没有接入执行器，规则暂时只会保存不会生效。',
+      detail: props.health?.executor === 'offline' ? '执行器离线' : props.health?.executor === 'unconfigured' ? '执行器未连接' : '',
     }
   }
 })
 const resolvedNote = computed(() => (rule.value && rule.value.target_ip !== rule.value.target_host ? rule.value.target_ip : ''))
-const isDomain = computed(() => form.target_host.trim() !== '' && !/^[\d.]+$/.test(form.target_host.trim()) && !form.target_host.includes(':'))
 const protocolOptions = (['tcp', 'udp', 'both'] as Protocol[]).map(option => ({ value: option, label: protocolLabels[option] }))
 const portRange = computed(() => (owner.value ? `${owner.value.port_start}–${owner.value.port_end}` : ''))
 
@@ -246,33 +241,28 @@ defineExpose({ dirty })
 </script>
 
 <template>
-  <SideDrawer :open="open" :title="isNew ? '新建转发' : rule?.name ?? '转发'" :description="isNew ? '把本机的一个端口转发到公网目标。' : rule ? `ID ${rule.id} · ${rule.owner_username}` : undefined" width="lg" @close="requestClose" @before-close="onBeforeClose">
+  <SideDrawer :open="open" :title="isNew ? '新建转发' : rule?.name ?? '转发'" :description="rule ? `ID ${rule.id} · ${rule.owner_username}` : undefined" width="lg" @close="requestClose" @before-close="onBeforeClose">
 
     <div ref="body" class="grid gap-6" @keydown="onKeydown">
-      <div v-if="missing" class="well px-4 py-8 text-center text-muted">这条转发不存在，可能已被删除。</div>
+      <p v-if="missing" class="py-8 text-center text-muted">转发不存在</p>
       <template v-else>
-        <section v-if="rule && runtime" aria-label="运行状态" class="rounded-xl border p-3.5" :class="rule.runtime_status === 'failed' ? 'border-danger/30 bg-danger-soft' : 'border-line bg-surface-2'">
-          <div class="flex items-center gap-2">
+        <section v-if="rule && runtime" aria-label="运行状态" class="grid gap-1 border-b border-line pb-5">
+          <div class="flex min-h-8 items-center gap-2">
             <StatusMark :status="rule.runtime_status" />
             <span class="font-medium" :class="rule.runtime_status === 'failed' ? 'text-danger' : 'text-fg'">{{ runtime.title }}</span>
+            <span v-if="runtime.detail" class="text-sm text-muted">{{ runtime.detail }}</span>
             <button v-if="rule.runtime_status === 'failed'" type="button" class="btn btn-secondary btn-sm ml-auto" :disabled="retry.isPending.value" @click="retry.mutate(rule.owner_id)">
               <RotateCw class="size-3.5" :class="retry.isPending.value ? 'anim-spin' : ''" />重试
             </button>
           </div>
-          <p class="mt-1.5 text-sm text-muted">{{ runtime.detail }}</p>
-          <p v-if="rule.runtime_error" class="mt-2 rounded-lg border border-line bg-surface px-2.5 py-2 font-mono text-xs text-fg [overflow-wrap:anywhere]">执行器报告：{{ rule.runtime_error }}</p>
-          <p v-if="rule.dns_error" class="mt-2 rounded-lg border border-warning/30 bg-warning-soft px-2.5 py-2 text-xs text-fg [overflow-wrap:anywhere]">目标解析失败：{{ rule.dns_error }}</p>
+          <p v-if="rule.runtime_error" class="font-mono text-xs text-danger [overflow-wrap:anywhere]">{{ rule.runtime_error }}</p>
+          <p v-if="rule.dns_error" class="text-xs text-warning [overflow-wrap:anywhere]">目标解析失败：{{ rule.dns_error }}</p>
         </section>
-
-        <p class="well px-3.5 py-3 text-sm leading-6 text-muted" aria-live="polite">
-          访问本机 <span class="font-mono font-medium text-fg tabular">{{ sentence.port }}</span> 端口（{{ sentence.protocol }}，{{ sentence.sources }}）的流量，将被转发到
-          <span class="font-mono font-medium text-fg [overflow-wrap:anywhere]">{{ sentence.target }}</span>。
-        </p>
 
         <form id="rule-form" class="grid gap-5" novalidate @submit.prevent="submit">
           <label class="field">
             <span class="field-label">名称</span>
-            <input v-model="form.name" class="input" maxlength="64" placeholder="例如：东京入口" :aria-invalid="!!show('name')" autocomplete="off" />
+            <input v-model="form.name" class="input" maxlength="64" :aria-invalid="!!show('name')" autocomplete="off" />
             <span v-if="show('name')" class="field-error">{{ show('name') }}</span>
           </label>
 
@@ -291,7 +281,7 @@ defineExpose({ dirty })
             <label class="field-label" for="rule-port">入口端口</label>
             <input id="rule-port" v-model.number="form.listen_port" class="input input-mono w-40" type="number" inputmode="numeric" :min="owner?.port_start" :max="owner?.port_end" :aria-invalid="!!show('port')" />
             <span v-if="show('port')" class="field-error">{{ show('port') }}</span>
-            <span v-else class="field-hint">{{ portRange ? `可用范围 ${portRange}` : '' }}</span>
+            <span v-else-if="portRange" class="field-hint tabular">可用 {{ portRange }}</span>
             <div v-if="ports.data.value" class="mt-1.5">
               <PortRuler :usage="ports.data.value" :statuses="statuses" :selected="form.listen_port" :own-rule-id="ruleId" interactive @select="form.listen_port = $event" />
             </div>
@@ -314,10 +304,7 @@ defineExpose({ dirty })
             </label>
           </div>
           <p v-if="show('host') || show('targetPort')" class="field-error -mt-3">{{ show('host') || show('targetPort') }}</p>
-          <p v-else-if="isDomain || resolvedNote" class="field-hint -mt-3">
-            <template v-if="resolvedNote && !dirty">保存时解析为 <span class="font-mono">{{ hostText(resolvedNote) }}</span>。</template>
-            域名定期刷新。
-          </p>
+          <p v-else-if="resolvedNote && !dirty" class="field-hint -mt-3">解析为 <span class="font-mono">{{ hostText(resolvedNote) }}</span></p>
 
           <div class="field">
             <span id="rule-sources" class="field-label">来源限制</span>
@@ -334,22 +321,18 @@ defineExpose({ dirty })
                 <TagsInputItemText />
                 <TagsInputItemDelete class="rounded p-0.5 pr-1 text-muted hover:text-fg" :aria-label="`移除 ${item}`"><X class="size-3" /></TagsInputItemDelete>
               </TagsInputItem>
-              <TagsInputInput class="h-6 min-w-40 flex-1 bg-transparent font-mono text-sm outline-none max-md:text-base placeholder:font-sans placeholder:text-faint" :placeholder="form.sources.length ? '' : '不限来源；输入网段后回车，如 203.0.113.0/24'" />
+              <TagsInputInput class="h-6 min-w-40 flex-1 bg-transparent font-mono text-sm outline-none max-md:text-base placeholder:font-sans placeholder:text-faint" :placeholder="form.sources.length ? '' : '不限，输入网段后回车'" />
             </TagsInputRoot>
             <span v-if="show('sources')" class="field-error">{{ show('sources') }}</span>
-            <span v-else class="field-hint">只允许这些网段访问入口端口；留空表示任何来源都可以访问。</span>
           </div>
 
-          <div class="well flex items-center justify-between gap-4 px-3.5 py-3">
-            <div>
-              <p class="font-medium">启用转发</p>
-              <p class="text-xs text-muted">{{ rule ? '立即生效，可在提示里撤销。' : '停用后保留配置和端口，只是不再转发流量。' }}</p>
-            </div>
+          <div class="flex items-center justify-between gap-4">
+            <span class="field-label">启用</span>
             <UiSwitch v-if="rule" :model-value="rule.enabled" label="启用转发" :disabled="toggle.isPending.value" @update:model-value="toggle.mutate({ rule, enabled: $event })" />
             <UiSwitch v-else v-model="form.enabled" label="启用转发" />
           </div>
 
-          <p v-if="serverError" class="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger" role="alert">{{ serverError }}</p>
+          <p v-if="serverError" class="field-error" role="alert">{{ serverError }}</p>
         </form>
 
         <dl v-if="rule" class="grid grid-cols-[auto_1fr] gap-x-6 gap-y-2 border-t border-line pt-5 text-sm">
@@ -361,18 +344,17 @@ defineExpose({ dirty })
 
     <template v-if="!missing" #footer>
       <button v-if="rule" type="button" class="btn btn-danger-ghost -ml-2" @click="confirmDelete = true"><Trash2 class="size-4" />删除</button>
-      <span v-if="dirty" class="ml-auto text-xs text-muted max-sm:hidden">有未保存的修改</span>
+      <span v-if="dirty" class="ml-auto text-xs text-muted max-sm:hidden">未保存</span>
       <button type="button" class="btn btn-secondary" :class="dirty ? '' : 'ml-auto'" @click="requestClose">取消</button>
       <button type="submit" form="rule-form" class="btn btn-primary" :disabled="save.isPending.value || (!isNew && !dirty)">
-        {{ save.isPending.value ? '正在保存…' : isNew ? '创建转发' : '保存修改' }}
+        {{ save.isPending.value ? '保存中…' : isNew ? '创建' : '保存' }}
       </button>
     </template>
   </SideDrawer>
 
   <ConfirmDialog
-    :open="confirmDelete" danger title="删除这条转发？" confirm-label="删除"
-    :description="rule ? `「${rule.name}」会停止转发并被删除，无法恢复。端口 ${rule.listen_port} 会在执行器确认后释放。` : ''"
+    :open="confirmDelete" danger :title="rule ? `删除 ${rule.name}？` : '删除转发？'" confirm-label="删除" description="删除后无法恢复。"
     :busy="remove.isPending.value" @confirm="confirmRemoval" @cancel="confirmDelete = false"
   />
-  <ConfirmDialog :open="confirmDiscard" title="放弃未保存的修改？" description="离开后，这次填写的内容不会保存。" confirm-label="放弃修改" danger @confirm="discard" @cancel="confirmDiscard = false" />
+  <ConfirmDialog :open="confirmDiscard" title="放弃修改？" confirm-label="放弃" danger @confirm="discard" @cancel="confirmDiscard = false" />
 </template>

@@ -41,14 +41,14 @@ const options = computed(() => [
 <template>
   <div>
     <h1 class="page-title">审计</h1>
-    <p class="mt-1 text-muted">最近 200 条操作记录，只有管理员可见。</p>
+    <p class="mt-1 text-muted">最近 200 条</p>
 
     <div class="mt-6 flex flex-wrap items-center gap-2">
       <Segmented v-model="category" label="按类别筛选" :options="options" />
       <label class="relative ml-auto w-full sm:w-64">
         <span class="sr-only">搜索记录</span>
         <Search class="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-faint" aria-hidden="true" />
-        <input v-model="search" type="search" class="input pl-8" placeholder="搜索账户、对象或端口" />
+        <input v-model="search" type="search" class="input pl-8" placeholder="搜索" />
       </label>
     </div>
 
@@ -57,12 +57,12 @@ const options = computed(() => [
         <div v-for="index in 6" :key="index" class="flex items-center gap-4 px-4 py-3.5"><span class="skeleton h-4 w-10" /><span class="skeleton h-4 w-72" /></div>
       </div>
       <div v-else-if="audit.isError.value" class="panel px-6 py-10 text-center">
-        <p class="font-medium">没能读取操作记录</p>
+        <p class="font-medium">读取失败</p>
         <p class="mt-1 text-muted">{{ errorMessage(audit.error.value) }}</p>
         <button type="button" class="btn btn-secondary mt-4" @click="audit.refetch()"><RotateCw class="size-4" />重试</button>
       </div>
       <div v-else-if="!filtered.length" class="panel">
-        <EmptyState :title="entries.length ? '没有匹配的记录' : '还没有操作记录'">
+        <EmptyState :title="entries.length ? '无匹配结果' : '暂无记录'">
           <template #icon><ScrollText class="size-5" /></template>
         </EmptyState>
       </div>

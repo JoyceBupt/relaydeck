@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { ArrowRight, CircleCheck, Clock, Gauge, Plus, RotateCw, ServerOff } from '@lucide/vue'
+import { ArrowRight, Clock, Gauge, Plus, RotateCw, ServerOff } from '@lucide/vue'
 import StatusMark from '../components/StatusMark.vue'
 import RuleEndpoint from '../components/RuleEndpoint.vue'
 import PortRuler from '../components/PortRuler.vue'
@@ -46,24 +46,12 @@ function tenantTone(index: number) {
 }
 const myExpiry = computed(() => (currentUser.value ? expiry(currentUser.value.expires_at) : null))
 const recent = computed(() => (audit.data.value ?? []).slice(0, 6).map(entry => ({ entry, ...describeAudit(entry) })))
-const greeting = computed(() => {
-  const hour = new Date().getHours()
-  return hour < 6 ? '夜深了' : hour < 12 ? '早上好' : hour < 18 ? '下午好' : '晚上好'
-})
 </script>
 
 <template>
   <div class="grid grid-cols-[minmax(0,1fr)] gap-8">
     <div class="flex flex-wrap items-end justify-between gap-4">
-      <div>
-        <h1 class="page-title">{{ greeting }}，{{ currentUser?.username }}</h1>
-        <p class="mt-1 text-muted">
-          <template v-if="rules.isLoading.value">正在读取状态…</template>
-          <template v-else-if="attentionCount">有 {{ attentionCount }} 件事需要处理。</template>
-          <template v-else-if="all.length">一切正常，{{ all.length }} 条转发都已按配置运行。</template>
-          <template v-else>还没有转发。</template>
-        </p>
-      </div>
+      <h1 class="page-title">总览</h1>
       <RouterLink to="/rules/new" class="btn btn-primary"><Plus class="size-4" />新建转发</RouterLink>
     </div>
 
@@ -86,7 +74,7 @@ const greeting = computed(() => {
         <span class="meter" aria-hidden="true">
           <span v-for="index in MAX_TENANTS" :key="index" :class="tenantTone(index - 1)" />
         </span>
-        <span class="text-xs text-muted">{{ expiring.length ? `${expiring.length} 个即将或已经到期` : '没有即将到期的账户' }}</span>
+        <span class="text-xs text-muted">{{ expiring.length ? `${expiring.length} 个即将到期` : '\u00a0' }}</span>
       </RouterLink>
       <div v-else class="panel flex flex-col gap-3 p-4">
         <span class="stat-label">规则额度</span>
@@ -98,21 +86,20 @@ const greeting = computed(() => {
       </div>
     </section>
 
-    <section aria-labelledby="attention-title">
-      <h2 id="attention-title" class="group-title">需要处理</h2>
-      <div v-if="rules.isLoading.value" class="panel p-4"><div class="skeleton h-5 w-1/2" /></div>
-      <ul v-else-if="attentionCount" class="panel group-list">
+    <section v-if="attentionCount" aria-labelledby="attention-title">
+      <h2 id="attention-title" class="group-title">待处理 <span class="font-normal text-muted tabular">{{ attentionCount }}</span></h2>
+      <ul class="panel group-list">
         <li v-if="executor && executor !== 'running'" class="flex items-start gap-3 px-4 py-3.5">
           <ServerOff class="mt-0.5 size-4 text-danger" aria-hidden="true" />
           <div class="min-w-0 flex-1">
-            <p class="font-medium">{{ executor === 'offline' ? '执行器离线' : '执行器未接入' }}</p>
-            <p class="text-sm text-muted">{{ executor === 'offline' ? '新的变更会在执行器恢复后生效，已在运行的转发不受影响。' : '规则目前只会保存，不会生效。请在服务器上启动 relaydeck worker。' }}</p>
+            <p class="font-medium">{{ executor === 'offline' ? '执行器离线' : '执行器未连接' }}</p>
+            <p class="text-sm text-muted">{{ executor === 'offline' ? '新变更暂不生效，运行中的转发不受影响' : '启动 relaydeck worker 后规则才会生效' }}</p>
           </div>
         </li>
         <li v-for="group in failedOwners" :key="group.ownerId" class="flex items-start gap-3 px-4 py-3.5">
           <StatusMark status="failed" class="mt-0.5" />
           <div class="min-w-0 flex-1">
-            <p class="font-medium">{{ isAdmin ? `${group.owner} 的 ` : '' }}{{ group.rules.length }} 条转发生效失败</p>
+            <p class="font-medium">{{ isAdmin ? `${group.owner} 的 ` : '' }}{{ group.rules.length }} 条生效失败</p>
             <p v-if="group.rules[0].runtime_error" class="mt-0.5 truncate font-mono text-xs text-muted" :title="group.rules[0].runtime_error">{{ group.rules[0].runtime_error }}</p>
             <div class="mt-2 flex flex-wrap gap-x-4 gap-y-1">
               <RouterLink v-for="rule in group.rules" :key="rule.id" :to="`/rules/${rule.id}`" class="text-sm font-medium hover:underline hover:underline-offset-4">{{ rule.name }} <span class="font-mono text-xs text-muted">{{ rule.listen_port }}</span></RouterLink>
@@ -125,23 +112,18 @@ const greeting = computed(() => {
             <Clock class="mt-0.5 size-4 text-warning" aria-hidden="true" />
             <div class="min-w-0 flex-1">
               <p class="font-medium">{{ user.username }} {{ expiry(user.expires_at).text }}</p>
-              <p class="text-sm text-muted">到期后该账户无法登录，名下转发会自动停止。</p>
             </div>
             <RouterLink :to="`/accounts/${user.id}`" class="btn btn-secondary btn-sm">续期</RouterLink>
           </li>
           <li v-for="user in full" :key="`full-${user.id}`" class="flex items-start gap-3 px-4 py-3.5">
             <Gauge class="mt-0.5 size-4 text-warning" aria-hidden="true" />
             <div class="min-w-0 flex-1">
-              <p class="font-medium">{{ user.username }} 的规则额度已用完</p>
-              <p class="text-sm text-muted">已用 {{ user.rule_count }} / {{ user.max_rules }} 条，对方无法再新建转发。</p>
+              <p class="font-medium">{{ user.username }} 额度已满 <span class="font-normal text-muted tabular">{{ user.rule_count }} / {{ user.max_rules }}</span></p>
             </div>
             <RouterLink :to="`/accounts/${user.id}`" class="btn btn-secondary btn-sm">调整额度</RouterLink>
           </li>
         </template>
       </ul>
-      <div v-else class="panel flex items-center gap-3 px-4 py-3.5 text-muted">
-        <CircleCheck class="size-4 text-success" aria-hidden="true" />没有需要处理的事项。
-      </div>
     </section>
 
     <div class="grid grid-cols-[minmax(0,1fr)] gap-8 lg:grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)]">
@@ -155,7 +137,7 @@ const greeting = computed(() => {
 
       <section aria-labelledby="rules-title">
         <div class="mb-2 flex items-center justify-between">
-          <h2 id="rules-title" class="group-title !mb-0">{{ isAdmin ? '最近更新的转发' : '我的转发' }}</h2>
+          <h2 id="rules-title" class="group-title !mb-0">{{ isAdmin ? '最近更新' : '我的转发' }}</h2>
           <RouterLink to="/rules" class="flex items-center gap-0.5 text-sm text-accent hover:opacity-80">全部<ArrowRight class="size-3.5" /></RouterLink>
         </div>
         <ul v-if="all.length" class="panel group-list">
@@ -170,7 +152,7 @@ const greeting = computed(() => {
             </RouterLink>
           </li>
         </ul>
-        <div v-else-if="!rules.isLoading.value" class="panel px-4 py-8 text-center text-muted">还没有转发。<RouterLink to="/rules/new" class="font-medium text-accent hover:underline">新建一条</RouterLink></div>
+        <div v-else-if="!rules.isLoading.value" class="panel px-4 py-8 text-center text-muted">暂无转发</div>
       </section>
 
       <section v-if="isAdmin" aria-labelledby="activity-title">
@@ -184,7 +166,7 @@ const greeting = computed(() => {
             <p class="mt-0.5 text-xs text-muted">{{ relative(item.entry.created_at) }}</p>
           </li>
         </ol>
-        <div v-else-if="!audit.isLoading.value" class="panel px-4 py-8 text-center text-muted">还没有操作记录。</div>
+        <div v-else-if="!audit.isLoading.value" class="panel px-4 py-8 text-center text-muted">暂无记录</div>
       </section>
     </div>
   </div>

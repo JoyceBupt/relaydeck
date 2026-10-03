@@ -60,10 +60,3 @@ export function sourcesText(cidrs: string[]) {
   if (!cidrs.length) return '不限来源'
   return cidrs.length === 1 ? cidrs[0] : `${cidrs[0]} 等 ${cidrs.length} 个网段`
 }
-
-export function ruleSentence(input: { listen_port: number | null; protocol: Protocol; target_host: string; target_port: number | null; source_cidrs: string[] }) {
-  const port = input.listen_port ?? '…'
-  const target = input.target_host ? `${hostText(input.target_host)}:${input.target_port ?? '…'}` : '…'
-  const sources = input.source_cidrs.length ? `仅限 ${input.source_cidrs.length} 个来源网段` : '不限来源'
-  return { port: String(port), protocol: protocolLabels[input.protocol], target, sources }
-}

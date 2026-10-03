@@ -67,7 +67,7 @@ async function setView(mode: ViewMode) {
   acceptSession({ ...previous, user: { ...previous.user, view_mode: mode } })
   try { await api.setPreference(mode) } catch (error) {
     if (epoch === sessionState.epoch && sessionState.session) acceptSession({ ...sessionState.session, user: { ...sessionState.session.user, view_mode: previous.user.view_mode } })
-    reportError(error, '没能保存显示方式')
+    reportError(error, '保存失败')
   } finally { savingView.value = false }
 }
 
@@ -76,9 +76,9 @@ const subtitle = computed(() => {
   if (!user) return ''
   if (isAdmin.value) {
     const owners = new Set(all.value.map(rule => rule.owner_id)).size
-    return `${all.value.length} 条转发，分属 ${owners} 个账户`
+    return `${all.value.length} 条 · ${owners} 个账户`
   }
-  return `端口段 ${user.port_start}–${user.port_end} · 已用 ${user.rule_count} / ${user.max_rules} 条额度`
+  return `${user.port_start}–${user.port_end} · ${user.rule_count} / ${user.max_rules} 条`
 })
 
 // Drawer state lives in the URL so a rule can be linked, refreshed and navigated with Back.
@@ -112,10 +112,10 @@ async function bulk(action: 'enable' | 'disable' | 'delete') {
       else await api.updateRule(rule.id, ruleInput(rule, { enabled: action === 'enable' }))
       done++
     }
-    toast(`已${action === 'delete' ? '删除' : action === 'enable' ? '启用' : '停用'} ${done} 条转发`, { description: '等待执行器确认', tone: 'success' })
+    toast(`已${action === 'delete' ? '删除' : action === 'enable' ? '启用' : '停用'} ${done} 条`)
     selected.value = new Set()
   } catch (error) {
-    if (!isStaleError(error)) toast(`完成 ${done} 条后中断`, { description: errorMessage(error), tone: 'danger' })
+    if (!isStaleError(error)) toast(`已处理 ${done} 条，其余失败`, { description: errorMessage(error), tone: 'danger' })
   } finally {
     bulkBusy.value = false
     confirmBulkDelete.value = false
@@ -131,7 +131,7 @@ async function confirmDelete() {
   deleteBusy.value = true
   try {
     await api.deleteRule(target.id)
-    toast(`已删除「${target.name}」`, { description: `端口 ${target.listen_port} 会在执行器确认后释放` })
+    toast(`已删除 ${target.name}`)
     deleting.value = null
   } catch (error) { reportError(error, '删除失败') } finally { deleteBusy.value = false; await afterRuleChange() }
 }
@@ -168,7 +168,7 @@ const cloneSource = computed(() => (route.name === 'rule-new' && route.query.fro
       <label class="relative ml-auto w-full sm:w-64">
         <span class="sr-only">搜索转发</span>
         <Search class="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-faint" aria-hidden="true" />
-        <input ref="searchInput" v-model="search" type="search" class="input pl-9" placeholder="搜索名称、端口或目标" @keydown.esc="search = ''; ($event.target as HTMLInputElement).blur()" />
+        <input ref="searchInput" v-model="search" type="search" class="input pl-9" placeholder="搜索" @keydown.esc="search = ''; ($event.target as HTMLInputElement).blur()" />
       </label>
       <Segmented :model-value="viewMode" label="显示方式" size="sm" :disabled="savingView" :options="[{ value: 'table', label: '列表' }, { value: 'cards', label: '卡片' }]" class="max-md:hidden" @update:model-value="setView($event as ViewMode)" />
     </div>
@@ -179,20 +179,20 @@ const cloneSource = computed(() => (route.name === 'rule-new' && route.query.fro
       </div>
 
       <div v-else-if="rules.isError.value" class="panel px-6 py-10 text-center">
-        <p class="font-medium">没能读取转发列表</p>
+        <p class="font-medium">读取失败</p>
         <p class="mt-1 text-muted">{{ errorMessage(rules.error.value) }}</p>
         <button type="button" class="btn btn-secondary mt-4" @click="rules.refetch()"><RotateCw class="size-4" />重试</button>
       </div>
 
       <div v-else-if="!all.length" class="panel">
-        <EmptyState title="还没有转发" :description="isAdmin ? '新建一条转发，把本机端口接到公网目标。也可以先去「账户」给租户分配端口段。' : `你可以使用端口 ${currentUser?.port_start}–${currentUser?.port_end}，最多 ${currentUser?.max_rules} 条转发。`">
+        <EmptyState title="暂无转发">
           <template #icon><ArrowRightLeft class="size-5" /></template>
           <button type="button" class="btn btn-primary" @click="newRule"><Plus class="size-4" />新建转发</button>
         </EmptyState>
       </div>
 
       <div v-else-if="!visible.length" class="panel">
-        <EmptyState title="没有符合条件的转发" description="换个关键词或状态试试。">
+        <EmptyState title="无匹配结果">
           <button type="button" class="btn btn-secondary" @click="clearFilters"><X class="size-4" />清除筛选</button>
         </EmptyState>
       </div>
@@ -238,7 +238,7 @@ const cloneSource = computed(() => (route.name === 'rule-new' && route.query.fro
                 <RouterLink :to="{ path: `/rules/${rule.id}`, query: route.query }" class="block truncate font-medium text-fg" @click.stop>{{ rule.name }}</RouterLink>
                 <p class="truncate text-xs" :class="rule.runtime_error ? 'text-danger' : rule.dns_error ? 'text-warning' : 'text-muted'">
                   <template v-if="rule.runtime_status === 'failed'">失败{{ rule.runtime_error ? `：${rule.runtime_error}` : '' }}</template>
-                  <template v-else-if="rule.dns_error">{{ rule.enabled ? '目标解析异常' : '因目标解析失败已停用' }}{{ isAdmin ? ` · ${rule.owner_username}` : '' }}</template>
+                  <template v-else-if="rule.dns_error">{{ rule.enabled ? '解析失败' : '解析失败，已停用' }}{{ isAdmin ? ` · ${rule.owner_username}` : '' }}</template>
                   <template v-else>{{ statusLabels[rule.runtime_status] }}{{ isAdmin ? ` · ${rule.owner_username}` : '' }}</template>
                 </p>
               </div>
@@ -283,13 +283,12 @@ const cloneSource = computed(() => (route.name === 'rule-new' && route.query.fro
       :preset-port="presetPort" :preset-owner="presetOwner" :clone="cloneSource" @close="closeDrawer"
     />
     <ConfirmDialog
-      :open="!!deleting" danger title="删除这条转发？" confirm-label="删除" :busy="deleteBusy"
-      :description="deleting ? `「${deleting.name}」会停止转发并被删除，无法恢复。端口 ${deleting.listen_port} 会在执行器确认后释放。` : ''"
+      :open="!!deleting" danger :title="deleting ? `删除 ${deleting.name}？` : '删除转发？'" confirm-label="删除" :busy="deleteBusy" description="删除后无法恢复。"
       @confirm="confirmDelete" @cancel="deleting = null"
     />
     <ConfirmDialog
-      :open="confirmBulkDelete" danger :title="`删除选中的 ${selected.size} 条转发？`" confirm-label="全部删除" :busy="bulkBusy"
-      description="这些转发会停止并被删除，无法恢复。端口会在执行器确认后释放。" @confirm="bulk('delete')" @cancel="confirmBulkDelete = false"
+      :open="confirmBulkDelete" danger :title="`删除 ${selected.size} 条转发？`" confirm-label="删除" :busy="bulkBusy"
+      description="删除后无法恢复。" @confirm="bulk('delete')" @cancel="confirmBulkDelete = false"
     />
   </div>
 </template>

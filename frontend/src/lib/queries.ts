@@ -73,11 +73,10 @@ export function useToggleRule() {
     },
     onError: (error, _vars, context) => {
       if (context?.previous && context.epoch === sessionState.epoch && !isStaleError(error)) queryClient.setQueryData(keys.rules, context.previous)
-      reportError(error, '没能保存')
+      reportError(error, '保存失败')
     },
     onSuccess: (_data, { rule, enabled }) => {
-      toast(enabled ? `已启用「${rule.name}」` : `已停用「${rule.name}」`, {
-        description: '等待执行器确认',
+      toast(enabled ? `已启用 ${rule.name}` : `已停用 ${rule.name}`, {
         action: { label: '撤销', run: () => toggleRule.mutate({ rule: { ...rule, enabled }, enabled: !enabled }) },
       })
     },
@@ -106,8 +105,8 @@ export function useDeleteRule() {
 export function useRetry() {
   return useMutation({
     mutationFn: (ownerId: number) => api.retryApply(ownerId),
-    onSuccess: () => toast('已重新提交给执行器', { description: '几秒后会看到新的结果' }),
-    onError: error => reportError(error, '无法重试'),
+    onSuccess: () => toast('已重试'),
+    onError: error => reportError(error, '重试失败'),
     onSettled: afterRuleChange,
   })
 }

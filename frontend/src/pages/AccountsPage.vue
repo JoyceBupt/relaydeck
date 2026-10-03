@@ -41,10 +41,10 @@ const drawerUserId = computed(() => (route.name === 'account' ? Number(route.par
     <div class="flex flex-wrap items-end justify-between gap-4">
       <div>
         <h1 class="page-title">账户</h1>
-        <p class="mt-1 text-muted tabular">{{ users.isLoading.value ? '正在读取…' : `${tenants.length} / ${MAX_TENANTS} 个租户` }}</p>
+        <p class="mt-1 text-muted tabular">{{ users.isLoading.value ? '' : `${tenants.length} / ${MAX_TENANTS} 个租户` }}</p>
       </div>
       <RouterLink v-if="tenants.length < MAX_TENANTS" to="/accounts/new" class="btn btn-primary"><Plus class="size-4" />新建账户</RouterLink>
-      <span v-else class="text-sm text-muted">已达到 {{ MAX_TENANTS }} 个租户上限</span>
+      <span v-else class="text-sm text-muted">租户已满</span>
     </div>
 
     <section class="mt-6" aria-label="账户列表">
@@ -52,7 +52,7 @@ const drawerUserId = computed(() => (route.name === 'account' ? Number(route.par
         <div v-for="index in 4" :key="index" class="flex items-center gap-4 px-4 py-4"><span class="skeleton size-8 rounded-full" /><span class="skeleton h-4 w-32" /><span class="skeleton ml-auto h-4 w-24" /></div>
       </div>
       <div v-else-if="users.isError.value" class="panel px-6 py-10 text-center">
-        <p class="font-medium">没能读取账户</p>
+        <p class="font-medium">读取失败</p>
         <p class="mt-1 text-muted">{{ errorMessage(users.error.value) }}</p>
         <button type="button" class="btn btn-secondary mt-4" @click="users.refetch()"><RotateCw class="size-4" />重试</button>
       </div>
@@ -71,9 +71,9 @@ const drawerUserId = computed(() => (route.name === 'account' ? Number(route.par
                 <span class="min-w-0">
                   <span class="flex items-center gap-1.5">
                     <span class="truncate font-medium">{{ user.username }}</span>
-                    <ShieldCheck v-if="user.mfa_enabled" class="size-3.5 text-accent" aria-label="已开双因素" role="img" />
+                    <ShieldCheck v-if="user.mfa_enabled" class="size-3.5 text-accent" aria-label="已开启两步验证" role="img" />
                   </span>
-                  <span class="block text-xs text-muted">{{ user.role === 'admin' ? '管理员' : user.must_change_password ? '租户 · 待修改初始密码' : '租户' }}</span>
+                  <span class="block text-xs text-muted">{{ user.role === 'admin' ? '管理员' : user.must_change_password ? '租户 · 未改初始密码' : '租户' }}</span>
                 </span>
               </span>
               <span class="font-mono text-sm tabular max-md:col-start-1 max-md:row-start-2 max-md:pl-11">{{ user.port_start }}–{{ user.port_end }}</span>
@@ -91,7 +91,7 @@ const drawerUserId = computed(() => (route.name === 'account' ? Number(route.par
           </li>
         </ul>
         <div v-if="!tenants.length" class="border-t border-line">
-          <EmptyState title="还没有租户" description="新建账户后，对方就能在分配的端口段里自助管理转发。">
+          <EmptyState title="暂无租户">
             <template #icon><Users class="size-5" /></template>
             <RouterLink to="/accounts/new" class="btn btn-primary"><Plus class="size-4" />新建账户</RouterLink>
           </EmptyState>

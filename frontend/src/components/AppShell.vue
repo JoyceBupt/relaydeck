@@ -3,7 +3,7 @@ import { computed, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useEventListener } from '@vueuse/core'
 import { DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuPortal, DropdownMenuRadioGroup, DropdownMenuRadioItem, DropdownMenuItemIndicator, DropdownMenuRoot, DropdownMenuSeparator, DropdownMenuTrigger } from 'reka-ui'
-import { ArrowRightLeft, Check, LayoutGrid, LogOut, ScrollText, Settings, ShieldAlert, Users } from '@lucide/vue'
+import { ArrowRightLeft, Check, LayoutGrid, LogOut, ScrollText, Settings, Users } from '@lucide/vue'
 import BrandMark from './BrandMark.vue'
 import ExecutorStatus from './ExecutorStatus.vue'
 import { api } from '../api/endpoints'
@@ -111,12 +111,6 @@ useEventListener(window, 'keydown', (event: KeyboardEvent) => {
     </header>
 
     <div ref="scroller" class="pane min-h-0 flex-1 overflow-y-auto overscroll-contain">
-      <div v-if="forcedMfa" class="mx-auto max-w-6xl px-4 pt-4 md:px-8 md:pt-6">
-        <p class="flex items-center gap-2.5 rounded-xl border border-warning/30 bg-warning-soft px-4 py-3 text-sm text-fg">
-          <ShieldAlert class="size-4 text-warning" aria-hidden="true" />
-          管理员必须先启用双因素验证，完成后才能使用其他功能。
-        </p>
-      </div>
       <main id="main" tabindex="-1" class="mx-auto max-w-6xl px-4 pt-5 pb-24 outline-none md:px-8 md:pt-8 md:pb-12">
         <RouterView />
       </main>

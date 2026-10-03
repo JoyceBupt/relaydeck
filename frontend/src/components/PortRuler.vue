@@ -26,7 +26,7 @@ function describe(port: number): Cell {
   if (!lease) return { port, kind: 'free', title: `${port} · 空闲` }
   const rule = props.statuses?.[lease.rule_id]
   if (lease.rule_id === props.ownRuleId) return { port, kind: 'own', title: `${port} · 当前规则` }
-  if (lease.state === 'releasing') return { port, kind: 'releasing', title: `${port} · 待释放（等待执行器确认）` }
+  if (lease.state === 'releasing') return { port, kind: 'releasing', title: `${port} · 释放中` }
   return { port, kind: rule?.status ?? 'active', title: `${port} · ${rule?.name ?? '已占用'}` }
 }
 
@@ -107,7 +107,7 @@ const tone: Record<Cell['kind'], string> = {
       <span class="flex items-center gap-3">
         <span class="tabular">空闲 {{ free }}</span>
         <button v-if="interactive && nextFree !== null" type="button" class="font-medium text-accent hover:underline" @click="emit('select', nextFree)">
-          用下一个空闲端口 {{ nextFree }}
+          下一个空闲 {{ nextFree }}
         </button>
       </span>
     </div>
