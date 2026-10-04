@@ -39,6 +39,15 @@ jobs:
             --env CARGO_HOME=/tmp/relaydeck-cargo --env RUSTUP_TOOLCHAIN=1.99.0 \
             rust:1.99-bookworm@sha256:59037199c44290f2befcdd58dcc540164763fc296950255aaefeef096a1866b0 \
             sh -c 'cargo test --locked --all-targets && cargo build --release --locked && python3 scripts/manage.py package --target "$(rustc -vV | sed -n "s/^host: //p")"'
+      - name: Accept the packaged release executable and legacy upgrade
+        run: |
+          docker run --rm --read-only \
+            --tmpfs /run:rw,exec,nosuid,nodev,mode=0755,size=128m \
+            --tmpfs /tmp:rw,exec,nosuid,nodev,mode=1777,size=256m \
+            --volume "$PWD:/workspace:ro" --workdir /workspace \
+            --env PYTHONDONTWRITEBYTECODE=1 --env RELAYDECK_EXPECTED_REVISION="$GITHUB_SHA" \
+            rust:1.99-bookworm@sha256:59037199c44290f2befcdd58dcc540164763fc296950255aaefeef096a1866b0 \
+            python3 tests/release_acceptance.py
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: relaydeck-${{ runner.arch }}
