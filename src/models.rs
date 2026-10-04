@@ -19,6 +19,17 @@ pub struct DbUser {
     pub mfa_secret: Option<String>,
     pub mfa_failures: i64,
     pub mfa_locked_until: i64,
+    pub traffic_limit_bytes: Option<i64>,
+    pub traffic_mode: String,
+    pub traffic_in_bytes: i64,
+    pub traffic_out_bytes: i64,
+    pub traffic_period_start: Option<i64>,
+    pub traffic_reset_at: Option<i64>,
+    pub traffic_blocked: bool,
+    pub traffic_observed_at: Option<i64>,
+    pub traffic_used_bytes: i64,
+    pub traffic_ready: bool,
+    pub traffic_error: Option<String>,
 }
 
 impl DbUser {
@@ -46,11 +57,14 @@ pub struct UserView {
     pub desired_revision: i64,
     pub applied_revision: i64,
     pub mfa_enabled: bool,
+    pub traffic: crate::traffic::TrafficView,
 }
 
 impl UserView {
     pub fn from_user(user: DbUser, rule_count: i64) -> Self {
+        let traffic = crate::traffic::TrafficView::from_user(&user);
         Self {
+            traffic,
             id: user.id,
             username: user.username,
             role: user.role,

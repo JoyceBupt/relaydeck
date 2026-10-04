@@ -147,6 +147,7 @@ fn plan(
     sources: Vec<String>,
 ) -> relaydeck::executor::RuntimePlan {
     DesiredPlan {
+        traffic: None,
         owner_id: owner,
         revision: 2,
         enabled: true,

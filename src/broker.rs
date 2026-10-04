@@ -22,6 +22,7 @@ enum Request {
     Inspect,
     Acknowledge(Vec<(i64, i64)>),
     Check(crate::connectivity::CheckRequest),
+    Traffic(Vec<crate::traffic::TrafficGrant>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +42,7 @@ struct Reply {
     retryable: bool,
     events: Vec<Failure>,
     check: Option<crate::connectivity::RuleCheck>,
+    traffic: Option<Vec<crate::traffic::TrafficSnapshot>>,
 }
 
 impl crate::connectivity::CheckChannel for SocketDriver {
@@ -151,6 +153,15 @@ impl SocketDriver {
         self.request(Request::Acknowledge(events.to_vec())).await?;
         Ok(())
     }
+    pub async fn traffic(
+        &self,
+        grants: Vec<crate::traffic::TrafficGrant>,
+    ) -> anyhow::Result<Vec<crate::traffic::TrafficSnapshot>> {
+        self.request(Request::Traffic(grants))
+            .await?
+            .traffic
+            .context("broker omitted traffic state")
+    }
 }
 
 impl ExecutorDriver for SocketDriver {
@@ -234,6 +245,8 @@ pub async fn run(policy_path: &Path) -> anyhow::Result<()> {
         let mut stopping = std::collections::BTreeSet::new();
         let mut last_check: Option<std::time::Instant> = None;
         let mut interval = tokio::time::interval(Duration::from_secs(10));
+        let mut traffic_clock = tokio::time::interval(Duration::from_secs(1));
+        traffic_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -272,6 +285,7 @@ pub async fn run(policy_path: &Path) -> anyhow::Result<()> {
                                 }
                                 Request::Stop(owner) => { leases.remove(&owner); if let Err(error)=driver.stop(owner).await { stopping.insert(owner); reply.retryable=true; return Err(error.into()); } stopping.remove(&owner); }
                                 Request::Inspect => { reply.events = events.values().cloned().collect(); }
+                                Request::Traffic(grants) => {reply.retryable=true;reply.traffic=Some(driver.traffic(&grants).await?);}
                                 Request::Check(check) => {
                                     ensure!(leases.get(&check.owner_id).is_some_and(|(revision,until)|*revision == check.revision && *until > crate::db::now()), "connectivity authorization is stale");
                                     ensure!(last_check.is_none_or(|time| time.elapsed() >= Duration::from_secs(5)), "connectivity checks are rate limited");
@@ -307,6 +321,9 @@ pub async fn run(policy_path: &Path) -> anyhow::Result<()> {
                             if !retryable { blocked.insert(owner,revision); }
                             events.insert(owner,Failure{owner,revision,message,retryable});
                         }
+                    }
+                    _ = traffic_clock.tick() => {
+                        if let Err(error)=driver.traffic_month().await {tracing::error!(%error,"traffic period transition deferred");}
                     }
                     _ = terminate.recv() => break,
                     _ = tokio::signal::ctrl_c() => break,

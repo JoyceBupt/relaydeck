@@ -13,6 +13,7 @@ use tokio::sync::{Mutex, Notify};
 
 fn desired() -> DesiredPlan {
     DesiredPlan {
+        traffic: None,
         owner_id: 1,
         revision: 1,
         enabled: true,

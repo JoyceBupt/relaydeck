@@ -35,6 +35,24 @@ pub fn firewall_fingerprint(value: &serde_json::Value) -> Result<Vec<u8>, serde_
                         }
                     }
                 }
+                if let Some(serde_json::Value::Object(quota)) = map.get_mut("quota")
+                    && quota.contains_key("used")
+                {
+                    quota.insert("used".into(), 0.into());
+                }
+                if let Some(serde_json::Value::Object(set)) = map.get_mut("set")
+                    && set.get("table").and_then(|v| v.as_str()) == Some("relaydeck_usage")
+                    && set
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|name| {
+                            name.strip_prefix("blocked_").is_some_and(|id| {
+                                !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit())
+                            })
+                        })
+                {
+                    set.remove("elem");
+                }
                 for value in map.values_mut() {
                     normalize(value);
                 }
@@ -633,6 +651,8 @@ pub struct LinuxDriver {
     plans: Mutex<BTreeMap<i64, RuntimePlan>>,
     firewall_digest: Mutex<Option<Vec<u8>>>,
     tunnel_peers: Mutex<Vec<WireguardPeer>>,
+    #[cfg(target_os = "linux")]
+    traffic: Mutex<crate::traffic::driver::TrafficMeter>,
     global_failures: Mutex<u8>,
     #[cfg(target_os = "linux")]
     bindguards: Mutex<BTreeMap<i64, crate::bindguard::BindGuard>>,
@@ -972,7 +992,11 @@ pub fn system_tool(path: &Path) -> anyhow::Result<PathBuf> {
 #[error("runtime command unavailable: {0}")]
 struct CommandUnavailable(String);
 
-async fn command(program: &str, args: &[&str], input: Option<&[u8]>) -> anyhow::Result<Vec<u8>> {
+pub(crate) async fn command(
+    program: &str,
+    args: &[&str],
+    input: Option<&[u8]>,
+) -> anyhow::Result<Vec<u8>> {
     use std::process::Stdio;
     #[cfg(target_os = "linux")]
     let executable = system_tool(Path::new(program))?;
@@ -1046,7 +1070,12 @@ async fn interface_ips() -> anyhow::Result<Vec<IpAddr>> {
 }
 
 #[cfg(target_os = "linux")]
-fn write_root_file(path: &Path, bytes: &[u8], mode: u32, group: u32) -> anyhow::Result<()> {
+pub(crate) fn write_root_file(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    group: u32,
+) -> anyhow::Result<()> {
     use std::{
         io::Write,
         os::{
@@ -1091,6 +1120,17 @@ fn write_root_file(path: &Path, bytes: &[u8], mode: u32, group: u32) -> anyhow::
 }
 
 impl LinuxDriver {
+    #[cfg(target_os = "linux")]
+    pub async fn traffic(
+        &self,
+        grants: &[crate::traffic::TrafficGrant],
+    ) -> anyhow::Result<Vec<crate::traffic::TrafficSnapshot>> {
+        self.traffic.lock().await.synchronize(grants).await
+    }
+    #[cfg(target_os = "linux")]
+    pub async fn traffic_month(&self) -> anyhow::Result<()> {
+        self.traffic.lock().await.check_month().await
+    }
     #[cfg(target_os = "linux")]
     pub async fn check_rule(
         &self,
@@ -1208,7 +1248,9 @@ impl LinuxDriver {
             validate_uid_pool(&policy)?;
             write_root_file(&Path::new(UNIT_DIR).join("relaydeck.slice"), format!("[Unit]\nDescription=RelayDeck runtime budget\n\n[Slice]\nMemoryMax={}M\nMemorySwapMax=0\nTasksMax={}\nCPUQuota={}%\n",policy.limits.total_memory_mb,policy.limits.tasks * policy.max_owners,policy.limits.total_cpu_percent).as_bytes(), 0o644, 0)?;
             command(SYSTEMCTL, &["daemon-reload"], None).await?;
+            let traffic = crate::traffic::driver::TrafficMeter::open(policy.clone())?;
             let driver = Self {
+                traffic: Mutex::new(traffic),
                 policy,
                 plans: Mutex::new(BTreeMap::new()),
                 firewall_digest: Mutex::new(None),
@@ -1248,6 +1290,15 @@ impl LinuxDriver {
         let value: serde_json::Value = serde_json::from_slice(&actual)?;
         *self.firewall_digest.lock().await = Some(firewall_fingerprint(&value)?);
         *self.tunnel_peers.lock().await = peers;
+        #[cfg(target_os = "linux")]
+        self.traffic
+            .lock()
+            .await
+            .update_routes(
+                plans.values().cloned().collect(),
+                self.tunnel_peers.lock().await.clone(),
+            )
+            .await?;
         Ok(())
     }
 
@@ -1581,6 +1632,14 @@ impl LinuxDriver {
 
     async fn apply_plan(&self, raw: &RuntimePlan) -> anyhow::Result<()> {
         self.policy.uid(raw.owner_id())?;
+        #[cfg(target_os = "linux")]
+        ensure!(
+            self.traffic
+                .lock()
+                .await
+                .authorized(raw.owner_id(), raw.traffic()),
+            "traffic authorization is unavailable or exhausted"
+        );
         {
             let mut plans = self.plans.lock().await;
             if plans.get(&raw.owner_id()).is_some_and(|existing| {
@@ -2094,6 +2153,7 @@ sys.stdin.read(1)
             enabled: true,
         };
         let mut desired = DesiredPlan {
+            traffic: None,
             owner_id: 1,
             revision: 1,
             enabled: true,

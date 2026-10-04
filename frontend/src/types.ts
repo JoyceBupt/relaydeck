@@ -18,6 +18,21 @@ export interface User {
   desired_revision: number
   applied_revision: number
   mfa_enabled: boolean
+  traffic?: TrafficView
+}
+
+export type TrafficMode = 'both' | 'ingress' | 'egress'
+export interface TrafficBudget { limit_bytes: number | null; mode: TrafficMode }
+export interface TrafficView extends TrafficBudget {
+  in_bytes: number
+  out_bytes: number
+  used_bytes: number
+  period_start: number | null
+  reset_at: number | null
+  blocked: boolean
+  ready: boolean
+  error: string | null
+  observed_at: number | null
 }
 
 export interface Session { can_upgrade?: boolean; user: User; csrf_token: string; session_ref: string; mfa_required: boolean }
@@ -90,6 +105,7 @@ export interface UserGrantInput {
   enabled: boolean
   max_rules: number
   expires_at: number | null
+  traffic?: TrafficBudget
 }
 
 export interface NewUserInput {
@@ -97,6 +113,7 @@ export interface NewUserInput {
   password: string
   max_rules: number
   expires_at: number | null
+  traffic?: TrafficBudget
 }
 
 

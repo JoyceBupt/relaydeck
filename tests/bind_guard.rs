@@ -26,6 +26,7 @@ fn kernel_bind_guard_enforces_port_protocol_and_address_families() {
     let port = listener.local_addr().unwrap().port();
     drop(listener);
     let plan = DesiredPlan {
+        traffic: None,
         owner_id: 1,
         revision: 1,
         enabled: true,
