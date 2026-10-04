@@ -185,6 +185,14 @@ async fn traffic_kernel_enforcement_and_recovery() {
     assert!(rows[2].out_bytes > 0);
     // A monthly transition restores traffic without toggling the forwarding rules.
     CLOCK.store(rows[0].reset_at + 1, Ordering::Relaxed);
+    let ledger = root.path().join("traffic-ledger.json");
+    let backup = root.path().join("traffic-ledger.before-rollover");
+    std::fs::rename(&ledger, &backup).unwrap();
+    std::fs::create_dir(&ledger).unwrap();
+    assert!(meter.check_month().await.is_err());
+    assert!(!meter.authorized(1, Some(&grants[0].budget)));
+    std::fs::remove_dir(&ledger).unwrap();
+    std::fs::rename(&backup, &ledger).unwrap();
     meter.check_month().await.unwrap();
     let rows = meter.synchronize(&grants).await.unwrap();
     assert!(rows.iter().all(|row| !row.blocked && row.used_bytes == 0));
