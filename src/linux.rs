@@ -280,7 +280,10 @@ pub fn prepare_broker_policy(source: &Path, destination: &Path) -> anyhow::Resul
         }
         policy.validate()?;
         let bytes = serde_json::to_vec(&policy)?;
-        ensure!(bytes.len() <= 16 * 1024, "effective broker policy too large");
+        ensure!(
+            bytes.len() <= 16 * 1024,
+            "effective broker policy too large"
+        );
         write_root_file(destination, &bytes, 0o644, 0)
     }
 }
