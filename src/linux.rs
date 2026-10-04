@@ -19,6 +19,8 @@ const SYSTEMCTL: &str = "/usr/bin/systemctl";
 const NFT: &str = "/usr/sbin/nft";
 const SS: &str = "/usr/bin/ss";
 const IP: &str = "/usr/sbin/ip";
+#[cfg(target_os = "linux")]
+const WG: &str = "/usr/bin/wg";
 const UNIT_DIR: &str = "/run/systemd/system";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(4);
 
@@ -373,6 +375,94 @@ pub fn render_nft_with_listeners(
     timestamp: i64,
     listeners: &[(Protocol, u16)],
 ) -> anyhow::Result<String> {
+    render_nft_with_tunnels(policy, plans, local_ips, timestamp, listeners, &[])
+}
+
+/// The encrypted outer packet can retain the original application's socket UID.
+/// Only root-owned kernel WireGuard peers with a nonzero, privileged socket mark
+/// may bypass a second application-target check. Inner packets remain checked.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct WireguardPeer {
+    pub mark: u32,
+    pub endpoint: std::net::SocketAddr,
+}
+
+pub fn parse_wireguard_peers(marks: &str, endpoints: &str) -> anyhow::Result<Vec<WireguardPeer>> {
+    ensure!(
+        marks.len() <= 16 * 1024 && endpoints.len() <= 64 * 1024,
+        "WireGuard inventory too large"
+    );
+    let mut interfaces = BTreeMap::new();
+    for line in marks.lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        ensure!(fields.len() == 2, "invalid WireGuard mark inventory");
+        let mark = if fields[1] == "off" {
+            0
+        } else {
+            u32::from_str_radix(
+                fields[1]
+                    .strip_prefix("0x")
+                    .context("invalid WireGuard mark")?,
+                16,
+            )?
+        };
+        ensure!(
+            interfaces.insert(fields[0], mark).is_none(),
+            "duplicate WireGuard interface"
+        );
+    }
+    let mut peers = std::collections::BTreeSet::new();
+    for line in endpoints.lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        ensure!(fields.len() == 3, "invalid WireGuard endpoint inventory");
+        let mark = *interfaces
+            .get(fields[0])
+            .context("WireGuard interface changed during inventory")?;
+        if mark == 0 || fields[2] == "(none)" {
+            continue;
+        }
+        let endpoint: std::net::SocketAddr = fields[2].parse()?;
+        ensure!(
+            endpoint.port() != 0
+                && !endpoint.ip().is_unspecified()
+                && !endpoint.ip().is_multicast(),
+            "invalid WireGuard peer address"
+        );
+        peers.insert(WireguardPeer { mark, endpoint });
+        ensure!(peers.len() <= 64, "too many WireGuard peers");
+    }
+    Ok(peers.into_iter().collect())
+}
+
+#[cfg(target_os = "linux")]
+async fn wireguard_peers() -> anyhow::Result<Vec<WireguardPeer>> {
+    match std::fs::symlink_metadata(WG) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+        Ok(_) => system_tool(Path::new(WG))?,
+    }
+    // Never use `dump` or `showconf`, both of which expose private keys.
+    let marks = command(WG, &["show", "all", "fwmark"], None).await?;
+    let endpoints = command(WG, &["show", "all", "endpoints"], None).await?;
+    parse_wireguard_peers(
+        std::str::from_utf8(&marks)?,
+        std::str::from_utf8(&endpoints)?,
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn wireguard_peers() -> anyhow::Result<Vec<WireguardPeer>> {
+    Ok(Vec::new())
+}
+
+pub fn render_nft_with_tunnels(
+    policy: &BrokerPolicy,
+    plans: &[RuntimePlan],
+    local_ips: &[IpAddr],
+    timestamp: i64,
+    listeners: &[(Protocol, u16)],
+    peers: &[WireguardPeer],
+) -> anyhow::Result<String> {
     policy.validate()?;
     let mut boundary_ips = policy.local_ips.clone();
     boundary_ips.extend_from_slice(local_ips);
@@ -513,6 +603,19 @@ pub fn render_nft_with_listeners(
         rules.push_str("  drop\n }\n");
     }
     rules.push_str(" chain output { type filter hook output priority -10; policy accept;\n");
+    for peer in peers {
+        ensure!(
+            peer.mark != 0 && peer.endpoint.port() != 0,
+            "unmarked WireGuard peers cannot bypass target policy"
+        );
+        let family = if peer.endpoint.is_ipv4() { "ip" } else { "ip6" };
+        rules.push_str(&format!(
+            "  meta mark {} {family} daddr {} udp dport {} return\n",
+            peer.mark,
+            peer.endpoint.ip(),
+            peer.endpoint.port()
+        ));
+    }
     for owner_id in 1..=i64::from(policy.max_owners) {
         rules.push_str(&format!(
             "  meta skuid {} jump owner_{owner_id}\n",
@@ -527,6 +630,7 @@ pub struct LinuxDriver {
     policy: BrokerPolicy,
     plans: Mutex<BTreeMap<i64, RuntimePlan>>,
     firewall_digest: Mutex<Option<Vec<u8>>>,
+    tunnel_peers: Mutex<Vec<WireguardPeer>>,
     global_failures: Mutex<u8>,
     #[cfg(target_os = "linux")]
     bindguards: Mutex<BTreeMap<i64, crate::bindguard::BindGuard>>,
@@ -1030,6 +1134,7 @@ impl LinuxDriver {
                 policy,
                 plans: Mutex::new(BTreeMap::new()),
                 firewall_digest: Mutex::new(None),
+                tunnel_peers: Mutex::new(Vec::new()),
                 global_failures: Mutex::new(0),
                 bindguards: Mutex::new(BTreeMap::new()),
             };
@@ -1050,18 +1155,21 @@ impl LinuxDriver {
     async fn firewall(&self, plans: &BTreeMap<i64, RuntimePlan>) -> anyhow::Result<()> {
         let addresses = interface_ips().await?;
         let held = tenant_kernel_listeners(&self.policy)?;
-        let nft = render_nft_with_listeners(
+        let peers = wireguard_peers().await?;
+        let nft = render_nft_with_tunnels(
             &self.policy,
             &plans.values().cloned().collect::<Vec<_>>(),
             &addresses,
             now(),
             &held,
+            &peers,
         )?;
         command(NFT, &["--check", "-f", "-"], Some(nft.as_bytes())).await?;
         command(NFT, &["-f", "-"], Some(nft.as_bytes())).await?;
         let actual = command(NFT, &["-j", "list", "table", "inet", "relaydeck"], None).await?;
         let value: serde_json::Value = serde_json::from_slice(&actual)?;
         *self.firewall_digest.lock().await = Some(firewall_fingerprint(&value)?);
+        *self.tunnel_peers.lock().await = peers;
         Ok(())
     }
 
@@ -1080,7 +1188,8 @@ impl LinuxDriver {
             let value: serde_json::Value = serde_json::from_slice(&actual)?;
             let changed =
                 self.firewall_digest.lock().await.as_ref() != Some(&firewall_fingerprint(&value)?);
-            if changed {
+            let peers_changed = *self.tunnel_peers.lock().await != wireguard_peers().await?;
+            if changed || peers_changed {
                 tracing::warn!("runtime firewall changed; rebuilding root policy");
                 self.firewall(&plans).await?;
             }
