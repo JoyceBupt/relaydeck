@@ -206,7 +206,7 @@ const expiryInfo = computed(() => (user.value ? expiry(user.value.expires_at) : 
           <div class="flex items-center justify-between gap-3"><span class="field-label">不限量</span><UiSwitch v-model="form.traffic_unlimited" label="不限流量" /></div>
           <div class="grid grid-cols-2 items-start gap-3">
             <div class="field"><label class="field-label" for="account-traffic">流量额度</label><div class="flex gap-2"><input id="account-traffic" v-model.number="form.traffic_amount" class="input input-mono min-w-0" type="number" min="0.000000001" step="any" :disabled="form.traffic_unlimited" :aria-invalid="!!show('traffic')" /><select class="input !w-20 shrink-0" :value="form.traffic_unit" aria-label="流量单位" :disabled="form.traffic_unlimited" @change="setTrafficUnit"><option>GB</option><option>TB</option></select></div><span class="field-hint">每月重置</span></div>
-            <label class="field"><span class="field-label">计量方向</span><select v-model="form.traffic_mode" class="input" :disabled="form.traffic_unlimited"><option v-for="[value,label] in modeOptions" :key="value" :value="value">{{ label }}</option></select><span class="field-hint">客户端侧</span></label>
+            <div class="field"><label class="field-label" for="account-traffic-mode">计量方向</label><select id="account-traffic-mode" v-model="form.traffic_mode" class="input" :disabled="form.traffic_unlimited"><option v-for="[value,label] in modeOptions" :key="value" :value="value">{{ label }}</option></select><span class="field-hint">客户端侧</span></div>
           </div>
           <p v-if="show('traffic')" class="field-error">{{ show('traffic') }}</p>
         </section>

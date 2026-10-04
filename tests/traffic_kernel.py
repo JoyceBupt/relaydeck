@@ -22,18 +22,18 @@ try:
         run('ip','-n',ns,'address','add',address,'dev',dev)
         run('ip','-n',ns,'link','set',dev,'up')
     echo='''import socket,sys,threading
-+def tcp():
-+ s=socket.socket();s.bind(('8.8.45.1',int(sys.argv[1])));s.listen()
-+ while True:
-+  c,_=s.accept()
-+  with c:
-+   b=c.recv(4096)
-+   if b:c.sendall(b)
-+threading.Thread(target=tcp,daemon=True).start()
-+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(('8.8.45.1',int(sys.argv[1])))
-+while True:
-+ b,a=s.recvfrom(4096);s.sendto(b,a)
-+'''.replace('\n+','\n')
+def tcp():
+ s=socket.socket();s.bind(('8.8.45.1',int(sys.argv[1])));s.listen()
+ while True:
+  c,_=s.accept()
+  with c:
+   b=c.recv(4096)
+   if b:c.sendall(b)
+threading.Thread(target=tcp,daemon=True).start()
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(('8.8.45.1',int(sys.argv[1])))
+while True:
+ b,a=s.recvfrom(4096);s.sendto(b,a)
+'''
     for owner in (1,2,3):
         children.append(subprocess.Popen(['ip','netns','exec',server_ns,'setpriv','--reuid',str(59999+owner),'--regid',str(59999+owner),'--clear-groups','--bounding-set=-all','python3','-c',echo,str(40990+owner*10)]))
     time.sleep(.2)
