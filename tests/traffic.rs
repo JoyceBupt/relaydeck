@@ -185,6 +185,18 @@ async fn traffic_kernel_enforcement_and_recovery() {
             .unwrap();
     assert_eq!(legacy["version"], 1);
     assert!(legacy["accounts"]["1"].get("period").is_none());
+    // An old broker resumed after rollback may update the compatibility
+    // ledger. A later upgrade must adopt those bytes, not its stale v2 copy.
+    drop(meter);
+    let legacy_path = root.path().join("traffic-ledger.json");
+    let mut legacy: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&legacy_path).unwrap()).unwrap();
+    legacy["accounts"]["1"]["charged"] = (used + 1).into();
+    std::fs::write(&legacy_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let mut meter = TrafficMeter::open_with_clock(policy.clone(), clock).unwrap();
+    let returned = meter.synchronize(&grants).await.unwrap();
+    assert_eq!(returned[0].used_bytes, used + 1);
+    let used = used + 1;
     // Route replacement and a broker restart preserve the current month.
     meter.update_routes(plans.clone(), vec![]).await.unwrap();
     assert_eq!(

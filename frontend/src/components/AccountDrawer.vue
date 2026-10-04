@@ -2,6 +2,7 @@
 import { computed, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useMutation } from '@tanstack/vue-query'
+import { useNow } from '@vueuse/core'
 import { ArrowRightLeft, Copy, KeyRound, RotateCw, RefreshCw, ShieldCheck, Trash2, CalendarPlus } from '@lucide/vue'
 import SideDrawer from './SideDrawer.vue'
 import PortRuler from './PortRuler.vue'
@@ -14,7 +15,7 @@ import { api } from '../api/endpoints'
 import { errorMessage, isStaleError } from '../api/client'
 import type { Rule, TrafficMode, User } from '../types'
 import { afterRuleChange, usePorts, useRetry, useTraffic } from '../lib/queries'
-import { dateTime, expiry, nowSeconds } from '../lib/format'
+import { dateTime, expiry } from '../lib/format'
 import { validatePassword, validateUsername } from '../lib/validation'
 import { generatePassword } from '../lib/password'
 import { toast } from '../lib/toast'
@@ -22,6 +23,8 @@ import { toast } from '../lib/toast'
 const props = defineProps<{ open: boolean; userId: number | null; users: User[]; rules: Rule[]; loaded: boolean }>()
 const emit = defineEmits<{ close: [] }>()
 const router = useRouter()
+const clock = useNow({ interval: 1000 })
+const timestamp = computed(() => Math.floor(clock.value.getTime() / 1000))
 
 const user = computed(() => (props.userId === null ? null : props.users.find(item => item.id === props.userId) ?? null))
 const isNew = computed(() => props.userId === null)
@@ -138,7 +141,7 @@ function onBeforeClose(event: Event) { if (dirty.value) { event.preventDefault()
 function discard() { confirmDiscard.value = false; baseline.value = snapshot(); pending?.(); pending = null }
 
 const deleting = computed(() => user.value?.deletion_requested_at != null)
-const canRenew = computed(() => user.value?.role === 'user' && !deleting.value && user.value.expires_at !== null && user.value.expires_at <= nowSeconds())
+const canRenew = computed(() => user.value?.role === 'user' && !deleting.value && user.value.expires_at !== null && user.value.expires_at <= timestamp.value)
 const deleteOpen = ref(false)
 const renewOpen = ref(false)
 const actionError = ref('')
@@ -169,7 +172,7 @@ async function confirmRenew() {
   } catch (error) { if (!isStaleError(error)) actionError.value = errorMessage(error) }
 }
 
-const expiryInfo = computed(() => (user.value ? expiry(user.value.expires_at) : null))
+const expiryInfo = computed(() => (user.value ? expiry(user.value.expires_at, timestamp.value) : null))
 </script>
 
 <template>
