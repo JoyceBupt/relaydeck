@@ -333,6 +333,7 @@ impl TrafficMeter {
     }
 
     async fn rebuild(&mut self) -> anyhow::Result<()> {
+        self.initialized = false;
         // Recovery freezes the client legs while taking a final counter snapshot.
         let owners = self.ledger.accounts.keys().copied().collect::<Vec<_>>();
         self.freeze(&owners).await?;
@@ -521,6 +522,9 @@ impl TrafficMeter {
     }
 
     pub async fn check_month(&mut self) -> anyhow::Result<()> {
+        if !self.initialized {
+            return self.initialize().await;
+        }
         if self.roll_clock((self.clock)())? {
             self.rebuild().await?;
         }
@@ -528,12 +532,13 @@ impl TrafficMeter {
     }
 
     pub fn authorized(&self, owner: i64, budget: Option<&TrafficBudget>) -> bool {
-        self.ledger.accounts.get(&owner).is_some_and(|account| {
-            account.prepared
-                && !account.blocked()
-                && budget.map_or(account.budget.limit_bytes.is_none(), |budget| {
-                    budget == &account.budget
-                })
-        })
+        self.initialized
+            && self.ledger.accounts.get(&owner).is_some_and(|account| {
+                account.prepared
+                    && !account.blocked()
+                    && budget.map_or(account.budget.limit_bytes.is_none(), |budget| {
+                        budget == &account.budget
+                    })
+            })
     }
 }
