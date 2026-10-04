@@ -6,7 +6,8 @@ StartLimitBurst=5
 
 [Service]
 Type=exec
-ExecStart=/usr/local/libexec/relaydeck broker /etc/relaydeck/broker.json
+ExecStartPre=/usr/local/libexec/relaydeck prepare-broker-policy /etc/relaydeck/broker.json /var/lib/relaydeck/runtime/broker-effective.json
+ExecStart=/usr/local/libexec/relaydeck broker /var/lib/relaydeck/runtime/broker-effective.json
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=45

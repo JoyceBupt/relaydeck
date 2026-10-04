@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::{io::AsyncWriteExt, process::Command, sync::Mutex};
 
 use crate::{
@@ -75,9 +75,11 @@ where
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrokerPolicy {
+    #[serde(default = "legacy_port_policy_version")]
+    pub port_policy_version: u32,
     pub database: PathBuf,
     pub web_uid: u32,
     #[serde(default)]
@@ -99,6 +101,10 @@ pub struct BrokerPolicy {
     pub limits: ResourceLimits,
 }
 
+fn legacy_port_policy_version() -> u32 {
+    1
+}
+
 fn default_socket() -> PathBuf {
     "/run/relaydeck/broker.sock".into()
 }
@@ -106,7 +112,7 @@ fn default_authorization_ttl() -> u64 {
     120
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ResourceLimits {
     pub memory_high_mb: u64,
@@ -134,6 +140,10 @@ impl Default for ResourceLimits {
 
 impl BrokerPolicy {
     pub fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            matches!(self.port_policy_version, 1 | 2),
+            "unsupported port policy version"
+        );
         ensure!(self.web_uid != 0, "web_uid must not be root");
         ensure!(self.web_gid != Some(0), "web_gid must not be root");
         ensure!(
@@ -228,6 +238,48 @@ impl BrokerPolicy {
             reserved_ports,
             local_ips,
         }
+    }
+}
+
+/// Old panel updaters keep executing their already-imported Python module.
+/// Preparing the new policy in ExecStartPre also covers that first upgrade;
+/// the original policy stays usable by the old units during rollback.
+pub fn prepare_broker_policy(source: &Path, destination: &Path) -> anyhow::Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (source, destination);
+        anyhow::bail!("broker policy preparation requires Linux root");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        ensure!(
+            unsafe { libc::geteuid() } == 0,
+            "policy preparation requires root"
+        );
+        secure_root_path(source, false)?;
+        ensure!(
+            std::fs::metadata(source)?.len() <= 16 * 1024,
+            "broker policy too large"
+        );
+        let mut policy: BrokerPolicy = serde_json::from_slice(&std::fs::read(source)?)?;
+        policy.validate()?;
+        ensure!(
+            destination == policy.runtime_dir.join("broker-effective.json")
+                && source != destination,
+            "effective policy must use its dedicated runtime path"
+        );
+        match std::fs::symlink_metadata(destination) {
+            Ok(_) => secure_root_path(destination, false)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error.into()),
+        }
+        if policy.port_policy_version == 1 {
+            policy.allowed_port_start = 1024;
+            policy.allowed_port_end = 65535;
+            policy.port_policy_version = 2;
+        }
+        policy.validate()?;
+        write_root_file(destination, &serde_json::to_vec_pretty(&policy)?, 0o644, 0)
     }
 }
 

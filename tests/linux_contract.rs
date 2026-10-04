@@ -7,6 +7,7 @@ use relaydeck::{
 
 fn policy() -> BrokerPolicy {
     BrokerPolicy {
+        port_policy_version: 2,
         database: "/var/lib/relaydeck/relaydeck.db".into(),
         web_uid: 999,
         web_gid: None,
