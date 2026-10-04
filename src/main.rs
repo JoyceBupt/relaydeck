@@ -17,6 +17,18 @@ async fn main() -> anyhow::Result<()> {
         );
         return Ok(());
     }
+    if let [command, address] = arguments.as_slice()
+        && command == "probe-tcp"
+    {
+        #[cfg(unix)]
+        anyhow::ensure!(
+            unsafe { libc::geteuid() } != 0,
+            "connectivity probes must run without root"
+        );
+        let result = relaydeck::connectivity::tcp(address.parse()?).await;
+        println!("{}", serde_json::to_string(&result)?);
+        return Ok(());
+    }
     if let [command, realm, config, expires_at, uid] = arguments.as_slice()
         && command == "tenant"
     {

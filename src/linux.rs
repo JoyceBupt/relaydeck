@@ -1091,6 +1091,82 @@ fn write_root_file(path: &Path, bytes: &[u8], mode: u32, group: u32) -> anyhow::
 }
 
 impl LinuxDriver {
+    #[cfg(target_os = "linux")]
+    pub async fn check_rule(
+        &self,
+        request: &crate::connectivity::CheckRequest,
+    ) -> anyhow::Result<crate::connectivity::RuleCheck> {
+        let plans = self.plans.lock().await;
+        let plan = plans
+            .get(&request.owner_id)
+            .context("account is not running")?;
+        ensure!(
+            plan.revision() == request.revision,
+            "connectivity revision changed"
+        );
+        let addresses = interface_ips().await?;
+        let validated = plan.validate_again(
+            &self.policy.boundary(
+                self.policy
+                    .local_ips
+                    .iter()
+                    .copied()
+                    .chain(addresses)
+                    .collect(),
+            ),
+            now(),
+        )?;
+        let rule = validated
+            .rules()
+            .iter()
+            .find(|rule| rule.id == request.rule_id)
+            .context("rule is not running")?;
+        let held = tenant_kernel_listeners(&self.policy)?;
+        let listening = |tcp: bool| {
+            held.iter().any(|(kind, port)| {
+                *port == rule.listen_port && if tcp { kind.tcp() } else { kind.udp() }
+            })
+        };
+        let mut result = crate::connectivity::RuleCheck {
+            rule_id: rule.id,
+            revision: plan.revision(),
+            target_ip: rule.target_ip,
+            target_port: rule.target_port,
+            checked_at: now(),
+            tcp_listener: rule.protocol.tcp().then(|| listening(true)),
+            udp_listener: rule.protocol.udp().then(|| listening(false)),
+            target_tcp: None,
+        };
+        #[cfg(target_os = "linux")]
+        if rule.protocol.tcp() {
+            let uid = self.policy.uid(plan.owner_id())?;
+            let mut child = Command::new(&self.policy.runner_binary);
+            child
+                .arg("probe-tcp")
+                .arg(std::net::SocketAddr::new(rule.target_ip, rule.target_port).to_string())
+                .uid(uid)
+                .gid(uid)
+                .env_clear()
+                .kill_on_drop(true);
+            unsafe {
+                child.pre_exec(|| {
+                    if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let output = tokio::time::timeout(Duration::from_secs(3), child.output())
+                .await
+                .context("connectivity child timed out")??;
+            ensure!(
+                output.status.success() && output.stdout.len() <= 512,
+                "connectivity child failed"
+            );
+            result.target_tcp = Some(serde_json::from_slice(&output.stdout)?);
+        }
+        Ok(result)
+    }
     pub async fn new(policy: BrokerPolicy) -> anyhow::Result<Self> {
         policy.validate()?;
         #[cfg(not(target_os = "linux"))]

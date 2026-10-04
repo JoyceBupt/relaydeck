@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
+import { useMutation } from '@tanstack/vue-query'
 import { useSwipe } from '@vueuse/core'
 import { TagsInputInput, TagsInputItem, TagsInputItemDelete, TagsInputItemText, TagsInputRoot } from 'reka-ui'
 import { RotateCw, Trash2, X } from '@lucide/vue'
@@ -11,6 +12,7 @@ import Segmented from './Segmented.vue'
 import UiSwitch from './UiSwitch.vue'
 import ConfirmDialog from './ConfirmDialog.vue'
 import { ApiError, errorMessage, isStaleError } from '../api/client'
+import { api } from '../api/endpoints'
 import type { Health, Protocol, Rule, RuleInput, User } from '../types'
 import { currentUser, isAdmin } from '../lib/session'
 import { sharedToggle, useDeleteRule, usePorts, useRetry, useSaveRule } from '../lib/queries'
@@ -141,6 +143,20 @@ const save = useSaveRule()
 const remove = useDeleteRule()
 const toggle = sharedToggle()
 const retry = useRetry()
+const check = useMutation({ mutationFn: (id: number) => api.checkRule(id) })
+const checkError = ref('')
+watch(() => [props.ruleId, rule.value?.updated_at, rule.value?.runtime_status], () => { check.reset(); checkError.value = '' })
+const checkResult = computed(() => {
+  const result = check.data.value
+  return result && rule.value && result.rule_id === rule.value.id && result.target_ip === rule.value.target_ip && result.target_port === rule.value.target_port && !dirty.value ? result : null
+})
+async function runCheck() {
+  if (!rule.value || dirty.value || check.isPending.value) return
+  const id = rule.value.id
+  checkError.value = ''
+  try { await check.mutateAsync(id) } catch (error) { if (!isStaleError(error) && rule.value?.id === id) checkError.value = errorMessage(error) }
+}
+const targetCheckLabels = { connected: '已连通', timeout: '连接超时', refused: '连接被拒绝', unreachable: '无法连接' }
 
 async function submit() {
   submitted.value = true
@@ -249,12 +265,23 @@ defineExpose({ dirty })
             <StatusMark :status="rule.runtime_status" />
             <span class="font-medium" :class="rule.runtime_status === 'failed' ? 'text-danger' : 'text-fg'">{{ runtime.title }}</span>
             <span v-if="runtime.detail" class="text-sm text-muted">{{ runtime.detail }}</span>
+            <button v-if="rule.runtime_status === 'active'" type="button" class="btn btn-secondary btn-sm ml-auto" :disabled="dirty || check.isPending.value" @click="runCheck">
+              <RotateCw class="size-3.5" :class="check.isPending.value ? 'anim-spin' : ''" />{{ check.isPending.value ? '检测中' : '检测' }}
+            </button>
             <button v-if="rule.runtime_status === 'failed'" type="button" class="btn btn-secondary btn-sm ml-auto" :disabled="retry.isPending.value" @click="retry.mutate(rule.owner_id)">
               <RotateCw class="size-3.5" :class="retry.isPending.value ? 'anim-spin' : ''" />重试
             </button>
           </div>
           <p v-if="rule.runtime_error" class="font-mono text-xs text-danger [overflow-wrap:anywhere]">{{ rule.runtime_error }}</p>
           <p v-if="rule.dns_error" class="text-xs text-warning [overflow-wrap:anywhere]">目标解析失败：{{ rule.dns_error }}</p>
+          <p v-if="checkError" class="field-error" role="alert">{{ checkError }}</p>
+          <dl v-if="checkResult" class="mt-3 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-sm" aria-label="连通性结果" aria-live="polite">
+            <template v-if="checkResult.tcp_listener !== null"><dt class="text-muted">入口 TCP</dt><dd :class="checkResult.tcp_listener ? 'text-success' : 'text-danger'">{{ checkResult.tcp_listener ? '监听正常' : '未监听' }}</dd></template>
+            <template v-if="checkResult.udp_listener !== null"><dt class="text-muted">入口 UDP</dt><dd :class="checkResult.udp_listener ? 'text-success' : 'text-danger'">{{ checkResult.udp_listener ? '监听正常' : '未监听' }}</dd></template>
+            <template v-if="checkResult.target_tcp"><dt class="text-muted">目标 TCP</dt><dd :class="checkResult.target_tcp.status === 'connected' ? 'text-success' : 'text-danger'">{{ targetCheckLabels[checkResult.target_tcp.status] }}<span v-if="checkResult.target_tcp.status === 'connected'" class="ml-2 text-muted tabular">{{ checkResult.target_tcp.elapsed_ms }} ms</span></dd></template>
+            <template v-if="checkResult.udp_listener !== null"><dt class="text-muted">目标 UDP</dt><dd class="text-muted">无法通用验证</dd></template>
+            <dt class="text-muted">检测时间</dt><dd class="text-muted tabular">{{ dateTime(checkResult.checked_at) }}</dd>
+          </dl>
         </section>
 
         <form id="rule-form" class="grid gap-5" novalidate @submit.prevent="submit">

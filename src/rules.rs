@@ -8,7 +8,7 @@ use axum::{
     Json, Router,
     extract::{Path, State},
     http::StatusCode,
-    routing::{get, put},
+    routing::{get, post, put},
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{Executor, Sqlite};
@@ -412,6 +412,53 @@ async fn list_rules(
     ))
 }
 
+async fn check_rule(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::connectivity::RuleCheck>, ApiError> {
+    auth.ready()?;
+    let rule = load_rule(&state.pool, &auth.user, id).await?;
+    if rule.runtime_status != "active" {
+        return Err(ApiError::conflict("转发尚未运行"));
+    }
+    crate::api::mutation_limit(&state, auth.user.id, "rule_check", 6).await?;
+    let revision: i64 = sqlx::query_scalar("SELECT desired_revision FROM users WHERE id=?")
+        .bind(rule.owner_id)
+        .fetch_one(&state.pool)
+        .await?;
+    let request = crate::connectivity::CheckRequest {
+        owner_id: rule.owner_id,
+        revision,
+        rule_id: id,
+    };
+    let result = tokio::time::timeout(Duration::from_secs(12), state.connectivity.check(request))
+        .await
+        .map_err(|_| ApiError::unavailable())?
+        .map_err(|error| {
+            tracing::warn!(rule_id=id,%error,"connectivity check unavailable");
+            ApiError::unavailable()
+        })?;
+    let mut tx = state.pool.begin_with("BEGIN IMMEDIATE").await?;
+    let actor = write_actor(&mut tx, &auth).await?;
+    let current = load_rule(&mut *tx, &actor, id).await?;
+    let current_revision: i64 = sqlx::query_scalar("SELECT desired_revision FROM users WHERE id=?")
+        .bind(rule.owner_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if current.runtime_status != "active"
+        || current_revision != revision
+        || current.target_ip != result.target_ip.to_string()
+        || current.target_port != i64::from(result.target_port)
+        || result.rule_id != id
+        || result.revision != revision
+    {
+        return Err(ApiError::conflict("转发已变更，请重新检测"));
+    }
+    tx.commit().await?;
+    Ok(Json(result))
+}
+
 async fn create_rule(
     State(state): State<AppState>,
     auth: AuthContext,
@@ -579,4 +626,5 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/rules", get(list_rules).post(create_rule))
         .route("/api/rules/{id}", put(update_rule).delete(delete_rule))
+        .route("/api/rules/{id}/check", post(check_rule))
 }
