@@ -1803,7 +1803,20 @@ mod shared_port_kernel_tests {
         let owner = dir.path().join("owner-1");
         std::fs::create_dir(&owner).unwrap();
         let host = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let script = "import socket,json,sys\na=socket.socket();a.bind(('127.0.0.1',0));a.listen()\nb=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);b.bind(('127.0.0.1',0))\nc=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);c.bind(('127.0.0.1',0))\nprint(json.dumps([a.getsockname()[1],b.getsockname()[1],c.getsockname()[1]]),flush=True)\nsys.stdin.read(1)";
+        let script = r#"import socket,json,sys
+a=socket.socket();a.bind(('127.0.0.1',0));a.listen()
+sockets=[a];ports=[a.getsockname()[1]]
+for _ in range(2):
+ for attempt in range(3):
+  s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(('127.0.0.1',0))
+  port=s.getsockname()[1]
+  if port not in ports:
+   sockets.append(s);ports.append(port);break
+  s.close()
+ else: raise RuntimeError('cannot allocate distinct fixture ports')
+print(json.dumps(ports),flush=True)
+sys.stdin.read(1)
+"#;
         let mut child = Process(
             Command::new("setpriv")
                 .args([
