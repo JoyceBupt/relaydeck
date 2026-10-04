@@ -9,7 +9,7 @@
   "authorization_ttl_secs": 120,
   "allowed_port_start": 40000,
   "allowed_port_end": 60000,
-  "reserved_ports": [22, 80, 443, 7410],
+  "reserved_ports": [22, 80, 443, 7410, 17443],
   "local_ips": [],
   "uid_start": 60000,
   "max_owners": 11,

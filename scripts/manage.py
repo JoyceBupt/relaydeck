@@ -33,6 +33,39 @@ ALL_UNITS = (*UNITS, UPGRADE_UNIT)
 TRANSACTION = STATE / 'upgrade-transaction.json'
 ENV_KEYS = {'RELAYDECK_DATABASE', 'RELAYDECK_MFA_KEY', 'RELAYDECK_LISTEN', 'RELAYDECK_ORIGIN', 'RELAYDECK_TRUST_PROXY', 'RELAYDECK_FRONTEND'}
 SAFE_ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8'}
+DEFAULT_PANEL_PORT = 17443
+CADDY_ORIGIN = 'https://panel.example.com:17443'
+
+
+def deployment_origin(value, default_port=DEFAULT_PANEL_PORT):
+    # Validate the raw string before urlsplit can strip control characters.
+    if not re.fullmatch(r'https://[A-Za-z0-9.-]+(?::[0-9]{1,5})?/?', value):
+        raise ValueError('Provide an HTTPS domain origin with an optional port')
+    url = urllib.parse.urlsplit(value)
+    host = url.hostname
+    if len(host) > 253 or any(not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', label) for label in host.split('.')):
+        raise ValueError('Invalid panel domain')
+    port = url.port if url.port is not None else default_port
+    if type(port) is not int or not (port == 443 or 1024 <= port <= 65535) or port == 7410:
+        raise ValueError('Panel port must be 443 or 1024..65535, excluding backend port 7410')
+    origin = f'https://{host}' + (f':{port}' if port != 443 else '')
+    return origin, port
+
+
+def caddy_configuration(template, origin):
+    # Replace the complete authority so custom ports cannot produce two colons.
+    if template.count(CADDY_ORIGIN) != 1:
+        raise ValueError('Unexpected release Caddy template')
+    return template.replace(CADDY_ORIGIN, origin)
+
+
+def reserve_control_ports(policy, origin):
+    # A legacy origin without a port means 443, even after the default changes.
+    _, port = deployment_origin(origin, default_port=443)
+    ports = policy['reserved_ports']
+    if not isinstance(ports, list) or any(type(item) is not int or not 1 <= item <= 65535 for item in ports):
+        raise ValueError('Invalid reserved control ports')
+    policy['reserved_ports'] = sorted(set(ports) | {22, 80, 443, 7410, port})
 
 
 def run(*args, env=None, capture=False):
@@ -274,10 +307,14 @@ def manage_lock():
     return os.fdopen(descriptor, 'w')
 
 
-def merged_port_reservations(existing, start, end):
+def merged_port_reservations(existing, start, end, control_ports=()):
     if not 1024 <= start <= end <= 65535:
         raise ValueError('Invalid forwarding port range')
     ranges = [(start, end)]
+    for port in control_ports:
+        if type(port) is not int or not 1 <= port <= 65535:
+            raise ValueError('Invalid reserved control port')
+        ranges.append((port, port))
     for item in existing.strip().split(',') if existing.strip() else []:
         if not re.fullmatch(r'[0-9]+(?:-[0-9]+)?', item):
             raise ValueError('Invalid existing port reservations')
@@ -300,7 +337,7 @@ def reserve_forwarding_ports(policy):
     # Preserve every existing reservation, including those of other services.
     current = pathlib.Path('/proc/sys/net/ipv4/ip_local_reserved_ports')
     existing = current.read_text().strip()
-    desired = merged_port_reservations(existing, policy['allowed_port_start'], policy['allowed_port_end'])
+    desired = merged_port_reservations(existing, policy['allowed_port_start'], policy['allowed_port_end'], policy['reserved_ports'])
     path = pathlib.Path('/etc/sysctl.d/zz-relaydeck-ports.conf')
     root_path(path.parent)
     if path.exists() or path.is_symlink():
@@ -330,14 +367,13 @@ def install(args):
     preflight()
     if any(path.exists() or path.is_symlink() for path in (CONFIG, STATE, CURRENT, BIN, BIN.with_name('realm'), MANAGER, UPDATER)):
         raise ValueError('Existing installation detected; use update or migrate explicitly')
-    url = urllib.parse.urlsplit(args.origin)
-    if url.scheme != 'https' or not url.hostname or url.username or url.password or url.path not in ('', '/') or url.query or url.fragment or not re.fullmatch('[a-zA-Z0-9.-]+', url.netloc):
-        raise ValueError('Provide a plain HTTPS domain origin')
+    origin, _ = deployment_origin(args.origin)
     if not re.fullmatch('[A-Za-z][A-Za-z0-9_-]{2,31}', args.admin):
         raise ValueError('Invalid administrator name')
     with tempfile.TemporaryDirectory(prefix='relaydeck-install-') as work:
         stage = pathlib.Path(work) / 'release'
         manifest = prepare(args, stage)
+        caddy = caddy_configuration((stage / 'deploy/Caddyfile.example').read_text(), origin)
         with verified_file(args.realm, args.realm_sha256) as realm:
             header = realm.read(20)
             machine = 183 if manifest['target'].startswith('aarch64') else 62
@@ -387,20 +423,21 @@ def install(args):
         current_link(release)
         policy = json.loads((release / 'deploy/broker.example.json').read_text())
         policy.update(web_uid=account.pw_uid, web_gid=account.pw_gid)
+        reserve_control_ports(policy, origin)
         (CONFIG / 'broker.json').write_text(json.dumps(policy, indent=2) + '\n')
         (CONFIG / 'broker.json').chmod(0o644)
         environment = {
             'RELAYDECK_DATABASE': str(STATE / 'data/relaydeck.db'),
             'RELAYDECK_MFA_KEY': str(STATE / 'secrets/mfa.key'),
             'RELAYDECK_LISTEN': '127.0.0.1:7410',
-            'RELAYDECK_ORIGIN': args.origin.rstrip('/'),
+            'RELAYDECK_ORIGIN': origin,
             'RELAYDECK_TRUST_PROXY': 'true',
             'RELAYDECK_FRONTEND': str(CURRENT / 'frontend'),
         }
         (CONFIG / 'relaydeck.env').write_text(''.join(f'{key}={value}\n' for key, value in environment.items()))
         os.chown(CONFIG / 'relaydeck.env', 0, account.pw_gid)
         (CONFIG / 'relaydeck.env').chmod(0o640)
-        (CONFIG / 'Caddyfile').write_text((release / 'deploy/Caddyfile.example').read_text().replace('panel.example.com', url.netloc))
+        (CONFIG / 'Caddyfile').write_text(caddy)
         (CONFIG / 'Caddyfile').chmod(0o644)
         reservations = reserve_forwarding_ports(policy)
         hashes = {}
@@ -418,6 +455,7 @@ def install(args):
         run('systemctl', 'enable', '--now', *ALL_UNITS)
         wait_health(manifest['version'])
         print('Installed. Import /etc/relaydeck/Caddyfile into your Caddy configuration before public use. Updates: sudo relaydeck-update --bundle <release.tar.gz> --sha256 <trusted-digest>')
+        print(f'Panel: {origin} (open its TCP port and TCP 80 for certificate issuance/renewal).')
 
 
 
@@ -524,6 +562,12 @@ def update(args, progress=lambda step: None):
         policy = json.loads((CONFIG / 'broker.json').read_text())
         if not 64 <= policy['limits']['tasks'] <= 256:
             raise ValueError('Set limits.tasks to 64..256 in /etc/relaydeck/broker.json before upgrading the per-rule supervisor (default: 96)')
+        previous_ports = list(policy['reserved_ports'])
+        reserve_control_ports(policy, read_environment().get('RELAYDECK_ORIGIN', ''))
+        # Only add control-port exclusions; keep the existing origin, proxy and
+        # other policy settings intact, including when an upgrade rolls back.
+        if policy['reserved_ports'] != previous_ports:
+            atomic_json(CONFIG / 'broker.json', policy, 0o644)
         record['port_reservations'] = reserve_forwarding_ports(policy)
         ensure_upgrade_policy()
         release = RELEASES / release_name(manifest)
@@ -612,7 +656,7 @@ def main():
         if name == 'install':
             sub.add_argument('--realm', type=pathlib.Path, required=True)
             sub.add_argument('--realm-sha256', required=True)
-            sub.add_argument('--origin', required=True)
+            sub.add_argument('--origin', required=True, help='HTTPS domain[:port]; new installations default to port 17443')
             sub.add_argument('--admin', required=True)
     commands.add_parser('recover')
     sub = commands.add_parser('package')
