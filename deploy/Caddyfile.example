@@ -1,4 +1,9 @@
-panel.example.com {
+https://panel.example.com:17443 {
+    tls {
+        issuer acme {
+            disable_tlsalpn_challenge
+        }
+    }
     reverse_proxy 127.0.0.1:7410 {
         header_up X-RelayDeck-Client-IP {remote_host}
     }

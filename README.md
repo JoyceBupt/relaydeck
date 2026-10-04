@@ -30,10 +30,10 @@ tar -xzf "$BUNDLE"
 sudo python3 deploy/manage.py install \
   --bundle "$BUNDLE" --sha256 "$(cut -d ' ' -f1 "$BUNDLE.sha256")" \
   --realm ./realm --realm-sha256 'REALM_SHA256' \
-  --origin https://panel.example.com --admin admin
+  --origin https://panel.example.com:17443 --admin admin
 ```
 
-安装时交互设置密码。将 `import /etc/relaydeck/Caddyfile` 加入现有 Caddy 配置，验证后重载；域名指向服务器，开放 80/443 及分配的转发端口。
+安装时交互设置密码。将 `import /etc/relaydeck/Caddyfile` 加入现有 Caddy 配置，验证后重载。面板默认 HTTPS `17443`，可在 `--origin` 指定其他端口；升级保留原端口。开放面板 TCP 端口、证书验证所需的 TCP 80 及转发端口；443 可供其他服务使用。Cloudflare 域名设为“仅 DNS”，访问网址须带高位端口。
 
 数据位于 `/var/lib/relaydeck`，配置位于 `/etc/relaydeck`。调整 `broker.json` 中的端口与资源预算以适配主机；systemd 自定义项使用 drop-in。备份需同时保留一致的数据库与 MFA 密钥。
 

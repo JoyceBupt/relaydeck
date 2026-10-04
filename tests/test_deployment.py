@@ -7,6 +7,8 @@ import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
+from contextlib import ExitStack, nullcontext
 
 MODULE = pathlib.Path(__file__).resolve().parents[1] / 'scripts/manage.py'
 spec = importlib.util.spec_from_file_location('relaydeck_manage', MODULE)
@@ -104,11 +106,94 @@ class PortReservations(unittest.TestCase):
             with self.subTest(value=value),self.assertRaises(ValueError):
                 manage.merged_port_reservations(value,40000,60000)
 
+    def test_panel_backend_and_existing_service_ports_are_all_reserved(self):
+        policy = {'reserved_ports': [8080, 22, 80, 443, 7410]}
+        manage.reserve_control_ports(policy, 'https://panel.example.com:17443')
+        self.assertEqual(manage.merged_port_reservations('30000-30002', 40000, 40999, policy['reserved_ports']),
+                         '22,80,443,7410,8080,17443,30000-30002,40000-40999')
+        for invalid in (0, 65536, True, '17443'):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                manage.merged_port_reservations('', 40000, 40999, [invalid])
+
     def test_unattended_upgrade_requires_interruption_acknowledgement(self):
         with patch.object(manage.sys.stdin,'isatty',return_value=False),patch('builtins.print'):
             with self.assertRaisesRegex(ValueError,'--yes'):
                 manage.confirm_update(False)
             manage.confirm_update(True)
+
+
+class PanelOrigin(unittest.TestCase):
+    def test_default_custom_and_legacy_https_origins(self):
+        self.assertEqual(manage.deployment_origin('https://Panel.Example.com/'), ('https://panel.example.com:17443', 17443))
+        self.assertEqual(manage.deployment_origin('https://panel.example.com:50005'), ('https://panel.example.com:50005', 50005))
+        self.assertEqual(manage.deployment_origin('https://panel.example.com:443'), ('https://panel.example.com', 443))
+        self.assertEqual(manage.deployment_origin('https://panel.example.com', default_port=443), ('https://panel.example.com', 443))
+
+    def test_unsafe_origins_fail_before_installation_mutates_anything(self):
+        values = ['http://panel.example.com', 'https://panel.example.com:0', 'https://panel.example.com:65536',
+                  'https://panel.example.com:7410', 'https://panel.example.com:80', 'https://user@panel.example.com',
+                  'https://panel.example.com/path', 'https://panel.example.com?x=1', 'https://panel.example.com#x',
+                  'https://panel.example.com\nimport /etc/passwd', 'https://panel.example.com\r',
+                  'https://panel.example.com:\t17443', 'https://-panel.example.com', 'https://panel..example.com']
+        with patch.object(manage, 'preflight'), patch.object(manage, 'prepare') as prepare, patch.object(manage, 'run') as run:
+            for value in values:
+                with self.subTest(value=value), self.assertRaises(ValueError):
+                    manage.install(SimpleNamespace(origin=value))
+            prepare.assert_not_called()
+            run.assert_not_called()
+
+    def test_generated_caddy_address_matches_canonical_origin(self):
+        template = (MODULE.parent.parent / 'deploy/Caddyfile.example').read_text()
+        for value, address in [('https://panel.example.com', 'https://panel.example.com:17443'),
+                               ('https://Custom.Example.com:50005/', 'https://custom.example.com:50005'),
+                               ('https://panel.example.com:443', 'https://panel.example.com')]:
+            with self.subTest(value=value):
+                origin, _ = manage.deployment_origin(value)
+                text = manage.caddy_configuration(template, origin)
+                self.assertTrue(text.startswith(address + ' {'))
+                self.assertIn('disable_tlsalpn_challenge', text)
+                self.assertIn('header_up X-RelayDeck-Client-IP {remote_host}', text)
+        with self.assertRaises(ValueError):
+            manage.caddy_configuration('unexpected template', 'https://panel.example.com:17443')
+
+    def test_upgrade_preserves_existing_origin_and_caddy_while_excluding_control_port(self):
+        for origin, panel_port in [('https://panel.example.com', 443), ('https://panel.example.com:50005', 50005)]:
+            with self.subTest(origin=origin), tempfile.TemporaryDirectory() as work, ExitStack() as patches:
+                root = pathlib.Path(work).resolve()
+                config = root / 'config'; config.mkdir()
+                state = root / 'state'; state.mkdir()
+                releases = root / 'releases'; releases.mkdir()
+                previous = releases / 'old'; previous.mkdir()
+                current = root / 'current'; current.symlink_to(previous)
+                environment = ('RELAYDECK_DATABASE=' + str(state / 'data/relaydeck.db') + '\nRELAYDECK_MFA_KEY=' + str(state / 'secrets/mfa.key') + '\nRELAYDECK_ORIGIN=' + origin + '\n')
+                (config / 'relaydeck.env').write_text(environment)
+                (config / 'Caddyfile').write_text('custom existing proxy config\n')
+                (config / 'installation.json').write_text('{"units":{}}')
+                policy = {'limits': {'tasks': 96}, 'allowed_port_start': 40000, 'allowed_port_end': 60000,
+                          'reserved_ports': [22, 80, 443, 7410], 'custom_field': 'preserve'}
+                (config / 'broker.json').write_text(json.dumps(policy))
+                calls = []
+                def prepare_release(_, stage):
+                    stage.mkdir()
+                    return {'version': '0.2.0', 'revision': 'abcdef1', 'target': 'x86_64-unknown-linux-gnu'}
+                for name, value in [('CONFIG', config), ('STATE', state), ('CURRENT', current), ('RELEASES', releases),
+                                    ('TRANSACTION', state / 'transaction.json'), ('ALL_UNITS', ()),
+                                    ('root_path', lambda _: None), ('preflight', lambda: None), ('confirm_update', lambda _: None),
+                                    ('manage_lock', nullcontext), ('prepare', prepare_release),
+                                    ('reserve_forwarding_ports', lambda policy: calls.append(policy.copy()) or {}),
+                                    ('ensure_upgrade_policy', lambda: None), ('management_tools', lambda _: None),
+                                    ('current_link', lambda _: None), ('as_web', lambda *_: None),
+                                    ('atomic_json', lambda path, value, mode=0o600: path.write_text(json.dumps(value))),
+                                    ('atomic_copy', lambda *_: None), ('run', lambda *_: None), ('wait_health', lambda _: None)]:
+                    patches.enter_context(patch.object(manage, name, value))
+                manage.update(SimpleNamespace(yes=True))
+                self.assertEqual((config / 'relaydeck.env').read_text(), environment)
+                self.assertEqual((config / 'Caddyfile').read_text(), 'custom existing proxy config\n')
+                installed = json.loads((config / 'broker.json').read_text())
+                self.assertIn(panel_port, installed['reserved_ports'])
+                self.assertEqual(installed['custom_field'], 'preserve')
+                self.assertIn(panel_port, calls[0]['reserved_ports'])
+                self.assertFalse((state / 'transaction.json').exists())
 
 
 class CachedRelease(unittest.TestCase):

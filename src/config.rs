@@ -65,6 +65,11 @@ impl Config {
             secure_cookie || (url.scheme() == "http" && local_origin && listen.ip().is_loopback()),
             "HTTP is supported only on loopback; configure an HTTPS public origin for deployment"
         );
+        let public_port = url.port_or_known_default().filter(|port| *port != 0);
+        anyhow::ensure!(
+            public_port.is_some(),
+            "RELAYDECK_ORIGIN requires a valid port"
+        );
         let parse_ports = |s: &str| -> anyhow::Result<Vec<u16>> {
             s.split(',')
                 .filter(|p| !p.trim().is_empty())
@@ -75,6 +80,7 @@ impl Config {
             &std::env::var("RELAYDECK_RESERVED_PORTS").unwrap_or_else(|_| "22,80,443".into()),
         )?;
         reserved_ports.extend([22, 80, 443, listen.port()]);
+        reserved_ports.extend(public_port);
         reserved_ports.sort_unstable();
         reserved_ports.dedup();
         let local_ips = std::env::var("RELAYDECK_LOCAL_IPS")

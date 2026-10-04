@@ -14,7 +14,7 @@ use tower::ServiceExt;
 const ADMIN_PASSWORD: &str = "only-testing-admin-password";
 const INITIAL_PASSWORD: &str = "only-testing-initial-password";
 const USER_PASSWORD: &str = "only-testing-user-password";
-const ORIGIN: &str = "https://relaydeck.test";
+const ORIGIN: &str = "https://relaydeck.test:17443";
 
 struct Login {
     cookie: String,
