@@ -10,12 +10,12 @@ function update(value: unknown) { if (typeof value === 'string' && value) model.
 <template>
   <ToggleGroupRoot
     type="single" :model-value="model" :aria-label="label" :disabled="disabled"
-    class="inline-flex max-w-full items-center gap-0.5 overflow-x-auto rounded-xl border border-line bg-surface p-[3px] shadow-[var(--shadow-card)] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+    class="inline-flex max-w-full items-center gap-0.5 overflow-x-auto rounded-[10px] bg-fill p-[3px] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
     @update:model-value="update"
   >
     <ToggleGroupItem
       v-for="option in options" :key="option.value" :value="option.value"
-      class="inline-flex shrink-0 items-center gap-1.5 rounded-[9px] border border-transparent px-3 font-medium whitespace-nowrap text-muted transition-[color,background-color,border-color] duration-200 hover:text-fg data-[state=on]:border-line-strong data-[state=on]:bg-surface-2 data-[state=on]:text-fg data-[state=on]:shadow-[0_1px_2px_rgb(0_0_0/0.06)]"
+      class="inline-flex shrink-0 items-center gap-1.5 rounded-lg px-3 font-medium whitespace-nowrap text-muted transition-[color,background-color,box-shadow] duration-200 hover:text-fg data-[state=on]:bg-[var(--raised)] data-[state=on]:text-fg data-[state=on]:shadow-[0_1px_2px_rgb(0_0_0/0.08),0_0_0_0.5px_rgb(0_0_0/0.04)]"
       :class="size === 'sm' ? 'h-7 text-xs' : 'h-8 text-sm'"
     >
       {{ option.label }}
