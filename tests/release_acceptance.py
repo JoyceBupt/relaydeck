@@ -45,7 +45,11 @@ def main():
     checksum = archive.with_name(archive.name + '.sha256').read_text().split()[0]
     with tempfile.TemporaryDirectory(prefix='relaydeck-release-acceptance-') as directory:
         stage = pathlib.Path(directory) / 'release'
-        manifest = manage.prepare(SimpleNamespace(bundle=archive, sha256=checksum), stage)
+        previous_umask = os.umask(0o077)
+        try:
+            manifest = manage.prepare(SimpleNamespace(bundle=archive, sha256=checksum), stage)
+        finally:
+            os.umask(previous_umask)
         if manifest != {'version': version, 'revision': revision, 'target': target}:
             raise RuntimeError('Packaged release manifest differs from source')
         binary = stage / 'bin/relaydeck'
@@ -55,6 +59,7 @@ def main():
             raise RuntimeError('Executable requires a newer libc than the Debian 12 deployment baseline')
         environment = {**os.environ, 'PYTHONDONTWRITEBYTECODE': '1', 'RELAYDECK_POLICY_TEST': '1', 'RELAYDECK_TEST_BINARY': str(binary)}
         subprocess.run([sys.executable, str(SOURCE / 'tests/policy_preparation.py'), '-v'], env=environment, check=True)
+        subprocess.run([sys.executable, str(SOURCE / 'tests/frontend_preparation.py'), '-v'], env=environment, check=True)
         subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-s', str(SOURCE / 'tests'), '-p', 'test_legacy_update.py', '-v'], env=environment, check=True)
         print(f'Accepted {target}: binary={binary.stat().st_size} bytes, bundle={archive.stat().st_size} bytes, maximum GLIBC={".".join(map(str, max(glibc)))}', flush=True)
 
