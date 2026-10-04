@@ -439,7 +439,9 @@ async fn wireguard_peers() -> anyhow::Result<Vec<WireguardPeer>> {
     match std::fs::symlink_metadata(WG) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error.into()),
-        Ok(_) => system_tool(Path::new(WG))?,
+        Ok(_) => {
+            system_tool(Path::new(WG))?;
+        }
     }
     // Never use `dump` or `showconf`, both of which expose private keys.
     let marks = command(WG, &["show", "all", "fwmark"], None).await?;
@@ -946,7 +948,7 @@ fn validate_uid_pool(policy: &BrokerPolicy) -> anyhow::Result<()> {
 pub fn system_tool(path: &Path) -> anyhow::Result<PathBuf> {
     use std::os::unix::fs::MetadataExt;
     ensure!(
-        [SYSTEMCTL, NFT, SS, IP]
+        [SYSTEMCTL, NFT, SS, IP, WG]
             .iter()
             .any(|tool| Path::new(tool) == path),
         "unknown system tool"
