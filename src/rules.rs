@@ -184,12 +184,7 @@ fn validate_owner_rule(
     }
     // Administrators may prepare rules for a newly provisioned account before
     // its initial password change. The actor's ready state is still enforced.
-    policy::validate_listen_port(
-        input.listen_port,
-        owner.port_start,
-        owner.port_end,
-        &state.config.reserved_ports,
-    )?;
+    policy::validate_listen_port(input.listen_port, 1024, 65535, &state.config.reserved_ports)?;
     Ok(())
 }
 
@@ -220,7 +215,7 @@ where
     .fetch_one(executor)
     .await?;
     if owner_count >= owner.max_rules {
-        return Err(ApiError::conflict("规则数量已达上限"));
+        return Err(ApiError::conflict("端口额度已满"));
     }
     if total_count >= 30 {
         return Err(ApiError::conflict("总规则数已达30条"));
@@ -270,7 +265,62 @@ where
     if let Some((existing_owner, existing_rule)) = lease
         && (existing_owner != owner_id || Some(existing_rule) != rule_id)
     {
-        return Err(ApiError::conflict("端口已占用或待释放"));
+        return Err(ApiError {
+            status: StatusCode::CONFLICT,
+            code: "port_unavailable",
+            message: format!("端口 {port} 已占用或待释放，请更换端口"),
+        });
+    }
+    Ok(())
+}
+
+// This is a preflight, not a reservation. Database leases serialize panel
+// claims; the root broker checks kernel ownership again before touching nft.
+fn check_host_port(port: i64) -> Result<(), ApiError> {
+    for host in ["0.0.0.0", "::"] {
+        let address = format!("{host}:{port}");
+        let address = if host == "::" {
+            format!("[{host}]:{port}")
+        } else {
+            address
+        };
+        let address: std::net::SocketAddr = address.parse().map_err(|_| ApiError::unavailable())?;
+        for (kind, protocol) in [
+            (socket2::Type::STREAM, socket2::Protocol::TCP),
+            (socket2::Type::DGRAM, socket2::Protocol::UDP),
+        ] {
+            let result = (|| {
+                let socket = socket2::Socket::new(
+                    socket2::Domain::for_address(address),
+                    kind,
+                    Some(protocol),
+                )?;
+                socket.set_reuse_address(false)?;
+                if address.is_ipv6() {
+                    socket.set_only_v6(true)?;
+                }
+                socket.bind(&address.into())
+            })();
+            if let Err(error) = result {
+                if host == "::"
+                    && matches!(
+                        error.raw_os_error(),
+                        Some(libc::EAFNOSUPPORT | libc::EADDRNOTAVAIL)
+                    )
+                {
+                    continue;
+                }
+                if error.kind() == std::io::ErrorKind::AddrInUse {
+                    return Err(ApiError {
+                        status: StatusCode::CONFLICT,
+                        code: "port_unavailable",
+                        message: format!("端口 {port} 已占用，请更换端口"),
+                    });
+                }
+                tracing::warn!(%error, port, "cannot check listening port");
+                return Err(ApiError::unavailable());
+            }
+        }
     }
     Ok(())
 }
@@ -379,6 +429,7 @@ async fn create_rule(
     validate_owner_rule(&state, &owner, &input)?;
     check_create_quota(&state.pool, &owner).await?;
     check_lease(&state.pool, input.listen_port, owner.id, None).await?;
+    check_host_port(input.listen_port)?;
     let target_ip = resolve_target(&state, &input).await?;
     let source_cidrs =
         serde_json::to_string(&input.source_cidrs).map_err(|_| stored_data_error())?;
@@ -392,6 +443,7 @@ async fn create_rule(
     validate_owner_rule(&state, &owner, &input)?;
     check_create_quota(&mut *tx, &owner).await?;
     check_lease(&mut *tx, input.listen_port, owner.id, None).await?;
+    check_host_port(input.listen_port)?;
     let timestamp = now();
     let id = sqlx::query("INSERT INTO rules(owner_id,name,listen_port,target_host,target_ip,target_port,protocol,source_cidrs,enabled,created_at,updated_at,dns_checked_at,dns_resolved_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,unixepoch(),unixepoch())")
         .bind(owner.id)
@@ -436,6 +488,9 @@ async fn update_rule(
     validate_owner_rule(&state, &owner, &input)?;
     check_enabled_quota(&state.pool, &owner, id, input.enabled).await?;
     check_lease(&state.pool, input.listen_port, owner.id, Some(id)).await?;
+    if input.listen_port != existing.listen_port || (!existing.enabled && input.enabled) {
+        check_host_port(input.listen_port)?;
+    }
     let target_ip = if !input.enabled
         && input.target_host == existing.target_host
         && input.target_port == existing.target_port
@@ -460,6 +515,9 @@ async fn update_rule(
     validate_owner_rule(&state, &owner, &input)?;
     check_enabled_quota(&mut *tx, &owner, id, input.enabled).await?;
     check_lease(&mut *tx, input.listen_port, owner.id, Some(id)).await?;
+    if input.listen_port != current.listen_port || (!current.enabled && input.enabled) {
+        check_host_port(input.listen_port)?;
+    }
     sqlx::query("UPDATE rules SET name=?,listen_port=?,target_host=?,target_ip=?,target_port=?,protocol=?,source_cidrs=?,enabled=?,updated_at=?,dns_checked_at=unixepoch(),dns_resolved_at=unixepoch(),dns_error=NULL,dns_blocked=0 WHERE id=? AND deleted_at IS NULL")
         .bind(&input.name)
         .bind(input.listen_port)

@@ -13,7 +13,7 @@ pub enum PolicyError {
     RuleName,
     #[error("端口范围须在1024至65535内且起点不大于终点")]
     PortRange,
-    #[error("规则上限须在0至30之间")]
+    #[error("端口额度须在0至30之间")]
     RuleLimit,
     #[error("监听端口不在授权范围内")]
     PortOutsideGrant,

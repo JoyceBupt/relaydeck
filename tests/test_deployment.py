@@ -192,6 +192,7 @@ class PanelOrigin(unittest.TestCase):
                 installed = json.loads((config / 'broker.json').read_text())
                 self.assertIn(panel_port, installed['reserved_ports'])
                 self.assertEqual(installed['custom_field'], 'preserve')
+                self.assertEqual((installed['allowed_port_start'], installed['allowed_port_end']), (1024, 65535))
                 self.assertIn(panel_port, calls[0]['reserved_ports'])
                 self.assertFalse((state / 'transaction.json').exists())
 
@@ -216,6 +217,34 @@ class CachedRelease(unittest.TestCase):
             with self.assertRaises(ValueError): manage.verify_cached_release(cached, stage)
             (cached / 'extra').unlink(); (cached / 'app').unlink(); (cached / 'app').symlink_to(stage / 'app')
             with self.assertRaises(ValueError): manage.verify_cached_release(cached, stage)
+
+class SharedPortDeployment(unittest.TestCase):
+    def test_shared_pool_does_not_exhaust_outbound_ephemeral_ports(self):
+        self.assertEqual(manage.merged_port_reservations('40000-40999', control_ports=[22, 80, 443, 7410, 17443]),
+                         '22,80,443,7410,17443,40000-40999')
+        self.assertEqual(manage.merged_port_reservations('', control_ports=[7410, 17443]), '7410,17443')
+
+    def test_rollback_restores_the_previous_root_port_boundary(self):
+        with tempfile.TemporaryDirectory() as work, ExitStack() as patches:
+            root = pathlib.Path(work).resolve()
+            config = root / 'config'; config.mkdir()
+            releases = root / 'releases'; releases.mkdir()
+            previous = releases / 'old'; previous.mkdir()
+            release = releases / 'new'; release.mkdir()
+            (previous / 'release.json').write_text('{"version":"0.1.1"}')
+            policy = {'allowed_port_start':40000, 'allowed_port_end':40999, 'limits':{'tasks':96}, 'reserved_ports':[17443]}
+            (config / 'broker.json').write_text('{"allowed_port_start":1024,"allowed_port_end":65535}')
+            transaction = root / 'transaction.json'; transaction.write_text('{}')
+            for name, value in [('CONFIG', config), ('RELEASES', releases), ('TRANSACTION', transaction), ('ALL_UNITS', ()),
+                                ('root_path', lambda _: None), ('atomic_copy', lambda *_: None),
+                                ('current_link', lambda _: None), ('management_tools', lambda _: None),
+                                ('run', lambda *_: None), ('wait_health', lambda _: None),
+                                ('atomic_json', lambda path, value, mode=0o600: path.write_text(json.dumps(value)))]:
+                patches.enter_context(patch.object(manage, name, value))
+            manage.restore_transaction({'previous':str(previous), 'release':str(release), 'backup':None,
+                                        'installation':{'units':{}}, 'broker_policy':policy})
+            self.assertEqual(json.loads((config / 'broker.json').read_text()), policy)
+            self.assertFalse(transaction.exists())
 
 
 if __name__ == '__main__':

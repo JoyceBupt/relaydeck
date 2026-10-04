@@ -307,10 +307,12 @@ def manage_lock():
     return os.fdopen(descriptor, 'w')
 
 
-def merged_port_reservations(existing, start, end, control_ports=()):
-    if not 1024 <= start <= end <= 65535:
-        raise ValueError('Invalid forwarding port range')
-    ranges = [(start, end)]
+def merged_port_reservations(existing, start=None, end=None, control_ports=()):
+    ranges = []
+    if start is not None or end is not None:
+        if type(start) is not int or type(end) is not int or not 1024 <= start <= end <= 65535:
+            raise ValueError('Invalid forwarding port range')
+        ranges.append((start, end))
     for port in control_ports:
         if type(port) is not int or not 1 <= port <= 65535:
             raise ValueError('Invalid reserved control port')
@@ -337,7 +339,10 @@ def reserve_forwarding_ports(policy):
     # Preserve every existing reservation, including those of other services.
     current = pathlib.Path('/proc/sys/net/ipv4/ip_local_reserved_ports')
     existing = current.read_text().strip()
-    desired = merged_port_reservations(existing, policy['allowed_port_start'], policy['allowed_port_end'], policy['reserved_ports'])
+    # Reserve control ports only. Reserving the entire shared high-port pool
+    # would exhaust automatic outbound allocation. Actual binds and kernel
+    # ownership checks protect each selected forwarding port.
+    desired = merged_port_reservations(existing, control_ports=policy['reserved_ports'])
     path = pathlib.Path('/etc/sysctl.d/zz-relaydeck-ports.conf')
     root_path(path.parent)
     if path.exists() or path.is_symlink():
@@ -510,6 +515,8 @@ def restore_transaction(record):
     run('systemctl', 'reset-failed', *UNITS)
     # The service hashes correspond to the restored release as well.
     atomic_json(CONFIG / 'installation.json', record['installation'], 0o644)
+    if 'broker_policy' in record:
+        atomic_json(CONFIG / 'broker.json', record['broker_policy'], 0o644)
     record['phase'] = 'rolled_back'
     atomic_json(TRANSACTION, record)
     run('systemctl', 'start', *UNITS)
@@ -551,6 +558,7 @@ def update(args, progress=lambda step: None):
         record_path = CONFIG / 'installation.json'
         root_path(record_path)
         record = json.loads(record_path.read_text())
+        previous_installation = json.loads(json.dumps(record))
         for unit in ALL_UNITS:
             path = pathlib.Path('/etc/systemd/system') / unit
             if unit == UPGRADE_UNIT and not path.exists() and unit not in record['units']:
@@ -578,7 +586,7 @@ def update(args, progress=lambda step: None):
         else:
             shutil.copytree(stage, release)
         backup = STATE / 'backups' / ('update-' + str(time.time_ns()))
-        transaction = {'previous': str(previous), 'release': str(release), 'backup': None, 'phase': 'prepared', 'installation': record}
+        transaction = {'previous': str(previous), 'release': str(release), 'backup': None, 'phase': 'prepared', 'installation': previous_installation, 'broker_policy': policy.copy()}
         atomic_json(TRANSACTION, transaction)
         try:
             progress('backup')
@@ -588,6 +596,10 @@ def update(args, progress=lambda step: None):
             atomic_json(TRANSACTION, transaction)
             run('systemctl', 'stop', 'relaydeck-broker.service')
             progress('install')
+            # Shared-port releases replace tenant ranges with a quota. Keep the
+            # prior root policy in the transaction so rollback restores it too.
+            policy.update(allowed_port_start=1024, allowed_port_end=65535)
+            atomic_json(CONFIG / 'broker.json', policy, 0o644)
             atomic_copy(release / 'bin/relaydeck', BIN)
             current_link(release)
             management_tools(release)

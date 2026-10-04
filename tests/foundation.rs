@@ -218,9 +218,74 @@ async fn configured_https_port_is_reserved_and_login_requires_the_exact_origin()
     assert!(ports.starts_with("HTTP/1.1 200"), "{ports}");
     let value: serde_json::Value =
         serde_json::from_str(ports.split("\r\n\r\n").nth(1).unwrap()).unwrap();
-    assert_eq!(value["reserved"], serde_json::json!([17443]));
+    assert!(
+        value["reserved"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(17443))
+    );
+    assert!(
+        value["reserved"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(address.port()))
+    );
     let body = r#"{"name":"reserved","listen_port":17443,"target_host":"8.8.8.8","target_port":443,"protocol":"tcp","source_cidrs":[],"enabled":true}"#;
     let rule = request(address, "POST", "/api/rules", &headers, body);
     assert!(rule.starts_with("HTTP/1.1 400"), "{rule}");
     assert!(rule.contains("17443"), "{rule}");
+}
+
+#[tokio::test]
+async fn shared_port_migration_preserves_credentials_rules_quotas_and_owner_identity() {
+    use std::borrow::Cow;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("relaydeck.db");
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&path)
+        .create_if_missing(true);
+    let old = sqlx::SqlitePool::connect_with(options).await.unwrap();
+    let mut migrations = sqlx::migrate!("./migrations");
+    migrations.migrations = Cow::Owned(
+        migrations
+            .iter()
+            .filter(|m| m.version < 8)
+            .cloned()
+            .collect(),
+    );
+    migrations.run(&old).await.unwrap();
+    sqlx::query("INSERT INTO users(id,username,password_hash,role,port_start,port_end,max_rules,auth_version,mfa_secret,created_at) VALUES(1,'owner','old-hash','admin',40000,40049,30,7,'old-encrypted-mfa',0)").execute(&old).await.unwrap();
+    sqlx::query("INSERT INTO rules(id,owner_id,name,listen_port,target_host,target_ip,target_port,protocol,source_cidrs,created_at,updated_at) VALUES(1,1,'existing',40001,'1.1.1.1','1.1.1.1',443,'both','[]',0,0)").execute(&old).await.unwrap();
+    sqlx::query("INSERT INTO port_leases(port,owner_id,rule_id,created_at) VALUES(40001,1,1,0)")
+        .execute(&old)
+        .await
+        .unwrap();
+    old.close().await;
+    let pool = relaydeck::db::connect(&path).await.unwrap();
+    let user: relaydeck::models::DbUser = sqlx::query_as("SELECT * FROM users WHERE id=1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(user.username, "owner");
+    assert_eq!(user.password_hash, "old-hash");
+    assert_eq!(user.mfa_secret.as_deref(), Some("old-encrypted-mfa"));
+    assert_eq!(user.auth_version, 7);
+    assert_eq!(user.max_rules, 30);
+    assert_eq!((user.port_start, user.port_end), (1024, 65535));
+    let lease: (i64, i64, i64) = sqlx::query_as("SELECT port,owner_id,rule_id FROM port_leases")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(lease, (40001, 1, 1));
+    let rule: (String, String, bool) = sqlx::query_as("SELECT name,protocol,enabled FROM rules")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rule, ("existing".into(), "both".into(), true));
+    let pending: (i64, i64) =
+        sqlx::query_as("SELECT owner_id,revision FROM apply_jobs WHERE status='pending'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(pending, (1, user.desired_revision));
 }
