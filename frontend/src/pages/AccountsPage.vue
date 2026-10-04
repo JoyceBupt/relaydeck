@@ -57,13 +57,13 @@ const drawerUserId = computed(() => (route.name === 'account' ? Number(route.par
         <button type="button" class="btn btn-secondary mt-4" @click="users.refetch()"><RotateCw class="size-4" />重试</button>
       </div>
       <div v-else class="panel overflow-hidden">
-        <div class="grid grid-cols-[minmax(10rem,1.3fr)_minmax(8rem,1fr)_minmax(9rem,1fr)_minmax(8rem,1fr)_minmax(7rem,0.8fr)_1rem] items-center gap-x-4 border-b border-line px-4 pt-3 pb-2 text-xs text-muted max-md:hidden">
-          <span>账户</span><span>端口段</span><span>规则额度</span><span>有效期</span><span>运行</span><span />
+        <div class="grid grid-cols-[minmax(10rem,1.3fr)_minmax(9rem,1fr)_minmax(8rem,1fr)_minmax(7rem,0.8fr)_1rem] items-center gap-x-4 border-b border-line px-4 pt-3 pb-2 text-xs text-muted max-md:hidden">
+          <span>账户</span><span>端口额度</span><span>有效期</span><span>运行</span><span />
         </div>
         <ul class="group-list">
           <li v-for="user in list" :key="user.id">
             <button
-              type="button" class="grid w-full items-center gap-x-4 px-4 py-3 text-left transition-colors duration-150 hover:bg-fill/60 md:grid-cols-[minmax(10rem,1.3fr)_minmax(8rem,1fr)_minmax(9rem,1fr)_minmax(8rem,1fr)_minmax(7rem,0.8fr)_1rem] max-md:grid-cols-[minmax(0,1fr)_auto] max-md:gap-y-1.5"
+              type="button" class="grid w-full items-center gap-x-4 px-4 py-3 text-left transition-colors duration-150 hover:bg-fill/60 md:grid-cols-[minmax(10rem,1.3fr)_minmax(9rem,1fr)_minmax(8rem,1fr)_minmax(7rem,0.8fr)_1rem] max-md:grid-cols-[minmax(0,1fr)_auto] max-md:gap-y-1.5"
               :aria-label="`编辑 ${user.username}`" @click="open(user)"
             >
               <span class="flex min-w-0 items-center gap-3">
@@ -76,8 +76,7 @@ const drawerUserId = computed(() => (route.name === 'account' ? Number(route.par
                   <span class="block text-xs text-muted">{{ user.role === 'admin' ? '管理员' : user.must_change_password ? '租户 · 未改初始密码' : '租户' }}</span>
                 </span>
               </span>
-              <span class="font-mono text-sm tabular max-md:col-start-1 max-md:row-start-2 max-md:pl-11">{{ user.port_start }}–{{ user.port_end }}</span>
-              <span class="flex items-center gap-2.5 max-md:hidden">
+              <span class="flex items-center gap-2.5 max-md:col-start-1 max-md:row-start-2 max-md:pl-11">
                 <span class="h-1.5 w-16 overflow-hidden rounded-full bg-surface-3" aria-hidden="true"><span class="block h-full rounded-full" :class="user.rule_count >= user.max_rules && user.max_rules > 0 ? 'bg-[var(--meter-warn)]' : 'bg-accent'" :style="{ width: quotaWidth(user) }" /></span>
                 <span class="text-sm tabular">{{ user.rule_count }} / {{ user.max_rules }}</span>
               </span>

@@ -77,8 +77,8 @@ const recent = computed(() => (audit.data.value ?? []).slice(0, 6).map(entry => 
         <span class="text-xs text-muted">{{ expiring.length ? `${expiring.length} 个即将到期` : '\u00a0' }}</span>
       </RouterLink>
       <div v-else class="panel flex flex-col gap-3 p-4">
-        <span class="stat-label">规则额度</span>
-        <span><span class="stat-value">{{ currentUser?.rule_count ?? 0 }}</span><span class="stat-unit">/ {{ currentUser?.max_rules ?? 0 }} 条</span></span>
+        <span class="stat-label">端口额度</span>
+        <span><span class="stat-value">{{ currentUser?.rule_count ?? 0 }}</span><span class="stat-unit">/ {{ currentUser?.max_rules ?? 0 }} 个</span></span>
         <span class="meter" aria-hidden="true">
           <span v-for="index in Math.max(currentUser?.max_rules ?? 0, 1)" :key="index" :class="index <= (currentUser?.rule_count ?? 0) ? 'is-on' : ''" />
         </span>

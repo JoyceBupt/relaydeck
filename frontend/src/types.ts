@@ -77,8 +77,6 @@ export interface PortUsage {
 
 export interface UserGrantInput {
   enabled: boolean
-  port_start: number
-  port_end: number
   max_rules: number
   expires_at: number | null
 }
@@ -86,8 +84,6 @@ export interface UserGrantInput {
 export interface NewUserInput {
   username: string
   password: string
-  port_start: number
-  port_end: number
   max_rules: number
   expires_at: number | null
 }

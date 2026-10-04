@@ -29,27 +29,21 @@ const statuses = computed(() => Object.fromEntries(props.rules.map(rule => [rule
 const ownRules = computed(() => props.rules.filter(rule => rule.owner_id === props.userId))
 const failed = computed(() => ownRules.value.filter(rule => rule.runtime_status === 'failed'))
 
-interface FormState { username: string; password: string; enabled: boolean; port_start: number | null; port_end: number | null; max_rules: number | null; expires: string }
-const form = reactive<FormState>({ username: '', password: '', enabled: true, port_start: null, port_end: null, max_rules: 5, expires: '' })
+interface FormState { username: string; password: string; enabled: boolean; max_rules: number | null; expires: string }
+const form = reactive<FormState>({ username: '', password: '', enabled: true, max_rules: 10, expires: '' })
 const baseline = ref('')
 const initializedFor = ref<string | null>(null)
 const submitted = ref(false)
 const serverError = ref('')
 const snapshot = () => JSON.stringify(form)
 
-function suggestRange() {
-  const highest = Math.max(29_999, ...props.users.map(item => item.port_end))
-  const start = Math.ceil((highest + 1) / 100) * 100
-  return start + 99 <= 65535 ? { start, end: start + 99 } : { start: null, end: null }
-}
 function load() {
   const key = `${props.userId ?? 'new'}`
   if (initializedFor.value === key || (!isNew.value && !user.value)) return
   if (user.value) {
-    Object.assign(form, { username: user.value.username, password: '', enabled: user.value.enabled, port_start: user.value.port_start, port_end: user.value.port_end, max_rules: user.value.max_rules, expires: dateInputValue(user.value.expires_at) })
+    Object.assign(form, { username: user.value.username, password: '', enabled: user.value.enabled, max_rules: user.value.max_rules, expires: dateInputValue(user.value.expires_at) })
   } else {
-    const range = suggestRange()
-    Object.assign(form, { username: '', password: generatePassword(), enabled: true, port_start: range.start, port_end: range.end, max_rules: 5, expires: '' })
+    Object.assign(form, { username: '', password: generatePassword(), enabled: true, max_rules: 10, expires: '' })
   }
   submitted.value = false
   serverError.value = ''
@@ -59,23 +53,11 @@ function load() {
 watch(() => [props.open, props.userId, user.value?.id], () => { if (props.open) load(); else initializedFor.value = null }, { immediate: true })
 const dirty = computed(() => initializedFor.value !== null && snapshot() !== baseline.value)
 
-const overlap = computed(() => {
-  if (form.port_start === null || form.port_end === null) return null
-  return props.users.find(item => item.id !== props.userId && item.port_start <= form.port_end! && item.port_end >= form.port_start!) ?? null
-})
 const errors = computed(() => {
-  const start = form.port_start
-  const end = form.port_end
-  let range = ''
-  if (start === null || end === null || !Number.isInteger(start) || !Number.isInteger(end)) range = '填写起止端口'
-  else if (start < 1024 || end > 65535) range = '范围 1024–65535'
-  else if (start > end) range = '起始端口大于结束端口'
-  else if (overlap.value) range = `与 ${overlap.value.username} 的端口段 ${overlap.value.port_start}–${overlap.value.port_end} 重叠`
   const expiresAt = expiryFromDateInput(form.expires)
   return {
     username: isNew.value ? validateUsername(form.username) : '',
     password: isNew.value ? validatePassword(form.password) : '',
-    range,
     maxRules: form.max_rules === null || !Number.isInteger(form.max_rules) || form.max_rules < 0 || form.max_rules > 30 ? '范围 0–30' : '',
     expires: form.enabled && expiresAt !== null && expiresAt <= nowSeconds() ? '须晚于今天' : '',
   }
@@ -83,18 +65,14 @@ const errors = computed(() => {
 const valid = computed(() => Object.values(errors.value).every(message => !message))
 const show = (field: keyof typeof errors.value) => (submitted.value ? errors.value[field] : '')
 
-// Narrowing a grant disables rules outside it on the server; say so before saving.
 const affected = computed(() => {
-  if (isNew.value || form.port_start === null || form.port_end === null || form.max_rules === null) return 0
-  const enabled = ownRules.value.filter(rule => rule.enabled)
-  const outside = enabled.filter(rule => rule.listen_port < form.port_start! || rule.listen_port > form.port_end!)
-  const inside = enabled.length - outside.length
-  return outside.length + Math.max(0, inside - form.max_rules)
+  if (isNew.value || form.max_rules === null) return 0
+  return Math.max(0, ownRules.value.filter(rule => rule.enabled).length - form.max_rules)
 })
 
 const save = useMutation({
   mutationFn: () => {
-    const grant = { port_start: form.port_start!, port_end: form.port_end!, max_rules: form.max_rules!, expires_at: expiryFromDateInput(form.expires) }
+    const grant = { max_rules: form.max_rules!, expires_at: expiryFromDateInput(form.expires) }
     return isNew.value
       ? api.createUser({ username: form.username.trim(), password: form.password, ...grant })
       : api.updateUser(props.userId!, { enabled: form.enabled, ...grant })
@@ -192,22 +170,9 @@ const expiryInfo = computed(() => (user.value ? expiry(user.value.expires_at) : 
           </div>
         </template>
 
-        <div class="field">
-          <span class="field-label">端口段</span>
-          <div class="flex items-center gap-2">
-            <input v-model.number="form.port_start" class="input input-mono" type="number" min="1024" max="65535" aria-label="起始端口" :aria-invalid="!!show('range')" />
-            <span class="text-faint">–</span>
-            <input v-model.number="form.port_end" class="input input-mono" type="number" min="1024" max="65535" aria-label="结束端口" :aria-invalid="!!show('range')" />
-          </div>
-          <span :class="show('range') || (overlap && !submitted) ? 'field-error' : 'field-hint'">
-            {{ show('range') || (overlap ? `与 ${overlap.username} 的端口段重叠` : form.port_start && form.port_end && form.port_end >= form.port_start ? `${form.port_end - form.port_start + 1} 个端口` : '') }}
-          </span>
-          <div v-if="user && ports.data.value" class="mt-1.5"><PortRuler :usage="ports.data.value" :statuses="statuses" /></div>
-        </div>
-
-        <div class="grid grid-cols-2 gap-3">
+        <div class="grid grid-cols-2 items-start gap-3">
           <label class="field">
-            <span class="field-label">规则上限</span>
+            <span class="field-label">端口额度</span>
             <input v-model.number="form.max_rules" class="input input-mono" type="number" min="0" max="30" :aria-invalid="!!show('maxRules')" />
             <span v-if="show('maxRules')" class="field-error">{{ show('maxRules') }}</span>
           </label>
@@ -218,6 +183,11 @@ const expiryInfo = computed(() => (user.value ? expiry(user.value.expires_at) : 
             <button v-else-if="form.expires" type="button" class="w-fit text-xs font-medium text-accent hover:underline" @click="form.expires = ''">清除</button>
             <span v-else class="field-hint">留空为长期</span>
           </div>
+        </div>
+
+        <div v-if="user && ports.data.value?.leases.length" class="field">
+          <span class="field-label">已用端口</span>
+          <PortRuler :usage="ports.data.value" :statuses="statuses" />
         </div>
 
         <div v-if="!isNew && user?.role !== 'admin'" class="flex items-center justify-between gap-4">

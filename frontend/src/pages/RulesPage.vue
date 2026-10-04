@@ -78,7 +78,7 @@ const subtitle = computed(() => {
     const owners = new Set(all.value.map(rule => rule.owner_id)).size
     return `${all.value.length} 条 · ${owners} 个账户`
   }
-  return `${user.port_start}–${user.port_end} · ${user.rule_count} / ${user.max_rules} 条`
+  return `已用 ${user.rule_count} / ${user.max_rules} 个端口`
 })
 
 // Drawer state lives in the URL so a rule can be linked, refreshed and navigated with Back.
