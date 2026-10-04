@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Package, install and update verified RelayDeck releases on systemd Linux."""
 import argparse
+import html.parser
 import hashlib
 import json
 import os
@@ -165,7 +166,97 @@ def extract_release(archive, expected, destination):
                 with path.open('xb') as output, tar.extractfile(member) as source:
                     shutil.copyfileobj(source, output)
                 path.chmod(0o755 if member.name == 'bin/relaydeck' else 0o644)
+        # A root updater runs with UMask=0077. Published files must still be
+        # traversable by the separate Web UID, including implicit tar parents.
+        for directory in [destination, *(path for path in destination.rglob('*') if path.is_dir())]:
+            directory.chmod(0o755)
     return manifest
+
+
+def prepare_frontend():
+    """Repair public payload modes even when a legacy manager performed extraction."""
+    if platform.system() != 'Linux' or os.geteuid() != 0:
+        raise ValueError('Frontend preparation requires Linux root')
+    root_path(RELEASES)
+    root_path(CURRENT.parent)
+    link = CURRENT.lstat()
+    if not stat.S_ISLNK(link.st_mode) or link.st_uid != 0 or link.st_nlink != 1:
+        raise ValueError('Invalid root-owned current release pointer')
+    release = CURRENT.resolve(strict=True)
+    if release.parent != RELEASES:
+        raise ValueError('Frontend release is outside the managed release directory')
+    root_path(release)
+    frontend = release / 'frontend'
+    root_path(frontend)
+    if not frontend.is_dir():
+        raise ValueError('Frontend payload must be a directory')
+    # Validate the entire public subtree before changing any mode. No links,
+    # shared files, writable entries or paths outside this release are accepted.
+    entries = [frontend, *frontend.rglob('*')]
+    if len(entries) > 4096:
+        raise ValueError('Frontend exceeds entry limit')
+    total = 0
+    for path in entries:
+        root_path(path)
+        info = path.lstat()
+        if stat.S_ISREG(info.st_mode):
+            if info.st_nlink != 1:
+                raise ValueError('Frontend files must have one link')
+            total += info.st_size
+        elif not stat.S_ISDIR(info.st_mode):
+            raise ValueError('Frontend contains a special file')
+    if total > 250 * 1024 * 1024 or not (frontend / 'index.html').is_file():
+        raise ValueError('Invalid frontend payload')
+    for name in required_frontend_assets((frontend / 'index.html').read_bytes()):
+        if not (frontend / name.lstrip('/')).is_file():
+            raise ValueError('Frontend entry asset is missing: ' + name)
+    for path in entries:
+        path.chmod(0o755 if path.is_dir() else 0o644)
+    release.chmod(0o755)
+    print('Public frontend permissions prepared; private data paths unchanged.', flush=True)
+
+
+class FrontendAssets(html.parser.HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.paths = set()
+
+    def handle_starttag(self, tag, attributes):
+        values = dict(attributes)
+        asset = values.get('src') if tag == 'script' and values.get('type') == 'module' else values.get('href') if tag == 'link' and values.get('rel') == 'stylesheet' else None
+        if asset is not None:
+            if not re.fullmatch(r'/assets/(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:js|css)', asset) or '..' in pathlib.PurePosixPath(asset).parts:
+                raise ValueError('Unexpected frontend asset path')
+            self.paths.add(asset)
+
+
+
+def required_frontend_assets(index):
+    if len(index) > 1024 * 1024:
+        raise ValueError('Frontend index exceeds size limit')
+    assets = FrontendAssets()
+    assets.feed(index.decode('utf-8'))
+    if not any(path.endswith('.js') for path in assets.paths) or not any(path.endswith('.css') for path in assets.paths):
+        raise ValueError('Frontend entry JavaScript and stylesheet are required')
+    return assets.paths
+
+
+def check_frontend_http():
+    frontend = CURRENT / 'frontend'
+    expected = (frontend / 'index.html').read_bytes()
+    if len(expected) > 1024 * 1024:
+        raise ValueError('Frontend index exceeds size limit')
+    with urllib.request.urlopen('http://127.0.0.1:7410/', timeout=1) as response:
+        if response.status != 200 or response.headers.get_content_type() != 'text/html' or response.read(1024 * 1024 + 1) != expected:
+            raise ValueError('Served frontend index differs from installed release')
+    for name in sorted(required_frontend_assets(expected)):
+        payload = frontend / name.lstrip('/')
+        if payload.stat().st_size > 20 * 1024 * 1024:
+            raise ValueError('Frontend asset exceeds size limit')
+        expected_asset = payload.read_bytes()
+        with urllib.request.urlopen('http://127.0.0.1:7410' + name, timeout=1) as response:
+            if response.status != 200 or response.headers.get_content_type() not in ({'text/css'} if name.endswith('.css') else {'text/javascript', 'application/javascript'}) or response.read(len(expected_asset) + 1) != expected_asset:
+                raise ValueError('Served frontend asset differs from installed release: ' + name)
 
 
 def preflight():
@@ -287,6 +378,7 @@ def wait_health(version):
             with urllib.request.urlopen('http://127.0.0.1:7410/api/health', timeout=1) as response:
                 health = json.load(response)
             if health.get('version') == version and health.get('executor') == 'running':
+                check_frontend_http()
                 return
             last = str(health)
         except (OSError, ValueError) as error:
@@ -669,11 +761,14 @@ def main():
             sub.add_argument('--origin', required=True, help='HTTPS domain[:port]; new installations default to port 17443')
             sub.add_argument('--admin', required=True)
     commands.add_parser('recover')
+    commands.add_parser('prepare-frontend')
     sub = commands.add_parser('package')
     sub.add_argument('--target', required=True)
     sub.add_argument('--output', default='dist')
     args = parser.parse_args()
-    if args.command == 'recover':
+    if args.command == 'prepare-frontend':
+        prepare_frontend()
+    elif args.command == 'recover':
         recover_update()
     elif args.command == 'inspect':
         with tempfile.TemporaryDirectory(prefix='relaydeck-inspect-') as work:

@@ -10,6 +10,7 @@ Type=exec
 User=relaydeck
 Group=relaydeck
 EnvironmentFile=/etc/relaydeck/relaydeck.env
+ExecStartPre=+/usr/bin/python3 -B /usr/local/libexec/relaydeck-manage.py prepare-frontend
 ExecStart=/usr/local/libexec/relaydeck serve
 Restart=on-failure
 RestartSec=3

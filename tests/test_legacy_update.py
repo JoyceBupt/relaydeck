@@ -49,10 +49,18 @@ class LegacyPanelUpdate(unittest.TestCase):
             (release / 'bin').mkdir(); (release / 'bin/relaydeck').write_bytes(b'old binary' if old else b'new binary')
             (release / 'deploy').mkdir()
             (release / 'release.json').write_text(json.dumps({'version': version}))
+            (release / 'frontend/assets').mkdir(parents=True)
+            (release / 'frontend/index.html').write_text('<script type="module" src="/assets/app.js"></script><link rel="stylesheet" href="/assets/app.css">')
+            (release / 'frontend/assets/app.js').write_text('export default 1')
+            (release / 'frontend/assets/app.css').write_text('body{}')
+            for directory in [release / 'frontend', release / 'frontend/assets']: directory.chmod(0o755 if old else 0o700)
+            if not old: release.chmod(0o700)
             for name in self.tools.ALL_UNITS:
                 text = (SOURCE / 'deploy' / name).read_text()
                 if old and name == 'relaydeck-broker.service':
                     text = '[Service]\nExecStart=/usr/local/libexec/relaydeck broker /etc/relaydeck/broker.json\n'
+                if old and name == 'relaydeck-web.service':
+                    text = '[Service]\nExecStart=/usr/local/libexec/relaydeck serve\n'
                 if old and name == 'relaydeck-worker.service':
                     text = '[Service]\nExecStart=/usr/local/libexec/relaydeck worker /etc/relaydeck/broker.json\n'
                 (release / 'deploy' / name).write_text(text)
@@ -88,6 +96,7 @@ class LegacyPanelUpdate(unittest.TestCase):
         self.starts = []
         self.reserved = []
         self.preparations = []
+        self.web_preparations = []
         patches = ExitStack(); self.addCleanup(patches.close)
         # Redirect the frozen module's sole hard-coded unit directory, without
         # replacing pathlib globally or allowing any real systemctl invocation.
@@ -136,6 +145,18 @@ class LegacyPanelUpdate(unittest.TestCase):
             return
         self.assertEqual(args[0], 'systemctl')
         if args[1] != 'start': return
+        if 'relaydeck-web.service' in args:
+            web = (self.units / 'relaydeck-web.service').read_text()
+            for line in web.splitlines():
+                if not line.startswith('ExecStartPre='): continue
+                command = shlex.split(line.split('=', 1)[1])
+                self.assertEqual(command, ['+/usr/bin/python3', '-B', '/usr/local/libexec/relaydeck-manage.py', 'prepare-frontend'])
+                self.web_preparations.append(command)
+                if self.real_policy:
+                    spec = importlib.util.spec_from_file_location('new_disk_manager', self.manager)
+                    new = importlib.util.module_from_spec(spec); spec.loader.exec_module(new)
+                    new.CURRENT = self.current; new.RELEASES = self.releases
+                    new.prepare_frontend()
         broker = (self.units / 'relaydeck-broker.service').read_text()
         self.starts.append(broker)
         if 'ExecStartPre=' not in broker: return
@@ -168,11 +189,23 @@ class LegacyPanelUpdate(unittest.TestCase):
         self.assertIs(self.tools.update, old_function)
         self.assertNotEqual(self.manager.read_bytes(), FIXTURE.read_bytes())
         self.assertEqual(len(self.preparations), 1)
+        self.assertEqual(len(self.web_preparations), 1)
         self.assertEqual(self.grant(), (1, 'fixture hash', 'fixture encrypted secret', 1024, 65535, 10))
         self.assertNotIn('1024-65535', self.reserved[0])
         if self.real_policy:
             effective = json.loads((self.state / 'runtime/broker-effective.json').read_text())
             self.assertEqual((effective['port_policy_version'], effective['allowed_port_start'], effective['allowed_port_end']), (2, 1024, 65535))
+        self.assert_preserved()
+
+    @unittest.skipUnless(os.environ.get('RELAYDECK_POLICY_TEST') == '1', 'Linux root Web UID gate only')
+    def test_legacy_update_reopens_root_only_frontend_without_exposing_private_state(self):
+        self.root.chmod(0o755); self.releases.chmod(0o755)
+        private = self.state / 'secrets'; private.chmod(0o700)
+        before = private.stat().st_mode & 0o7777
+        self.tools.update(SimpleNamespace(yes=True))
+        index = self.current.resolve() / 'frontend/index.html'
+        subprocess.run(['setpriv', '--reuid', '65534', '--regid', '65534', '--clear-groups', 'cat', str(index)], check=True, stdout=subprocess.DEVNULL)
+        self.assertEqual(private.stat().st_mode & 0o7777, before)
         self.assert_preserved()
 
     def test_startup_or_health_failure_rolls_back_old_database_units_and_policy(self):
