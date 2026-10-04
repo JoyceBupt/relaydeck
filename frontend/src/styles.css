@@ -259,6 +259,16 @@
   .input[aria-invalid="true"] { border-color: var(--danger); }
   .input[aria-invalid="true"]:focus { box-shadow: 0 0 0 4px var(--danger-soft); }
   .input-mono { font-family: var(--font-mono); }
+  .input-mono::placeholder { font-family: var(--font-sans); }
+  /* Native date fields: same height, left-aligned value and a muted picker icon in every engine. */
+  .input[type="date"] { -webkit-appearance: none; appearance: none; }
+  .input[type="date"]::-webkit-date-and-time-value { text-align: left; margin: 0; }
+  .input[type="date"]::-webkit-datetime-edit { padding: 0; }
+  .input[type="date"]::-webkit-calendar-picker-indicator { margin-left: auto; opacity: 0.5; cursor: pointer; }
+  .input[type="date"]:hover::-webkit-calendar-picker-indicator { opacity: 0.8; }
+  /* Number fields carry their own validation; the spinner arrows only add noise. */
+  .input[type="number"] { appearance: textfield; -moz-appearance: textfield; }
+  .input[type="number"]::-webkit-inner-spin-button, .input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
   /* Browser autofill keeps the field's own colors instead of a tinted fill. */
   .input:-webkit-autofill, .input:-webkit-autofill:hover {
     -webkit-text-fill-color: var(--fg); caret-color: var(--fg);

@@ -2,7 +2,7 @@
 import { computed, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useMutation } from '@tanstack/vue-query'
-import { ArrowRightLeft, Copy, KeyRound, RotateCw, ShieldCheck, Sparkles } from '@lucide/vue'
+import { ArrowRightLeft, Copy, KeyRound, RotateCw, RefreshCw, ShieldCheck } from '@lucide/vue'
 import SideDrawer from './SideDrawer.vue'
 import PortRuler from './PortRuler.vue'
 import StatusMark from './StatusMark.vue'
@@ -163,7 +163,7 @@ const expiryInfo = computed(() => (user.value ? expiry(user.value.expires_at) : 
             <label class="field-label" for="initial-password">初始密码</label>
             <div class="flex gap-2">
               <input id="initial-password" v-model="form.password" class="input input-mono" autocomplete="new-password" spellcheck="false" :aria-invalid="!!show('password')" />
-              <button type="button" class="btn btn-secondary btn-icon" aria-label="重新生成" title="重新生成" @click="form.password = generatePassword()"><Sparkles class="size-4" /></button>
+              <button type="button" class="btn btn-secondary btn-icon" aria-label="重新生成" title="重新生成" @click="form.password = generatePassword()"><RefreshCw class="size-4" /></button>
               <button type="button" class="btn btn-secondary btn-icon" aria-label="复制密码" title="复制" @click="copyPassword(form.password)"><Copy class="size-4" /></button>
             </div>
             <span :class="show('password') ? 'field-error' : 'field-hint'">{{ show('password') || '首次登录须修改' }}</span>
@@ -177,11 +177,13 @@ const expiryInfo = computed(() => (user.value ? expiry(user.value.expires_at) : 
             <span v-if="show('maxRules')" class="field-error">{{ show('maxRules') }}</span>
           </label>
           <div v-if="user?.role !== 'admin'" class="field">
-            <label class="field-label" for="account-expiry">到期日</label>
+            <span class="flex items-baseline justify-between gap-2">
+              <label class="field-label" for="account-expiry">到期日</label>
+              <button v-if="form.expires" type="button" class="text-xs text-accent hover:underline" @click="form.expires = ''">清除</button>
+            </span>
             <input id="account-expiry" v-model="form.expires" class="input" type="date" :aria-invalid="!!show('expires')" />
             <span v-if="show('expires')" class="field-error">{{ show('expires') }}</span>
-            <button v-else-if="form.expires" type="button" class="w-fit text-xs font-medium text-accent hover:underline" @click="form.expires = ''">清除</button>
-            <span v-else class="field-hint">留空为长期</span>
+            <span v-else-if="!form.expires" class="field-hint">留空为长期</span>
           </div>
         </div>
 

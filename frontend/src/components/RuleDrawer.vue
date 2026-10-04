@@ -275,20 +275,23 @@ defineExpose({ dirty })
             <span v-if="show('owner')" class="field-error">{{ show('owner') }}</span>
           </label>
 
-          <div class="field">
-            <label class="field-label" for="rule-port">入口端口</label>
-            <input id="rule-port" v-model.number="form.listen_port" class="input input-mono w-40" type="number" inputmode="numeric" min="1024" max="65535" placeholder="1024–65535" :aria-invalid="!!show('port')" />
+          <div class="grid gap-1.5">
+            <div class="grid grid-cols-[8rem_minmax(0,1fr)] items-end gap-3">
+              <div class="field">
+                <label class="field-label" for="rule-port">入口端口</label>
+                <input id="rule-port" v-model.number="form.listen_port" class="input input-mono" type="number" inputmode="numeric" min="1024" max="65535" :aria-invalid="!!show('port')" />
+              </div>
+              <div class="field">
+                <span id="rule-protocol" class="field-label">协议</span>
+                <Segmented v-model="form.protocol" label="协议" :options="protocolOptions" aria-labelledby="rule-protocol" class="h-[2.375rem] w-full [&>*]:flex-1 [&>*]:justify-center" />
+              </div>
+            </div>
             <span v-if="show('port')" class="field-error">{{ show('port') }}</span>
-            <span v-else class="field-hint">1024–65535，排除保留及占用端口</span>
-            <div v-if="ports.data.value" class="mt-1.5">
+            <span v-else class="field-hint">1024–65535，不含已占用端口</span>
+            <div v-if="ports.data.value" class="mt-1">
               <PortRuler :usage="ports.data.value" :statuses="statuses" :selected="form.listen_port" :own-rule-id="ruleId" />
             </div>
-            <div v-else-if="ports.isLoading.value" class="skeleton mt-1.5 h-10" />
-          </div>
-
-          <div class="field">
-            <span id="rule-protocol" class="field-label">协议</span>
-            <Segmented v-model="form.protocol" label="协议" :options="protocolOptions" aria-labelledby="rule-protocol" />
+            <div v-else-if="ports.isLoading.value" class="skeleton mt-1 h-6" />
           </div>
 
           <div class="grid grid-cols-[minmax(0,1fr)_7rem] gap-3">

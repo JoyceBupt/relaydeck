@@ -50,9 +50,10 @@ const counts = computed(() => {
   for (const rule of searched.value) result[rule.runtime_status]++
   return result
 })
-const filterOptions = computed(() => (['all', 'active', 'pending', 'failed', 'blocked', 'stopped'] as Filter[]).map(value => ({
-  value, label: value === 'all' ? '全部' : statusLabels[value], count: counts.value[value],
-})))
+// Empty states are hidden (except the active one) so the bar stays short and fits on phones.
+const filterOptions = computed(() => (['all', 'active', 'pending', 'failed', 'blocked', 'stopped'] as Filter[])
+  .filter(value => value === 'all' || value === filter.value || counts.value[value] > 0)
+  .map(value => ({ value, label: value === 'all' ? '全部' : statusLabels[value], count: counts.value[value] })))
 const ownerOptions = computed(() => (users.data.value ?? []).filter(user => all.value.some(rule => rule.owner_id === user.id) || user.id === ownerFilter.value))
 const filtering = computed(() => filter.value !== 'all' || ownerFilter.value !== null || search.value.trim() !== '')
 function clearFilters() { search.value = ''; router.replace({ query: {} }) }
