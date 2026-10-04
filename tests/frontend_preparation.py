@@ -158,6 +158,7 @@ class FrontendPreparation(unittest.TestCase):
             subprocess.run(['systemctl', 'start', service.name], check=True)
             self.assertEqual((group(service.name) / 'memory.high').read_text().strip(), str(32 * 1024 * 1024))
             self.assertEqual((group(slice_file.name) / 'memory.max').read_text().strip(), str(256 * 1024 * 1024))
+            self.assertEqual((group(service.name) / 'cpu.max').read_text().split()[0], '20000')
             slice_file.write_text(slice_text)
             service.write_text(base + resources + '\n')
             subprocess.run(['systemctl', 'daemon-reload'], check=True)
@@ -166,7 +167,12 @@ class FrontendPreparation(unittest.TestCase):
                 path = group(unit)
                 for field in ('memory.high', 'memory.max', 'memory.swap.max', 'pids.max'):
                     self.assertEqual((path / field).read_text().strip(), 'max', unit + ':' + field)
-                self.assertEqual((path / 'cpu.max').read_text().split()[0], 'max')
+                cpu = path / 'cpu.max'
+                if cpu.is_file():
+                    self.assertEqual(cpu.read_text().split()[0], 'max')
+                else:
+                    # systemd disables an unused controller after clearing quotas.
+                    self.assertEqual(subprocess.check_output(['systemctl', 'show', unit, '-p', 'CPUQuotaPerSecUSec', '--value'], text=True).strip(), 'infinity')
             pid = subprocess.check_output(['systemctl', 'show', service.name, '-p', 'MainPID', '--value'], text=True).strip()
             line = next(line for line in pathlib.Path('/proc', pid, 'limits').read_text().splitlines() if line.startswith('Max open files'))
             self.assertTrue(all(int(value) > 4096 for value in line[len('Max open files'):].split()[:2]))
