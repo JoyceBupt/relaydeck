@@ -1689,6 +1689,82 @@ async fn panel_upgrade_requires_csrf_fresh_password_totp_and_interruption_consen
 }
 
 #[tokio::test]
+async fn upgrade_diagnostics_record_progress_without_request_secrets() {
+    use std::io::Write;
+    use tracing::instrument::WithSubscriber;
+
+    #[derive(Clone)]
+    struct LogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut f = Fixture::new().await;
+    std::sync::Arc::make_mut(&mut f.state.config).upgrade =
+        Some(relaydeck::upgrade::UpgradeConfig {
+            owner_id: 1,
+            socket: "/unused".into(),
+            maintenance: f._dir.path().join("upgrade-transaction.json"),
+        });
+    f.app = router(f.state.clone());
+    let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = LogWriter(output.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(move || writer.clone())
+        .finish();
+    let password = "do-not-log-this-password";
+    let code = "246810";
+    let offer = "e".repeat(64);
+    let (status, _, _) = call(
+        &f.app,
+        "POST",
+        "/api/system/update?private=do-not-log-this-query",
+        Some(json!({"offer":offer,"password":password,"code":code,"acknowledge":true})),
+        Some(&f.admin),
+        true,
+    )
+    .with_subscriber(subscriber)
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    for expected in [
+        "upgrade HTTP request received",
+        "upgrade authorization started",
+        "upgrade password authorization rejected",
+        "upgrade HTTP request completed",
+        "route=/api/system/update",
+        "elapsed_ms=",
+    ] {
+        assert!(
+            log.contains(expected),
+            "Missing diagnostic: {expected}; {log}"
+        );
+    }
+    for secret in [
+        password,
+        code,
+        offer.as_str(),
+        "do-not-log-this-query",
+        &f.admin.csrf,
+        &f.admin.cookie,
+    ] {
+        assert!(
+            !log.contains(secret),
+            "Request secrets must never appear in diagnostic logs"
+        );
+    }
+}
+
+#[tokio::test]
 async fn panel_upgrade_snapshot_blocks_external_writes_until_commit() {
     let mut f = Fixture::new().await;
     let tenant = f.add_user("upgradewriter", 41000).await;

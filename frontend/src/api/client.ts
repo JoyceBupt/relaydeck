@@ -49,16 +49,21 @@ async function performRequest<T>(path: string, method: string, data?: unknown): 
   if (method === 'GET' && path !== '/session' && csrfToken) headers['X-CSRF-Token'] = csrfToken
   if (data !== undefined) headers['Content-Type'] = 'application/json'
   if (method !== 'GET') headers['X-CSRF-Token'] = csrfToken
+  const controller = new AbortController()
+  const deadline = setTimeout(() => controller.abort(), 30_000)
   let response: Response
+  let text: string
   try {
     response = await fetch(`/api${path}`, {
-      method, headers, credentials: 'same-origin',
+      method, headers, credentials: 'same-origin', signal: controller.signal,
       body: data === undefined ? undefined : JSON.stringify(data),
     })
+    text = await response.text()
   } catch {
+    if (generation !== sessionGeneration) throw new ApiError(0, 'stale_session', '会话已变更')
+    if (controller.signal.aborted) throw new ApiError(0, 'request_timeout', '请求超时')
     throw new ApiError(0, 'network_error', '无法连接服务器')
-  }
-  const text = await response.text()
+  } finally { clearTimeout(deadline) }
   // A delayed response from an earlier session must neither restore its data
   // nor revoke a newer session after logout or reauthentication.
   if (generation !== sessionGeneration) throw new ApiError(0, 'stale_session', '会话已变更')

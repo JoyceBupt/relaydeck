@@ -193,8 +193,11 @@ def update_status(identifier, phase, **extra):
     value = read_json(ROOT / 'status.json')
     if value['id'] != identifier:
         raise ValueError('Upgrade state changed unexpectedly')
+    previous = (value['phase'], value.get('step'))
     value.update(phase=phase, updated_at=int(time.time()), **extra)
     write_json(ROOT / 'status.json', value)
+    if previous != (value['phase'], value.get('step')):
+        print(f"Upgrade job {identifier}: phase={phase} step={value.get('step')} version={value['version']}", flush=True)
 
 
 def download(offer, destination, identifier):
@@ -217,6 +220,7 @@ def download(offer, destination, identifier):
 
 def run_job(identifier, recover=False):
     record = read_json(job_path(identifier))
+    print(f'Upgrade job {identifier}: started recovery={recover}', flush=True)
     try:
         tools = manager()
         if recover:
@@ -346,6 +350,7 @@ class Controller:
             except Exception:
                 update_status(identifier, 'failed', step='complete', error='升级任务启动失败')
                 raise
+            print(f"Upgrade job {identifier}: accepted version={release['version']}", flush=True)
             return self.status()
         raise UpgradeError('invalid', '升级请求无效')
 

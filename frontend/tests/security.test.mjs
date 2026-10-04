@@ -67,6 +67,61 @@ test('account switching and credential mutations preserve isolation', async t =>
       assert.equal(client.securityMutationPending.value, false)
       window.removeEventListener('relaydeck:session-expired', listener)
     })
+    await t.test('a stalled upgrade times out once and still permits status reconciliation', async t => {
+      session.acceptSession(identity(1), true)
+      t.mock.timers.enable({ apis: ['setTimeout'] })
+      let posts = 0
+      let signal
+      globalThis.fetch = (url, input) => {
+        if (input.method === 'GET') return Promise.resolve(new Response(JSON.stringify({ current_version: '0.2.0', job: null }), { status: 200 }))
+        posts += 1
+        signal = input.signal
+        return new Promise((resolve, reject) => signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true }))
+      }
+      const pending = api.startUpgrade({ offer: 'a'.repeat(64), password: 'test password', code: '123456', acknowledge: true })
+      const rejected = assert.rejects(pending, error => error.status === 0 && error.code === 'request_timeout')
+      t.mock.timers.tick(30_000)
+      await rejected
+      assert.equal(signal.aborted, true)
+      assert.equal(posts, 1, 'an ambiguous upgrade acknowledgement must never be automatically retried')
+      assert.equal((await api.upgradeStatus()).job, null)
+    })
+
+    await t.test('a stalled response body releases the credential mutation guard on timeout', async t => {
+      session.acceptSession(identity(1), true)
+      t.mock.timers.enable({ apis: ['setTimeout'] })
+      globalThis.fetch = async (url, { signal }) => ({ status: 200, ok: true, text: () => new Promise((resolve, reject) => signal.addEventListener('abort', () => reject(new Error('aborted body')), { once: true })) })
+      const pending = api.confirmMfa('123456')
+      const rejected = assert.rejects(pending, error => error.code === 'request_timeout')
+      assert.equal(client.securityMutationPending.value, true)
+      await Promise.resolve()
+      t.mock.timers.tick(30_000)
+      await rejected
+      assert.equal(client.securityMutationPending.value, false)
+    })
+
+    await t.test('a timed out old request cannot affect a newly logged in account', async t => {
+      session.acceptSession(identity(1), true)
+      t.mock.timers.enable({ apis: ['setTimeout'] })
+      globalThis.fetch = (url, { signal }) => new Promise((resolve, reject) => signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true }))
+      const pending = api.rules()
+      const rejected = assert.rejects(pending, error => client.isStaleError(error))
+      session.acceptSession(identity(2), true)
+      t.mock.timers.tick(30_000)
+      await rejected
+      assert.equal(session.sessionState.session.user.id, 2)
+    })
+
+    await t.test('a completed request clears its abort deadline', async t => {
+      session.acceptSession(identity(1), true)
+      t.mock.timers.enable({ apis: ['setTimeout'] })
+      let signal
+      globalThis.fetch = async (url, input) => { signal = input.signal; return new Response('[]', { status: 200 }) }
+      assert.deepEqual(await api.rules(), [])
+      t.mock.timers.tick(30_000)
+      assert.equal(signal.aborted, false)
+    })
+
     await t.test('identity refresh cannot retain forms from another account', async () => {
       session.acceptSession(identity(1), true)
       queryClient.setQueryData(['rules'], [rule])

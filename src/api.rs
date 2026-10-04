@@ -8,7 +8,7 @@ use crate::{
 };
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, FromRequestParts, Path, State},
+    extract::{ConnectInfo, FromRequestParts, MatchedPath, Path, State},
     http::{HeaderMap, StatusCode, header, request::Parts},
     response::{IntoResponse, Response},
     routing::{get, post, put},
@@ -18,6 +18,7 @@ use sqlx::{Sqlite, SqlitePool, Transaction};
 use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
+    time::Instant,
 };
 use tokio::sync::Mutex;
 
@@ -1150,6 +1151,11 @@ async fn start_upgrade(
     {
         return Err(ApiError::bad_request("请确认转发中断并输入验证码"));
     }
+    tracing::info!(
+        owner_id = auth.user.id,
+        stage = "password",
+        "upgrade authorization started"
+    );
     if let Err(mut error) = reauthenticate(&state, &auth, input.password).await {
         if error.code == "invalid_input" {
             let mut tx = state.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -1158,8 +1164,18 @@ async fn start_upgrade(
             tx.commit().await?;
             error.code = "password_invalid";
         }
+        tracing::warn!(
+            owner_id = auth.user.id,
+            code = error.code,
+            "upgrade password authorization rejected"
+        );
         return Err(error);
     }
+    tracing::info!(
+        owner_id = auth.user.id,
+        stage = "mfa",
+        "upgrade password verified"
+    );
     let mut tx = state.pool.begin_with("BEGIN IMMEDIATE").await?;
     let actor = mfa_actor(&mut tx, &auth).await?;
     if !owner_identity(&state, &actor) || actor.mfa_secret.is_none() {
@@ -1177,6 +1193,7 @@ async fn start_upgrade(
     {
         record_mfa_failure(&mut tx, &actor, "panel_upgrade_mfa_failed").await?;
         tx.commit().await?;
+        tracing::warn!(owner_id = actor.id, "upgrade MFA authorization rejected");
         return Err(ApiError {
             status: StatusCode::BAD_REQUEST,
             code: "mfa_invalid",
@@ -1187,11 +1204,25 @@ async fn start_upgrade(
     record_audit(&mut tx, &actor, "panel_upgrade_requested", Some(actor.id)).await?;
     tx.commit().await?;
     // The root-owned offer expires once accepted. No URLs, checksums, paths or commands cross this boundary.
-    upgrade_request(
+    tracing::info!(
+        owner_id = actor.id,
+        stage = "submit",
+        "upgrade authorization accepted"
+    );
+    let result = upgrade_request(
         &state,
         serde_json::json!({"op":"start","offer":input.offer}),
     )
-    .await
+    .await;
+    match &result {
+        Ok(_) => tracing::info!(owner_id = actor.id, "upgrade job acknowledged"),
+        Err(error) => tracing::warn!(
+            owner_id = actor.id,
+            code = error.code,
+            "upgrade job acknowledgement failed"
+        ),
+    }
+    result
 }
 
 async fn api_not_found() -> ApiError {
@@ -1236,11 +1267,24 @@ pub fn router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn(move |request:axum::extract::Request,next:axum::middleware::Next| {
             let maintenance = maintenance.clone();
             async move {
+            let started = Instant::now();
+            let method = request.method().clone();
+            // Log route patterns only, never URLs, query strings, headers or request bodies.
+            let route = request.extensions().get::<MatchedPath>().map(|path| path.as_str().to_owned()).unwrap_or_else(|| "static".into());
+            let upgrade_mutation = method == axum::http::Method::POST && matches!(route.as_str(), "/api/system/update" | "/api/system/update/check");
+            if upgrade_mutation { tracing::info!(%method, %route, "upgrade HTTP request received"); }
             // Once the snapshot is taken, reject external writes until commit or recovery completes.
             // New services may be serving health/read requests before the upgrade's final decision.
             let writing_api = request.uri().path().starts_with("/api/") && !matches!(*request.method(), axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS);
             let locked = match maintenance { Some(path) if writing_api => tokio::fs::try_exists(path).await.unwrap_or(true), _ => false };
             let mut response=if locked { ApiError::unavailable().into_response() } else { next.run(request).await };
+            let elapsed_ms = started.elapsed().as_millis();
+            let status = response.status().as_u16();
+            if elapsed_ms >= 2000 || response.status().is_server_error() {
+                tracing::warn!(%method, %route, status, elapsed_ms, "HTTP request slow or failed");
+            } else if upgrade_mutation {
+                tracing::info!(%method, %route, status, elapsed_ms, "upgrade HTTP request completed");
+            }
             let headers=response.headers_mut();
             headers.insert(header::CACHE_CONTROL,"no-store".parse().unwrap());
             headers.insert("x-content-type-options","nosniff".parse().unwrap());
