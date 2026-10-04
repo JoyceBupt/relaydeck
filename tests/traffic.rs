@@ -38,7 +38,7 @@ fn dynamic_counts_do_not_weaken_integrity_checks_for_quota_limits() {
 async fn traffic_kernel_enforcement_and_recovery() {
     use relaydeck::{
         executor::{DesiredPlan, DesiredRule, ExecutorPolicy, Protocol},
-        linux::{BrokerPolicy, ResourceLimits},
+        linux::BrokerPolicy,
         traffic::{TrafficBudget, TrafficGrant, driver::TrafficMeter},
     };
     use std::sync::atomic::{AtomicI64, Ordering};
@@ -81,7 +81,7 @@ async fn traffic_kernel_enforcement_and_recovery() {
         max_owners: 11,
         socket_path: "/run/relaydeck/broker.sock".into(),
         authorization_ttl_secs: 120,
-        limits: ResourceLimits::default(),
+        limits: serde_json::Value::Null,
     };
     let make_grant = |owner, limit, mode| TrafficGrant {
         owner_id: owner,

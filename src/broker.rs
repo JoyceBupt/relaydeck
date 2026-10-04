@@ -316,6 +316,7 @@ pub async fn run(policy_path: &Path) -> anyhow::Result<()> {
                             events.insert(owner,Failure{owner,revision,message:"运行授权已过期".into(),retryable:true});
                         }
                         for (owner,revision,message,retryable) in driver.unhealthy_owners().await {
+                            tracing::warn!(owner_id=owner,revision,retryable,%message,"tenant runtime unhealthy");
                             leases.remove(&owner);
                             if let Err(error)=driver.stop(owner).await { tracing::error!(owner,%error,"unhealthy tenant isolated; stop will be retried"); stopping.insert(owner); }
                             if !retryable { blocked.insert(owner,revision); }

@@ -3,6 +3,9 @@ import importlib.util
 import io
 import json
 import pathlib
+import shutil
+import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -17,6 +20,26 @@ spec.loader.exec_module(manage)
 
 
 class ReleaseValidation(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == 'linux' and shutil.which('systemd-analyze'), 'Linux systemd parser only')
+    def test_shipped_services_parse_without_resource_setting_errors(self):
+        with tempfile.TemporaryDirectory(prefix='relaydeck-unit-parser-') as directory:
+            units = []
+            for source in sorted((MODULE.parents[1] / 'deploy').glob('*.service')):
+                lines = []
+                for line in source.read_text().splitlines():
+                    if line.startswith(('ExecStart=', 'ExecStartPre=')):
+                        line = line.split('=', 1)[0] + '=/usr/bin/true'
+                    elif line.startswith(('User=', 'Group=')):
+                        line = line.split('=', 1)[0] + '=65534'
+                    lines.append(line)
+                unit = pathlib.Path(directory) / source.name
+                unit.write_text('\n'.join(lines) + '\n')
+                units.append(str(unit))
+            result = subprocess.run(['systemd-analyze', 'verify', '--man=no', *units], capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn('Invalid CPU quota', result.stderr)
+            self.assertNotIn('Failed to parse', result.stderr)
+
     def archive(self, directory, extra=None, target='aarch64-unknown-linux-gnu'):
         path = directory / 'release.tar.gz'
         binary = bytearray(24)

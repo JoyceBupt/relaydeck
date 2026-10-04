@@ -398,7 +398,7 @@ fn realm_data_plane_enforces_dual_stack_acl_targets_and_account_uids() {
         max_owners: 2,
         socket_path: "/run/relaydeck/broker.sock".into(),
         authorization_ttl_secs: 120,
-        limits: relaydeck::linux::ResourceLimits::default(),
+        limits: serde_json::Value::Null,
     };
     let boundary = ExecutorPolicy {
         reserved_ports: policy.reserved_ports.clone(),

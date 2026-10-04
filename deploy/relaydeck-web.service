@@ -28,9 +28,13 @@ ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ReadWritePaths=/var/lib/relaydeck/data /var/lib/relaydeck/secrets /var/lib/relaydeck/backups
-MemoryHigh=192M
-MemoryMax=256M
-TasksMax=32
+
+MemoryHigh=infinity
+MemoryMax=infinity
+MemorySwapMax=infinity
+CPUQuota=
+TasksMax=infinity
+LimitNOFILE=infinity
 
 [Install]
 WantedBy=multi-user.target

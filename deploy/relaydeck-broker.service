@@ -27,8 +27,13 @@ RestrictSUIDSGID=yes
 RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
 ReadWritePaths=/var/lib/relaydeck/runtime /run/relaydeck /run/systemd/system
 InaccessiblePaths=/var/lib/relaydeck/data /var/lib/relaydeck/secrets /var/lib/relaydeck/backups
-MemoryMax=128M
-TasksMax=32
+
+MemoryHigh=infinity
+MemoryMax=infinity
+MemorySwapMax=infinity
+CPUQuota=
+TasksMax=infinity
+LimitNOFILE=infinity
 
 [Install]
 WantedBy=multi-user.target

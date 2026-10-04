@@ -10,17 +10,14 @@
   "authorization_ttl_secs": 120,
   "allowed_port_start": 1024,
   "allowed_port_end": 65535,
-  "reserved_ports": [22, 80, 443, 7410, 17443],
+  "reserved_ports": [
+    22,
+    80,
+    443,
+    7410,
+    17443
+  ],
   "local_ips": [],
   "uid_start": 60000,
-  "max_owners": 11,
-  "limits": {
-    "memory_high_mb": 32,
-    "memory_max_mb": 64,
-    "tasks": 96,
-    "cpu_percent": 20,
-    "nofile": 4096,
-    "total_memory_mb": 384,
-    "total_cpu_percent": 150
-  }
+  "max_owners": 11
 }

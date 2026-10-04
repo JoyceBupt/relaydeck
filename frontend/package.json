@@ -2,7 +2,7 @@
   "name": "relaydeck-frontend",
   "private": true,
   "license": "MIT",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "type": "module",
   "packageManager": "pnpm@11.18.0",
   "engines": {

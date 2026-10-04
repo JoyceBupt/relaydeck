@@ -184,7 +184,9 @@ def launch(identifier, recover=False):
     root_path(PROGRAM)
     subprocess.run(['systemd-run', '--quiet', '--no-block', '--collect', '--unit=' + job_unit(identifier),
         '--property=Type=exec', '--property=RuntimeMaxSec=600', '--property=TimeoutStopSec=90',
-        '--property=UMask=0077', '--property=MemoryMax=384M', '--property=TasksMax=32',
+        '--property=UMask=0077', '--property=MemoryHigh=infinity', '--property=MemoryMax=infinity',
+        '--property=MemorySwapMax=infinity', '--property=CPUQuota=',
+        '--property=TasksMax=infinity', '--property=LimitNOFILE=infinity',
         '/usr/bin/python3', '-B', str(PROGRAM), 'recover-job' if recover else 'run-job', identifier],
         check=True, env=ENV, timeout=10, capture_output=True)
 

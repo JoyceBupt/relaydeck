@@ -1,0 +1,9 @@
+[Unit]
+Description=RelayDeck runtimes
+
+[Slice]
+MemoryHigh=infinity
+MemoryMax=infinity
+MemorySwapMax=infinity
+TasksMax=infinity
+CPUQuota=
