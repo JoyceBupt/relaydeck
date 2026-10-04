@@ -122,7 +122,7 @@ const recent = computed(() => (audit.data.value ?? []).slice(0, 5).map(entry => 
           <ServerOff class="mt-0.5 size-4 text-danger" aria-hidden="true" />
           <div class="min-w-0 flex-1">
             <p class="font-medium">{{ executor === 'offline' ? '执行器离线' : '执行器未连接' }}</p>
-            <p class="text-sm text-muted">{{ executor === 'offline' ? '新变更暂不生效，运行中的转发不受影响' : '启动 relaydeck worker 后规则才会生效' }}</p>
+            <p class="text-sm text-muted">{{ executor === 'offline' ? '新变更等待同步' : '转发尚未生效' }}</p>
           </div>
         </li>
         <li v-for="group in failedOwners" :key="group.ownerId" class="flex items-start gap-3 px-4 py-3.5">
