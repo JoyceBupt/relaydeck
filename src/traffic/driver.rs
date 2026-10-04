@@ -337,13 +337,21 @@ impl TrafficMeter {
         // Recovery freezes the client legs while taking a final counter snapshot.
         let owners = self.ledger.accounts.keys().copied().collect::<Vec<_>>();
         self.freeze(&owners).await?;
-        if let Some(value) = Self::table().await? {
-            self.absorb(&value)?;
+        let existing = Self::table().await?;
+        if let Some(value) = &existing {
+            self.absorb(value)?;
         }
         self.persist()?;
-        let mut text = format!(
-            "add table inet {TABLE}\nflush table inet {TABLE}\nadd chain inet {TABLE} input {{type filter hook input priority -9;policy accept;}}\nadd chain inet {TABLE} output {{type filter hook output priority -9;policy accept;}}\n"
-        );
+        // Flushing a table keeps named objects and set members. Recovery must
+        // replace this dedicated table atomically after preserving its counters.
+        let mut text = if existing.is_some() {
+            format!("delete table inet {TABLE}\n")
+        } else {
+            String::new()
+        };
+        text.push_str(&format!(
+            "add table inet {TABLE}\nadd chain inet {TABLE} input {{type filter hook input priority -9;policy accept;}}\nadd chain inet {TABLE} output {{type filter hook output priority -9;policy accept;}}\n"
+        ));
         for (owner, account) in &self.ledger.accounts {
             let (rx, tx, _) = self.names(*owner, account);
             text.push_str(&format!("add counter inet {TABLE} {rx} {{packets 0 bytes {};}}\nadd counter inet {TABLE} {tx} {{packets 0 bytes {};}}\nadd set inet {TABLE} blocked_{owner} {{type nf_proto;flags dynamic;size 2;}}\nadd chain inet {TABLE} rx_{owner}\nadd chain inet {TABLE} tx_{owner}\n",account.incoming,account.outgoing));
