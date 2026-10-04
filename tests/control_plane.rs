@@ -2111,3 +2111,189 @@ async fn tcp_connectivity_distinguishes_listening_from_refused_targets() {
         "refused"
     );
 }
+
+#[tokio::test]
+async fn traffic_budgets_are_admin_only_preserve_old_grants_and_resume_next_month() {
+    use relaydeck::traffic::{TrafficBudget, TrafficMode, TrafficSnapshot};
+    let f = Fixture::new().await;
+    assert!(f.admin.user["traffic"]["limit_bytes"].is_null());
+    let alice = f.add_user("alice", 41000).await;
+    let bob = f.add_user("bob", 42000).await;
+    let owner = alice.user["id"].as_i64().unwrap();
+    assert_eq!(alice.user["traffic"]["limit_bytes"], 100_000_000_000_i64);
+    let path = format!("/api/users/{owner}/traffic");
+    assert_eq!(
+        call(&f.app, "GET", &path, None, Some(&bob), false).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(&f.app, "GET", &path, None, Some(&alice), false)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let budget = json!({"enabled":true,"max_rules":10,"expires_at":null,"traffic":{"limit_bytes":1_000_000_000_000_i64,"mode":"egress"}});
+    let grant_path = format!("/api/users/{owner}");
+    assert_eq!(
+        call(
+            &f.app,
+            "PUT",
+            &grant_path,
+            Some(budget.clone()),
+            Some(&alice),
+            true
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        call(
+            &f.app,
+            "PUT",
+            &grant_path,
+            Some(budget.clone()),
+            Some(&f.admin),
+            false
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    let (status, _, updated) = call(
+        &f.app,
+        "PUT",
+        &grant_path,
+        Some(budget),
+        Some(&f.admin),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    assert_eq!(updated["traffic"]["mode"], "egress");
+    let (status, _, updated) = call(
+        &f.app,
+        "PUT",
+        &grant_path,
+        Some(json!({"enabled":true,"max_rules":10,"expires_at":null})),
+        Some(&f.admin),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(updated["traffic"]["limit_bytes"], 1_000_000_000_000_i64);
+    let alice = sign_in(&f.app, "alice", USER_PASSWORD).await;
+    let (_, _, created) = call(
+        &f.app,
+        "POST",
+        "/api/rules",
+        Some(rule(41000)),
+        Some(&alice),
+        true,
+    )
+    .await;
+    let (start, next) = relaydeck::traffic::utc_month(relaydeck::db::now()).unwrap();
+    let mut snapshot = TrafficSnapshot {
+        owner_id: owner,
+        budget: TrafficBudget {
+            limit_bytes: Some(1_000_000_000_000),
+            mode: TrafficMode::Egress,
+        },
+        in_bytes: 3,
+        out_bytes: 1_000_000_000_000,
+        used_bytes: 1_000_000_000_000,
+        period_start: start,
+        reset_at: next,
+        blocked: true,
+        ready: true,
+        error: None,
+        observed_at: relaydeck::db::now(),
+    };
+    relaydeck::worker::record_traffic(&f.state.pool, &[snapshot.clone()])
+        .await
+        .unwrap();
+    let (_, _, rules) = call(&f.app, "GET", "/api/rules", None, Some(&alice), false).await;
+    assert_eq!(rules[0]["id"], created["id"]);
+    assert_eq!(rules[0]["runtime_status"], "blocked");
+    assert_eq!(rules[0]["enabled"], true);
+    let revision: i64 = sqlx::query_scalar("SELECT desired_revision FROM users WHERE id=?")
+        .bind(owner)
+        .fetch_one(&f.state.pool)
+        .await
+        .unwrap();
+    relaydeck::worker::record_traffic(&f.state.pool, &[snapshot.clone()])
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT desired_revision FROM users WHERE id=?")
+            .bind(owner)
+            .fetch_one(&f.state.pool)
+            .await
+            .unwrap(),
+        revision
+    );
+    let (_, _, audit) = call(&f.app, "GET", "/api/audit", None, Some(&f.admin), false).await;
+    let event = audit
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["action"] == "user_traffic_blocked")
+        .unwrap();
+    assert_eq!(event["actor_username"], "系统");
+    assert_eq!(event["resource_kind"], "user");
+    assert_eq!(event["resource_name"], "alice");
+    snapshot.period_start = next;
+    snapshot.reset_at = relaydeck::traffic::utc_month(next).unwrap().1;
+    snapshot.in_bytes = 0;
+    snapshot.out_bytes = 0;
+    snapshot.used_bytes = 0;
+    snapshot.blocked = false;
+    relaydeck::worker::record_traffic(&f.state.pool, &[snapshot.clone()])
+        .await
+        .unwrap();
+    let (_, _, traffic) = call(&f.app, "GET", &path, None, Some(&alice), false).await;
+    assert_eq!(traffic["blocked"], false);
+    assert_eq!(traffic["used_bytes"], 0);
+    assert!(
+        sqlx::query_scalar::<_, i64>("SELECT desired_revision FROM users WHERE id=?")
+            .bind(owner)
+            .fetch_one(&f.state.pool)
+            .await
+            .unwrap()
+            > revision
+    );
+    // A delayed root reply for an older month cannot restore old counters or block the new month.
+    snapshot.period_start = start;
+    snapshot.blocked = true;
+    snapshot.used_bytes = 1_000_000_000_000;
+    relaydeck::worker::record_traffic(&f.state.pool, &[snapshot])
+        .await
+        .unwrap();
+    assert_eq!(
+        call(&f.app, "GET", &path, None, Some(&alice), false)
+            .await
+            .2["blocked"],
+        false
+    );
+}
+
+#[tokio::test]
+async fn invalid_traffic_limits_cannot_create_accounts() {
+    let f = Fixture::new().await;
+    for limit in [0, -1, 1_000_000_000_000_001_i64] {
+        let input = json!({"username":"badquota","password":INITIAL_PASSWORD,"traffic":{"limit_bytes":limit,"mode":"both"},"expires_at":null});
+        assert_eq!(
+            call(
+                &f.app,
+                "POST",
+                "/api/users",
+                Some(input),
+                Some(&f.admin),
+                true
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+}

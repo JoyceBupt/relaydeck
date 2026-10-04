@@ -44,11 +44,16 @@ export function usePorts(ownerId: MaybeRefOrGetter<number | null | undefined>) {
   })
 }
 
+export function useTraffic(ownerId: MaybeRefOrGetter<number | null | undefined>) {
+  return useQuery({ queryKey: computed(() => ['traffic', toValue(ownerId) ?? 0]), queryFn: () => api.traffic(toValue(ownerId)!), enabled: computed(() => signedIn.value && !!toValue(ownerId)), refetchInterval: poll(5_000) })
+}
+
 /** Everything a rule or grant change can move: lists, quota counts, port leases, history. */
 export async function afterRuleChange() {
   await Promise.all([
     queryClient.invalidateQueries({ queryKey: keys.rules }),
     queryClient.invalidateQueries({ queryKey: ['ports'] }),
+    queryClient.invalidateQueries({ queryKey: ['traffic'] }),
     queryClient.invalidateQueries({ queryKey: keys.users }),
     queryClient.invalidateQueries({ queryKey: keys.audit }),
     refreshIdentity(),

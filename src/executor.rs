@@ -48,6 +48,8 @@ pub struct DesiredRule {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DesiredPlan {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic: Option<crate::traffic::TrafficBudget>,
     pub owner_id: i64,
     pub revision: i64,
     pub enabled: bool,
@@ -88,6 +90,8 @@ pub enum PlanError {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimePlan {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    traffic: Option<crate::traffic::TrafficBudget>,
     owner_id: i64,
     revision: i64,
     expires_at: Option<i64>,
@@ -114,6 +118,7 @@ impl DesiredPlan {
         // or their grant has been narrowed beyond the previous rule settings.
         if !self.available_at(timestamp) {
             return Ok(RuntimePlan {
+                traffic: self.traffic.clone(),
                 owner_id: self.owner_id,
                 revision: self.revision,
                 expires_at: self.expires_at,
@@ -128,6 +133,9 @@ impl DesiredPlan {
             i64::from(self.port_end),
             i64::from(self.max_rules),
         )?;
+        if let Some(budget) = &self.traffic {
+            budget.validate().map_err(|_| PlanError::StoredRule)?;
+        }
         if self.rules.len() > MAX_RULES {
             return Err(PlanError::RuleLimit);
         }
@@ -158,6 +166,7 @@ impl DesiredPlan {
         }
         rules.sort_unstable_by_key(|rule| (rule.listen_port, rule.id));
         Ok(RuntimePlan {
+            traffic: self.traffic.clone(),
             owner_id: self.owner_id,
             revision: self.revision,
             expires_at: self.expires_at,
@@ -170,6 +179,9 @@ impl DesiredPlan {
 }
 
 impl RuntimePlan {
+    pub fn traffic(&self) -> Option<&crate::traffic::TrafficBudget> {
+        self.traffic.as_ref()
+    }
     pub fn owner_id(&self) -> i64 {
         self.owner_id
     }
@@ -206,6 +218,7 @@ impl RuntimePlan {
         timestamp: i64,
     ) -> Result<Self, PlanError> {
         DesiredPlan {
+            traffic: self.traffic.clone(),
             owner_id: self.owner_id,
             revision: self.revision,
             enabled: true,
@@ -351,6 +364,9 @@ struct PlanUser {
     expires_at: Option<i64>,
     max_rules: i64,
     desired_revision: i64,
+    traffic_limit_bytes: Option<i64>,
+    traffic_mode: String,
+    traffic_blocked: bool,
 }
 
 #[derive(sqlx::FromRow)]
@@ -370,7 +386,7 @@ async fn load_plan(
     timestamp: i64,
 ) -> Result<Option<Result<DesiredPlan, PlanError>>, sqlx::Error> {
     let Some(user) = sqlx::query_as::<_, PlanUser>(
-        "SELECT id,enabled,expires_at,max_rules,desired_revision FROM users WHERE id=?",
+        "SELECT id,enabled,expires_at,max_rules,desired_revision,traffic_limit_bytes,traffic_mode,traffic_blocked FROM users WHERE id=?",
     )
     .bind(owner_id)
     .fetch_optional(&mut **tx)
@@ -378,7 +394,9 @@ async fn load_plan(
     else {
         return Ok(None);
     };
-    let available = user.enabled && user.expires_at.is_none_or(|expiry| expiry > timestamp);
+    let available = user.enabled
+        && !user.traffic_blocked
+        && user.expires_at.is_none_or(|expiry| expiry > timestamp);
     let raw_rules = if available {
         sqlx::query_as::<_, PlanRule>(
             "SELECT id,listen_port,target_ip,target_port,protocol,source_cidrs,(enabled=1 AND dns_blocked=0) AS enabled FROM rules WHERE owner_id=? AND deleted_at IS NULL ORDER BY id LIMIT 31",
@@ -435,9 +453,14 @@ async fn load_plan(
             })
             .collect::<Result<_, PlanError>>()?;
         Ok(DesiredPlan {
+            traffic: Some(crate::traffic::TrafficBudget {
+                limit_bytes: user.traffic_limit_bytes,
+                mode: serde_json::from_value(user.traffic_mode.into())
+                    .map_err(|_| PlanError::StoredRule)?,
+            }),
             owner_id: user.id,
             revision: user.desired_revision,
-            enabled: user.enabled,
+            enabled: user.enabled && !user.traffic_blocked,
             expires_at: user.expires_at,
             port_start: 1024,
             port_end: 65535,
@@ -671,7 +694,7 @@ async fn current_in(
     timestamp: i64,
 ) -> Result<bool, sqlx::Error> {
     let user: Option<(i64, bool, Option<i64>)> =
-        sqlx::query_as("SELECT desired_revision,enabled,expires_at FROM users WHERE id=?")
+        sqlx::query_as("SELECT desired_revision,(enabled=1 AND traffic_blocked=0),expires_at FROM users WHERE id=?")
             .bind(plan.owner_id)
             .fetch_optional(&mut **tx)
             .await?;

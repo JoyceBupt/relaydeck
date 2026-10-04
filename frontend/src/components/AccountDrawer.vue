@@ -5,13 +5,15 @@ import { useMutation } from '@tanstack/vue-query'
 import { ArrowRightLeft, Copy, KeyRound, RotateCw, RefreshCw, ShieldCheck } from '@lucide/vue'
 import SideDrawer from './SideDrawer.vue'
 import PortRuler from './PortRuler.vue'
+import TrafficSummary from './TrafficSummary.vue'
+import { trafficBytes, trafficFactors, trafficModes } from '../lib/traffic'
 import StatusMark from './StatusMark.vue'
 import UiSwitch from './UiSwitch.vue'
 import ConfirmDialog from './ConfirmDialog.vue'
 import { api } from '../api/endpoints'
 import { errorMessage, isStaleError } from '../api/client'
-import type { Rule, User } from '../types'
-import { afterRuleChange, usePorts, useRetry } from '../lib/queries'
+import type { Rule, TrafficMode, User } from '../types'
+import { afterRuleChange, usePorts, useRetry, useTraffic } from '../lib/queries'
 import { dateInputValue, expiry, expiryFromDateInput, nowSeconds } from '../lib/format'
 import { validatePassword, validateUsername } from '../lib/validation'
 import { generatePassword } from '../lib/password'
@@ -29,21 +31,25 @@ const statuses = computed(() => Object.fromEntries(props.rules.map(rule => [rule
 const ownRules = computed(() => props.rules.filter(rule => rule.owner_id === props.userId))
 const failed = computed(() => ownRules.value.filter(rule => rule.runtime_status === 'failed'))
 
-interface FormState { username: string; password: string; enabled: boolean; max_rules: number | null; expires: string }
-const form = reactive<FormState>({ username: '', password: '', enabled: true, max_rules: 10, expires: '' })
+interface FormState { username: string; password: string; enabled: boolean; max_rules: number | null; expires: string; traffic_unlimited: boolean; traffic_amount: number | null; traffic_unit: 'GB' | 'TB'; traffic_mode: TrafficMode }
+const form = reactive<FormState>({ username: '', password: '', enabled: true, max_rules: 10, expires: '', traffic_unlimited: false, traffic_amount: 100, traffic_unit: 'GB', traffic_mode: 'both' })
 const baseline = ref('')
 const initializedFor = ref<string | null>(null)
 const submitted = ref(false)
 const serverError = ref('')
-const snapshot = () => JSON.stringify(form)
+const snapshot = () => { const { traffic_amount, traffic_unit, traffic_unlimited, ...rest } = form; return JSON.stringify({ ...rest, traffic_limit: traffic_unlimited ? null : trafficBytes(traffic_amount, traffic_unit) }) }
+const traffic = useTraffic(computed(() => user.value?.id))
+const modeOptions = Object.entries(trafficModes)
 
 function load() {
   const key = `${props.userId ?? 'new'}`
   if (initializedFor.value === key || (!isNew.value && !user.value)) return
   if (user.value) {
-    Object.assign(form, { username: user.value.username, password: '', enabled: user.value.enabled, max_rules: user.value.max_rules, expires: dateInputValue(user.value.expires_at) })
+    const budget = user.value.traffic
+    const unit = budget?.limit_bytes && budget.limit_bytes >= trafficFactors.TB ? 'TB' : 'GB'
+    Object.assign(form, { username: user.value.username, password: '', enabled: user.value.enabled, max_rules: user.value.max_rules, expires: dateInputValue(user.value.expires_at), traffic_unlimited: budget?.limit_bytes == null, traffic_amount: budget?.limit_bytes ? budget.limit_bytes / trafficFactors[unit] : 100, traffic_unit: unit, traffic_mode: budget?.mode ?? 'both' })
   } else {
-    Object.assign(form, { username: '', password: generatePassword(), enabled: true, max_rules: 10, expires: '' })
+    Object.assign(form, { username: '', password: generatePassword(), enabled: true, max_rules: 10, expires: '', traffic_unlimited: false, traffic_amount: 100, traffic_unit: 'GB', traffic_mode: 'both' })
   }
   submitted.value = false
   serverError.value = ''
@@ -53,9 +59,17 @@ function load() {
 watch(() => [props.open, props.userId, user.value?.id], () => { if (props.open) load(); else initializedFor.value = null }, { immediate: true })
 const dirty = computed(() => initializedFor.value !== null && snapshot() !== baseline.value)
 
+function setTrafficUnit(event: Event) {
+  const unit = (event.target as HTMLSelectElement).value as 'GB' | 'TB'
+  if (form.traffic_amount !== null) form.traffic_amount = form.traffic_amount * trafficFactors[form.traffic_unit] / trafficFactors[unit]
+  form.traffic_unit = unit
+}
+
 const errors = computed(() => {
   const expiresAt = expiryFromDateInput(form.expires)
+  const bytes = trafficBytes(form.traffic_amount, form.traffic_unit)
   return {
+    traffic: !form.traffic_unlimited && (bytes === null || bytes < 1 || bytes > 1_000_000_000_000_000) ? '额度须为 1 字节至 1000 TB' : '',
     username: isNew.value ? validateUsername(form.username) : '',
     password: isNew.value ? validatePassword(form.password) : '',
     maxRules: form.max_rules === null || !Number.isInteger(form.max_rules) || form.max_rules < 0 || form.max_rules > 30 ? '范围 0–30' : '',
@@ -72,7 +86,7 @@ const affected = computed(() => {
 
 const save = useMutation({
   mutationFn: () => {
-    const grant = { max_rules: form.max_rules!, expires_at: expiryFromDateInput(form.expires) }
+    const grant = { max_rules: form.max_rules!, expires_at: expiryFromDateInput(form.expires), traffic: { limit_bytes: form.traffic_unlimited ? null : trafficBytes(form.traffic_amount, form.traffic_unit), mode: form.traffic_mode } }
     return isNew.value
       ? api.createUser({ username: form.username.trim(), password: form.password, ...grant })
       : api.updateUser(props.userId!, { enabled: form.enabled, ...grant })
@@ -91,6 +105,7 @@ async function submit() {
       toast(`已创建 ${saved.username}`)
       initializedFor.value = `${saved.id}`
       form.password = ''
+      baseline.value = snapshot()
       await router.replace(`/accounts/${saved.id}`)
     } else {
       toast(`已保存 ${saved.username}`)
@@ -186,6 +201,16 @@ const expiryInfo = computed(() => (user.value ? expiry(user.value.expires_at) : 
             <span v-else-if="!form.expires" class="field-hint">留空为长期</span>
           </div>
         </div>
+
+        <section class="grid gap-3" aria-label="流量额度">
+          <div class="flex items-center justify-between gap-3"><span class="field-label">不限量</span><UiSwitch v-model="form.traffic_unlimited" label="不限流量" /></div>
+          <div class="grid grid-cols-2 items-start gap-3">
+            <div class="field"><label class="field-label" for="account-traffic">流量额度</label><div class="flex gap-2"><input id="account-traffic" v-model.number="form.traffic_amount" class="input input-mono min-w-0" type="number" min="0.000000001" step="any" :disabled="form.traffic_unlimited" :aria-invalid="!!show('traffic')" /><select class="input !w-20 shrink-0" :value="form.traffic_unit" aria-label="流量单位" :disabled="form.traffic_unlimited" @change="setTrafficUnit"><option>GB</option><option>TB</option></select></div><span class="field-hint">每月重置</span></div>
+            <div class="field"><label class="field-label" for="account-traffic-mode">计量方向</label><select id="account-traffic-mode" v-model="form.traffic_mode" class="input" :disabled="form.traffic_unlimited"><option v-for="[value,label] in modeOptions" :key="value" :value="value">{{ label }}</option></select><span class="field-hint">客户端侧</span></div>
+          </div>
+          <p v-if="show('traffic')" class="field-error">{{ show('traffic') }}</p>
+        </section>
+        <TrafficSummary v-if="user" class="border-t border-line pt-4" :traffic="traffic.data.value ?? user.traffic" :loading="traffic.isLoading.value" :error="traffic.isError.value" />
 
         <div v-if="user && ports.data.value?.leases.length" class="field">
           <span class="field-label">已用端口</span>

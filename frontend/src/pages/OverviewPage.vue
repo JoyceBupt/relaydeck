@@ -4,9 +4,10 @@ import { ArrowRight, Clock, Gauge, Plus, RotateCw, ServerOff } from '@lucide/vue
 import StatusMark from '../components/StatusMark.vue'
 import RelayTopology from '../components/RelayTopology.vue'
 import PortRuler from '../components/PortRuler.vue'
+import TrafficSummary from '../components/TrafficSummary.vue'
 import type { RuntimeStatus } from '../types'
 import { currentUser, isAdmin } from '../lib/session'
-import { useAudit, useHealth, usePorts, useRetry, useRules, useUsers } from '../lib/queries'
+import { useAudit, useHealth, usePorts, useRetry, useRules, useUsers, useTraffic } from '../lib/queries'
 import { expiry, MAX_TENANTS, relative, statusLabels } from '../lib/format'
 import { describeAudit } from '../lib/audit'
 
@@ -16,6 +17,8 @@ const health = useHealth()
 const audit = useAudit()
 const retry = useRetry()
 const ports = usePorts(computed(() => (isAdmin.value ? null : currentUser.value?.id)))
+
+const traffic = useTraffic(computed(() => isAdmin.value ? null : currentUser.value?.id))
 
 const all = computed(() => rules.data.value ?? [])
 const statusOrder: RuntimeStatus[] = ['active', 'pending', 'failed', 'blocked', 'stopped']
@@ -99,6 +102,7 @@ const recent = computed(() => (audit.data.value ?? []).slice(0, 5).map(entry => 
           <p v-else class="py-4 text-center text-sm text-muted">暂无记录</p>
         </section>
         <template v-else>
+          <TrafficSummary class="panel p-4" :traffic="traffic.data.value ?? currentUser?.traffic" :loading="traffic.isLoading.value" :error="traffic.isError.value" />
           <div class="panel flex flex-col gap-3 p-4">
             <span class="stat-label">端口额度</span>
             <span><span class="stat-value">{{ currentUser?.rule_count ?? 0 }}</span><span class="stat-unit">/ {{ currentUser?.max_rules ?? 0 }} 个</span></span>

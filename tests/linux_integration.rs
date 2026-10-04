@@ -407,6 +407,7 @@ fn realm_data_plane_enforces_dual_stack_acl_targets_and_account_uids() {
     let plans: Vec<_> = [(1, 41000, "8.8.42.2", 3), (2, 41010, "2001:4860:42::2", 4)]
         .map(|(owner, port, target, client)| {
             DesiredPlan {
+                traffic: None,
                 owner_id: owner,
                 revision: 1,
                 enabled: true,

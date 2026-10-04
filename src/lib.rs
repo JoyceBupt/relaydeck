@@ -14,5 +14,6 @@ pub mod models;
 pub mod policy;
 pub mod rules;
 pub mod tenant;
+pub mod traffic;
 pub mod upgrade;
 pub mod worker;

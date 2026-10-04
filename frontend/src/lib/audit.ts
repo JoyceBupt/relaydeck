@@ -21,6 +21,8 @@ const phrases: Record<string, { verb: string; category: AuditCategory; self?: bo
   rule_dns_updated: { verb: '目标地址已刷新', category: 'rule' },
   rule_dns_restored: { verb: '目标已恢复', category: 'rule' },
   rule_dns_blocked: { verb: '目标已阻断', category: 'rule' },
+  user_traffic_blocked: { verb: '已阻断流量', category: 'account' },
+  user_traffic_restored: { verb: '已恢复流量', category: 'account' },
   user_created: { verb: '创建了账户', category: 'account' },
   user_updated: { verb: '调整了账户授权', category: 'account' },
   password_reset: { verb: '重置了账户密码', category: 'account' },

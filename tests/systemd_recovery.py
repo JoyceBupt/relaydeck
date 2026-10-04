@@ -40,6 +40,8 @@ def wait_for(predicate, seconds=15):
 
 
 def request(op, data=None, success=True):
+    if op == 'apply':
+        request('traffic', [{'owner_id': data['owner_id'], 'budget': {'limit_bytes': None, 'mode': 'both'}}])
     value = {'op': op}
     if data is not None:
         value['data'] = data

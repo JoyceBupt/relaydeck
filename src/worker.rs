@@ -54,6 +54,62 @@ pub async fn reconcile_tick<D: ExecutorDriver>(
     Ok(())
 }
 
+pub async fn record_traffic(
+    pool: &SqlitePool,
+    snapshots: &[crate::traffic::TrafficSnapshot],
+) -> anyhow::Result<()> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    for snapshot in snapshots {
+        let previous:Option<(bool,Option<i64>,bool)>=sqlx::query_as("SELECT traffic_blocked,traffic_period_start,traffic_ready FROM users WHERE id=? AND traffic_limit_bytes IS ? AND traffic_mode=? AND (traffic_period_start IS NULL OR traffic_period_start<=?)")
+            .bind(snapshot.owner_id).bind(snapshot.budget.limit_bytes).bind(snapshot.budget.mode.as_str()).bind(snapshot.period_start).fetch_optional(&mut *tx).await?;
+        let Some((blocked, period, ready)) = previous else {
+            continue;
+        };
+        let signed = |value: u64| value.min(i64::MAX as u64) as i64;
+        sqlx::query("UPDATE users SET traffic_in_bytes=?,traffic_out_bytes=?,traffic_used_bytes=?,traffic_period_start=?,traffic_reset_at=?,traffic_blocked=?,traffic_ready=?,traffic_error=?,traffic_observed_at=? WHERE id=?")
+            .bind(signed(snapshot.in_bytes)).bind(signed(snapshot.out_bytes)).bind(signed(snapshot.used_bytes)).bind(snapshot.period_start).bind(snapshot.reset_at).bind(snapshot.blocked).bind(snapshot.ready).bind(&snapshot.error).bind(snapshot.observed_at).bind(snapshot.owner_id).execute(&mut *tx).await?;
+        if blocked != snapshot.blocked
+            || period != Some(snapshot.period_start)
+            || ready != snapshot.ready
+        {
+            crate::api::enqueue_apply(&mut tx, snapshot.owner_id).await?;
+            if blocked != snapshot.blocked {
+                crate::api::record_system_user_audit(
+                    &mut tx,
+                    if snapshot.blocked {
+                        "user_traffic_blocked"
+                    } else {
+                        "user_traffic_restored"
+                    },
+                    snapshot.owner_id,
+                )
+                .await?;
+            }
+        }
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn refresh_traffic(pool: &SqlitePool, driver: &SocketDriver) -> anyhow::Result<()> {
+    let rows: Vec<(i64, Option<i64>, String)> =
+        sqlx::query_as("SELECT id,traffic_limit_bytes,traffic_mode FROM users ORDER BY id")
+            .fetch_all(pool)
+            .await?;
+    let mut grants = Vec::with_capacity(rows.len());
+    for (owner_id, limit_bytes, mode) in rows {
+        grants.push(crate::traffic::TrafficGrant {
+            owner_id,
+            budget: crate::traffic::TrafficBudget {
+                limit_bytes,
+                mode: serde_json::from_value(mode.into())?,
+            },
+        });
+    }
+    record_traffic(pool, &driver.traffic(grants).await?).await
+}
+
 pub async fn refresh_dns<F, Fut>(
     pool: &SqlitePool,
     local_ips: &[std::net::IpAddr],
@@ -209,6 +265,7 @@ pub async fn run(policy_path: &Path) -> anyhow::Result<()> {
                 tokio::select! {
                     _ = interval.tick() => {
                         let tick = async {
+                            if let Err(error)=refresh_traffic(&pool,&driver).await {tracing::error!(%error,"traffic synchronization deferred; existing authorizations continue independently");}
                             receive_failures(&pool,&driver).await?;
                             reconcile_tick(&pool,&reconciler).await?;
                             refresh_dns(&pool,&local_ips,|host,port| {let ips=local_ips.clone();async move {crate::rules::resolve_host(&host,port,&ips).await}}).await

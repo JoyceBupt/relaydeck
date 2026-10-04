@@ -816,6 +816,8 @@ struct CreateUser {
     #[serde(default = "default_port_quota")]
     max_rules: i64,
     expires_at: Option<i64>,
+    #[serde(default)]
+    traffic: crate::traffic::TrafficBudget,
 }
 
 fn default_port_quota() -> i64 {
@@ -836,6 +838,7 @@ async fn create_user(
 ) -> Result<(StatusCode, Json<UserView>), ApiError> {
     auth.admin()?;
     policy::validate_username(&input.username)?;
+    input.traffic.validate()?;
     policy::validate_password(&input.password)?;
     policy::validate_port_grant(1024, 65535, input.max_rules)?;
     validate_expiry(input.expires_at)?;
@@ -851,11 +854,39 @@ async fn create_user(
     if count >= 10 {
         return Err(ApiError::conflict("首版最多10个用户"));
     }
-    let id=sqlx::query("INSERT INTO users(username,password_hash,role,port_start,port_end,max_rules,expires_at,created_at) VALUES(?,?,'user',?,?,?,?,?)")
-        .bind(input.username).bind(hash).bind(1024).bind(65535).bind(input.max_rules).bind(input.expires_at).bind(now()).execute(&mut *tx).await?.last_insert_rowid();
+    let id=sqlx::query("INSERT INTO users(username,password_hash,role,port_start,port_end,max_rules,expires_at,created_at,traffic_limit_bytes,traffic_mode) VALUES(?,?,'user',?,?,?,?,?,?,?)")
+        .bind(input.username).bind(hash).bind(1024).bind(65535).bind(input.max_rules).bind(input.expires_at).bind(now()).bind(input.traffic.limit_bytes).bind(input.traffic.mode.as_str()).execute(&mut *tx).await?.last_insert_rowid();
     record_audit(&mut tx, &actor, "user_created", Some(id)).await?;
     tx.commit().await?;
     Ok((StatusCode::CREATED, Json(user_view(&state.pool, id).await?)))
+}
+
+async fn user_traffic(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::traffic::TrafficView>, ApiError> {
+    auth.ready()?;
+    if auth.user.role != "admin" && auth.user.id != id {
+        return Err(ApiError::not_found());
+    }
+    let user: DbUser = sqlx::query_as("SELECT * FROM users WHERE id=?")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or_else(ApiError::not_found)?;
+    Ok(Json(crate::traffic::TrafficView::from_user(&user)))
+}
+
+pub async fn record_system_user_audit(
+    tx: &mut Transaction<'_, Sqlite>,
+    action: &str,
+    id: i64,
+) -> Result<(), ApiError> {
+    sqlx::query("INSERT INTO audit_events(actor_id,actor_username,action,resource_id,created_at,resource_kind,resource_name) SELECT NULL,'系统',?,id,?,'user',username FROM users WHERE id=?")
+        .bind(action).bind(now()).bind(id).execute(&mut **tx).await?;
+    sqlx::query("DELETE FROM audit_events WHERE id IN (SELECT id FROM audit_events ORDER BY id DESC LIMIT -1 OFFSET 10000)").execute(&mut **tx).await?;
+    Ok(())
 }
 
 async fn list_users(
@@ -885,6 +916,7 @@ struct UpdateUser {
     enabled: bool,
     max_rules: i64,
     expires_at: Option<i64>,
+    traffic: Option<crate::traffic::TrafficBudget>,
 }
 
 async fn update_user(
@@ -894,6 +926,9 @@ async fn update_user(
     Json(input): Json<UpdateUser>,
 ) -> Result<Json<UserView>, ApiError> {
     auth.admin()?;
+    if let Some(budget) = &input.traffic {
+        budget.validate()?;
+    }
     policy::validate_port_grant(1024, 65535, input.max_rules)?;
     if input.enabled {
         validate_expiry(input.expires_at)?;
@@ -910,6 +945,15 @@ async fn update_user(
         .ok_or_else(ApiError::not_found)?;
     if target.role == "admin" && (!input.enabled || input.expires_at.is_some()) {
         return Err(ApiError::bad_request("管理员不能停用或设置到期时间"));
+    }
+    if let Some(budget) = &input.traffic {
+        sqlx::query("UPDATE users SET traffic_ready=CASE WHEN traffic_limit_bytes IS ? AND traffic_mode=? THEN traffic_ready ELSE 0 END,traffic_limit_bytes=?,traffic_mode=? WHERE id=?")
+            .bind(budget.limit_bytes).bind(budget.mode.as_str())
+            .bind(budget.limit_bytes)
+            .bind(budget.mode.as_str())
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
     }
     sqlx::query("UPDATE users SET enabled=?,port_start=?,port_end=?,max_rules=?,expires_at=?,auth_version=auth_version+1 WHERE id=?")
         .bind(input.enabled).bind(1024).bind(65535).bind(input.max_rules).bind(input.expires_at).bind(id).execute(&mut *tx).await?;
@@ -1259,6 +1303,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/users/{id}/password",post(reset_password))
         .route("/api/users/{id}/apply",post(retry_apply))
         .route("/api/users/{id}/ports",get(port_usage))
+        .route("/api/users/{id}/traffic",get(user_traffic))
         .route("/api/preferences",put(preferences))
         .route("/api/audit",get(audit))
         .route("/api/health",get(health))
