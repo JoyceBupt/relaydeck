@@ -1972,3 +1972,142 @@ async fn shared_port_and_quota_races_have_one_winner() {
         .unwrap();
     assert_eq!(count, 2);
 }
+
+#[tokio::test]
+async fn connectivity_is_scoped_csrf_protected_bounded_and_rejects_stale_rules() {
+    use relaydeck::connectivity::{CheckChannel, CheckFuture, CheckRequest, RuleCheck, TcpCheck};
+    use std::sync::{Arc, Mutex};
+    struct Checker {
+        calls: Arc<Mutex<Vec<CheckRequest>>>,
+        pool: sqlx::SqlitePool,
+        stale: bool,
+    }
+    impl CheckChannel for Checker {
+        fn check(&self, request: CheckRequest) -> CheckFuture<'_> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push(request.clone());
+                if self.stale {
+                    sqlx::query("UPDATE users SET desired_revision=desired_revision+1 WHERE id=?")
+                        .bind(request.owner_id)
+                        .execute(&self.pool)
+                        .await?;
+                }
+                Ok(RuleCheck {
+                    rule_id: request.rule_id,
+                    revision: request.revision,
+                    target_ip: "8.8.8.8".parse().unwrap(),
+                    target_port: 443,
+                    checked_at: relaydeck::db::now(),
+                    tcp_listener: Some(true),
+                    udp_listener: Some(true),
+                    target_tcp: Some(TcpCheck {
+                        status: "timeout".into(),
+                        elapsed_ms: 2000,
+                    }),
+                })
+            })
+        }
+    }
+    let mut f = Fixture::new().await;
+    let alice = f.add_user("alice", 41000).await;
+    let bob = f.add_user("bob", 42000).await;
+    let owner = alice.user["id"].as_i64().unwrap();
+    let (_, _, created) = call(
+        &f.app,
+        "POST",
+        "/api/rules",
+        Some(rule(41000)),
+        Some(&alice),
+        true,
+    )
+    .await;
+    let path = format!("/api/rules/{}/check", created["id"]);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    f.state.connectivity = Arc::new(Checker {
+        calls: calls.clone(),
+        pool: f.state.pool.clone(),
+        stale: false,
+    });
+    f.app = router(f.state.clone());
+    assert_eq!(
+        call(&f.app, "POST", &path, None, None, false).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(&f.app, "POST", &path, None, Some(&alice), false)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        call(&f.app, "POST", &path, None, Some(&bob), true).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(&f.app, "POST", &path, None, Some(&alice), true)
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    assert!(calls.lock().unwrap().is_empty());
+    sqlx::query("UPDATE users SET applied_revision=desired_revision WHERE id=?")
+        .bind(owner)
+        .execute(&f.state.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO runtime_states(owner_id,revision,status,updated_at) SELECT id,desired_revision,'active',unixepoch() FROM users WHERE id=?").bind(owner).execute(&f.state.pool).await.unwrap();
+    sqlx::query("INSERT INTO executor_status(id,last_seen,status) VALUES(1,unixepoch(),'running') ON CONFLICT(id) DO UPDATE SET last_seen=excluded.last_seen,status=excluded.status").execute(&f.state.pool).await.unwrap();
+    let (status, _, result) = call(&f.app, "POST", &path, None, Some(&alice), true).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["target_tcp"]["status"], "timeout");
+    assert_eq!(result["tcp_listener"], true);
+    assert_eq!(calls.lock().unwrap()[0].owner_id, owner);
+    for _ in 0..5 {
+        assert_eq!(
+            call(&f.app, "POST", &path, None, Some(&alice), true)
+                .await
+                .0,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        call(&f.app, "POST", &path, None, Some(&alice), true)
+            .await
+            .0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(calls.lock().unwrap().len(), 6);
+    assert_eq!(
+        call(&f.app, "POST", &path, None, Some(&f.admin), true)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    f.state.connectivity = Arc::new(Checker {
+        calls: calls.clone(),
+        pool: f.state.pool.clone(),
+        stale: true,
+    });
+    f.app = router(f.state.clone());
+    assert_eq!(
+        call(&f.app, "POST", &path, None, Some(&f.admin), true)
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+}
+
+#[tokio::test]
+async fn tcp_connectivity_distinguishes_listening_from_refused_targets() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    assert_eq!(
+        relaydeck::connectivity::tcp(address).await.status,
+        "connected"
+    );
+    drop(listener);
+    assert_eq!(
+        relaydeck::connectivity::tcp(address).await.status,
+        "refused"
+    );
+}

@@ -55,6 +55,17 @@ export interface RuleInput {
   enabled: boolean
 }
 
+export interface RuleCheck {
+  rule_id: number
+  revision: number
+  target_ip: string
+  target_port: number
+  checked_at: number
+  tcp_listener: boolean | null
+  udp_listener: boolean | null
+  target_tcp: { status: 'connected' | 'timeout' | 'refused' | 'unreachable'; elapsed_ms: number } | null
+}
+
 export interface Audit {
   failure_count: number
   id: number

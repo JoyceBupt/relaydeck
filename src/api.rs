@@ -29,6 +29,7 @@ pub struct AppState {
     pub credentials: Credentials,
     pub mfa: crate::mfa::MfaService,
     pub upgrades: Option<Arc<dyn crate::upgrade::UpgradeChannel>>,
+    pub connectivity: Arc<dyn crate::connectivity::CheckChannel>,
     dummy_hash: Arc<String>,
     network_limits: Arc<Mutex<crate::limits::Limits>>,
     account_limits: Arc<Mutex<crate::limits::Limits>>,
@@ -48,6 +49,11 @@ impl AppState {
                 as Arc<dyn crate::upgrade::UpgradeChannel>
         });
         Ok(Self {
+            connectivity: Arc::new(crate::broker::SocketDriver::new(
+                std::env::var_os("RELAYDECK_BROKER_SOCKET")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| "/run/relaydeck/broker.sock".into()),
+            )),
             upgrades,
             pool,
             config: Arc::new(config),

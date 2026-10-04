@@ -1,5 +1,4 @@
 use crate::executor::{DriverError, DriverFuture, ExecutorDriver, RuntimePlan};
-#[cfg(target_os = "linux")]
 use anyhow::Context;
 use anyhow::ensure;
 use serde::{Deserialize, Serialize};
@@ -22,6 +21,7 @@ enum Request {
     Stop(i64),
     Inspect,
     Acknowledge(Vec<(i64, i64)>),
+    Check(crate::connectivity::CheckRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +40,21 @@ struct Reply {
     #[serde(default)]
     retryable: bool,
     events: Vec<Failure>,
+    check: Option<crate::connectivity::RuleCheck>,
+}
+
+impl crate::connectivity::CheckChannel for SocketDriver {
+    fn check(
+        &self,
+        request: crate::connectivity::CheckRequest,
+    ) -> crate::connectivity::CheckFuture<'_> {
+        Box::pin(async move {
+            self.request(Request::Check(request))
+                .await?
+                .check
+                .context("broker omitted connectivity result")
+        })
+    }
 }
 
 #[cfg(unix)]
@@ -217,6 +232,7 @@ pub async fn run(policy_path: &Path) -> anyhow::Result<()> {
         let mut events: BTreeMap<i64, Failure> = BTreeMap::new();
         let mut blocked: BTreeMap<i64, i64> = BTreeMap::new();
         let mut stopping = std::collections::BTreeSet::new();
+        let mut last_check: Option<std::time::Instant> = None;
         let mut interval = tokio::time::interval(Duration::from_secs(10));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut terminate =
@@ -256,6 +272,12 @@ pub async fn run(policy_path: &Path) -> anyhow::Result<()> {
                                 }
                                 Request::Stop(owner) => { leases.remove(&owner); if let Err(error)=driver.stop(owner).await { stopping.insert(owner); reply.retryable=true; return Err(error.into()); } stopping.remove(&owner); }
                                 Request::Inspect => { reply.events = events.values().cloned().collect(); }
+                                Request::Check(check) => {
+                                    ensure!(leases.get(&check.owner_id).is_some_and(|(revision,until)|*revision == check.revision && *until > crate::db::now()), "connectivity authorization is stale");
+                                    ensure!(last_check.is_none_or(|time| time.elapsed() >= Duration::from_secs(5)), "connectivity checks are rate limited");
+                                    last_check = Some(std::time::Instant::now());
+                                    reply.check = Some(driver.check_rule(&check).await?);
+                                }
                                 Request::Acknowledge(ack) => {
                                     ensure!(ack.len() <= policy.max_owners as usize,"too many acknowledgements");
                                     for (owner,revision) in ack { if events.get(&owner).is_some_and(|event|event.revision==revision) { events.remove(&owner); } }

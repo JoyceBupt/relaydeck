@@ -80,6 +80,9 @@ else:raise AssertionError('unmarked tenant reached non-target peer')
 '''
         for rules, allowed in ((old, 'no'), (fixed, 'yes')):
             run('ip', 'netns', 'exec', client, 'nft', '-f', '-', data=rules)
+            if binary := os.environ.get('RELAYDECK_PROBE_BINARY'):
+                result = json.loads(run('ip','netns','exec',client,'setpriv','--reuid','60000','--regid','60000','--clear-groups','--bounding-set=-all',binary,'probe-tcp','[2001:4860:44::2]:443'))
+                assert result['status'] == ('connected' if allowed == 'yes' else 'timeout'), result
             run('ip', 'netns', 'exec', client, 'setpriv', '--reuid', '60000', '--regid', '60000',
                 '--clear-groups', '--bounding-set=-all', 'python3', '-c', probe, allowed)
         print('WireGuard TCP/UDP forwarding and unmarked target isolation passed')

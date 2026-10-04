@@ -82,6 +82,7 @@ fn wireguard_kernel_forwarding_preserves_target_isolation() {
             env!("CARGO_MANIFEST_DIR"),
             "/tests/wireguard_egress.py"
         ))
+        .env("RELAYDECK_PROBE_BINARY", env!("CARGO_BIN_EXE_relaydeck"))
         .stdin(std::process::Stdio::piped())
         .spawn()
         .unwrap();
