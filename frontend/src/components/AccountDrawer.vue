@@ -2,7 +2,7 @@
 import { computed, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useMutation } from '@tanstack/vue-query'
-import { useNow } from '@vueuse/core'
+import { useIntervalFn } from '@vueuse/core'
 import { ArrowRightLeft, Copy, KeyRound, RotateCw, RefreshCw, ShieldCheck, Trash2, CalendarPlus } from '@lucide/vue'
 import SideDrawer from './SideDrawer.vue'
 import PortRuler from './PortRuler.vue'
@@ -23,8 +23,8 @@ import { toast } from '../lib/toast'
 const props = defineProps<{ open: boolean; userId: number | null; users: User[]; rules: Rule[]; loaded: boolean }>()
 const emit = defineEmits<{ close: [] }>()
 const router = useRouter()
-const clock = useNow({ interval: 1000 })
-const timestamp = computed(() => Math.floor(clock.value.getTime() / 1000))
+const timestamp = ref(Math.floor(Date.now() / 1000))
+useIntervalFn(() => { timestamp.value = Math.floor(Date.now() / 1000) }, 1000)
 
 const user = computed(() => (props.userId === null ? null : props.users.find(item => item.id === props.userId) ?? null))
 const isNew = computed(() => props.userId === null)
