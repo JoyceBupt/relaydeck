@@ -29,7 +29,7 @@ export function useRules() {
 }
 
 export function useUsers() {
-  return useQuery({ queryKey: keys.users, queryFn: api.users, enabled: computed(() => signedIn.value && isAdmin.value), refetchInterval: poll(15_000) })
+  return useQuery({ queryKey: keys.users, queryFn: api.users, enabled: computed(() => signedIn.value && isAdmin.value), refetchInterval: query => visibility.value === 'visible' ? query.state.data?.some(user => user.deletion_requested_at != null) ? 2_000 : 15_000 : false })
 }
 
 export function useAudit() {

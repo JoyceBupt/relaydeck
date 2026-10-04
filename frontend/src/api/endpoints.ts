@@ -31,6 +31,8 @@ export const api = {
   users: () => request<User[]>('/users'),
   createUser: (input: NewUserInput) => request<User>('/users', 'POST', input),
   updateUser: (id: number, input: UserGrantInput) => request<User>(`/users/${id}`, 'PUT', input),
+  deleteUser: (id: number) => request<{ status: string }>(`/users/${id}`, 'DELETE'),
+  renewUser: (id: number, subscription_id: number) => request<User>(`/users/${id}/subscription`, 'POST', { subscription_id }),
   resetPassword: (id: number, password: string) => request<void>(`/users/${id}/password`, 'POST', { password }),
   audit: () => request<Audit[]>('/audit'),
 }

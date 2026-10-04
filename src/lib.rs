@@ -13,6 +13,7 @@ pub mod mfa;
 pub mod models;
 pub mod policy;
 pub mod rules;
+pub mod subscriptions;
 pub mod tenant;
 pub mod traffic;
 pub mod upgrade;

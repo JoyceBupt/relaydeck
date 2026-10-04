@@ -427,8 +427,12 @@ async fn check_rule(
         .bind(rule.owner_id)
         .fetch_one(&state.pool)
         .await?;
+    let slot: i64 = sqlx::query_scalar("SELECT COALESCE(runtime_slot,id) FROM users WHERE id=?")
+        .bind(rule.owner_id)
+        .fetch_one(&state.pool)
+        .await?;
     let request = crate::connectivity::CheckRequest {
-        owner_id: rule.owner_id,
+        owner_id: slot,
         revision,
         rule_id: id,
     };
@@ -492,7 +496,9 @@ async fn create_rule(
     check_lease(&mut *tx, input.listen_port, owner.id, None).await?;
     check_host_port(input.listen_port)?;
     let timestamp = now();
-    let id = sqlx::query("INSERT INTO rules(owner_id,name,listen_port,target_host,target_ip,target_port,protocol,source_cidrs,enabled,created_at,updated_at,dns_checked_at,dns_resolved_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,unixepoch(),unixepoch())")
+    let id = crate::subscriptions::next_identity(&mut tx, "rule").await?;
+    sqlx::query("INSERT INTO rules(id,owner_id,name,listen_port,target_host,target_ip,target_port,protocol,source_cidrs,enabled,created_at,updated_at,dns_checked_at,dns_resolved_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,unixepoch(),unixepoch())")
+        .bind(id)
         .bind(owner.id)
         .bind(&input.name)
         .bind(input.listen_port)
@@ -505,8 +511,7 @@ async fn create_rule(
         .bind(timestamp)
         .bind(timestamp)
         .execute(&mut *tx)
-        .await?
-        .last_insert_rowid();
+        .await?;
     sqlx::query("INSERT INTO port_leases(port,owner_id,rule_id,created_at) VALUES(?,?,?,?)")
         .bind(input.listen_port)
         .bind(owner.id)

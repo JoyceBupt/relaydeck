@@ -60,19 +60,19 @@ pub async fn record_traffic(
 ) -> anyhow::Result<()> {
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     for snapshot in snapshots {
-        let previous:Option<(bool,Option<i64>,bool)>=sqlx::query_as("SELECT traffic_blocked,traffic_period_start,traffic_ready FROM users WHERE id=? AND traffic_limit_bytes IS ? AND traffic_mode=? AND (traffic_period_start IS NULL OR traffic_period_start<=?)")
-            .bind(snapshot.owner_id).bind(snapshot.budget.limit_bytes).bind(snapshot.budget.mode.as_str()).bind(snapshot.period_start).fetch_optional(&mut *tx).await?;
-        let Some((blocked, period, ready)) = previous else {
+        let previous:Option<(i64,bool,Option<i64>,bool)>=sqlx::query_as("SELECT id,traffic_blocked,traffic_period_start,traffic_ready FROM users WHERE COALESCE(runtime_slot,id)=? AND traffic_limit_bytes IS ? AND traffic_mode=? AND subscription_id=? AND subscription_started_at=? AND COALESCE(expires_at,9223372036854775807)=? AND deletion_requested_at IS NULL AND (traffic_observed_at IS NULL OR traffic_observed_at<=?)")
+            .bind(snapshot.owner_id).bind(snapshot.budget.limit_bytes).bind(snapshot.budget.mode.as_str()).bind(snapshot.period_id).bind(snapshot.period_start).bind(snapshot.reset_at).bind(snapshot.observed_at).fetch_optional(&mut *tx).await?;
+        let Some((owner_id, blocked, period, ready)) = previous else {
             continue;
         };
         let signed = |value: u64| value.min(i64::MAX as u64) as i64;
         sqlx::query("UPDATE users SET traffic_in_bytes=?,traffic_out_bytes=?,traffic_used_bytes=?,traffic_period_start=?,traffic_reset_at=?,traffic_blocked=?,traffic_ready=?,traffic_error=?,traffic_observed_at=? WHERE id=?")
-            .bind(signed(snapshot.in_bytes)).bind(signed(snapshot.out_bytes)).bind(signed(snapshot.used_bytes)).bind(snapshot.period_start).bind(snapshot.reset_at).bind(snapshot.blocked).bind(snapshot.ready).bind(&snapshot.error).bind(snapshot.observed_at).bind(snapshot.owner_id).execute(&mut *tx).await?;
+            .bind(signed(snapshot.in_bytes)).bind(signed(snapshot.out_bytes)).bind(signed(snapshot.used_bytes)).bind(snapshot.period_start).bind(snapshot.reset_at).bind(snapshot.blocked).bind(snapshot.ready).bind(&snapshot.error).bind(snapshot.observed_at).bind(owner_id).execute(&mut *tx).await?;
         if blocked != snapshot.blocked
             || period != Some(snapshot.period_start)
             || ready != snapshot.ready
         {
-            crate::api::enqueue_apply(&mut tx, snapshot.owner_id).await?;
+            crate::api::enqueue_apply(&mut tx, owner_id).await?;
             if blocked != snapshot.blocked {
                 crate::api::record_system_user_audit(
                     &mut tx,
@@ -81,7 +81,7 @@ pub async fn record_traffic(
                     } else {
                         "user_traffic_restored"
                     },
-                    snapshot.owner_id,
+                    owner_id,
                 )
                 .await?;
             }
@@ -93,13 +93,14 @@ pub async fn record_traffic(
 
 #[cfg(target_os = "linux")]
 async fn refresh_traffic(pool: &SqlitePool, driver: &SocketDriver) -> anyhow::Result<()> {
-    let rows: Vec<(i64, Option<i64>, String)> =
-        sqlx::query_as("SELECT id,traffic_limit_bytes,traffic_mode FROM users ORDER BY id")
+    let rows: Vec<(i64, Option<i64>, String, i64, i64, i64)> =
+        sqlx::query_as("SELECT COALESCE(runtime_slot,id),traffic_limit_bytes,traffic_mode,subscription_id,COALESCE(subscription_started_at,created_at),COALESCE(expires_at,9223372036854775807) FROM users ORDER BY id")
             .fetch_all(pool)
             .await?;
     let mut grants = Vec::with_capacity(rows.len());
-    for (owner_id, limit_bytes, mode) in rows {
+    for (owner_id, limit_bytes, mode, id, start, end) in rows {
         grants.push(crate::traffic::TrafficGrant {
+            period: Some(crate::traffic::TrafficPeriod { id, start, end }),
             owner_id,
             budget: crate::traffic::TrafficBudget {
                 limit_bytes,
@@ -201,8 +202,18 @@ pub async fn record_runtime_failures(
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     for event in events {
+        let owner_id: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM users WHERE COALESCE(runtime_slot,id)=? AND desired_revision=?",
+        )
+        .bind(event.owner)
+        .bind(event.revision)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(owner_id) = owner_id else {
+            continue;
+        };
         let existing: Option<(i64,String)> = sqlx::query_as("SELECT retry_count,status FROM runtime_states WHERE owner_id=? AND revision=? AND revision=(SELECT desired_revision FROM users WHERE id=?)")
-            .bind(event.owner).bind(event.revision).bind(event.owner).fetch_optional(&mut *tx).await?;
+            .bind(owner_id).bind(event.revision).bind(owner_id).fetch_optional(&mut *tx).await?;
         let Some((retries, status)) = existing else {
             continue;
         };
@@ -211,9 +222,9 @@ pub async fn record_runtime_failures(
         }
         let retry_at = (event.retryable && retries < 3).then(|| now() + (10_i64 << retries.min(3)));
         sqlx::query("UPDATE runtime_states SET status='failed',healthy_since=NULL,last_error=?,updated_at=?,retry_count=?,retry_at=? WHERE owner_id=? AND revision=?")
-            .bind(&event.message).bind(now()).bind(retries+ i64::from(retry_at.is_some())).bind(retry_at).bind(event.owner).bind(event.revision).execute(&mut *tx).await?;
+            .bind(&event.message).bind(now()).bind(retries+ i64::from(retry_at.is_some())).bind(retry_at).bind(owner_id).bind(event.revision).execute(&mut *tx).await?;
         sqlx::query("UPDATE apply_jobs SET status='failed' WHERE owner_id=? AND revision=?")
-            .bind(event.owner)
+            .bind(owner_id)
             .bind(event.revision)
             .execute(&mut *tx)
             .await?;

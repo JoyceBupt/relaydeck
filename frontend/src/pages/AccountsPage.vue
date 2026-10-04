@@ -23,6 +23,7 @@ const failedBy = computed(() => {
 })
 
 function state(user: User) {
+  if (user.deletion_requested_at != null) return { text: user.deletion_error ? '删除待重试' : '删除中', tone: 'text-warning' }
   const info = expiry(user.expires_at)
   if (!user.enabled) return { text: '已停用', tone: 'text-faint' }
   if (info.tone === 'expired') return { text: '已到期', tone: 'text-danger' }

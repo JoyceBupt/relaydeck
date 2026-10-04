@@ -542,7 +542,6 @@ impl<D: ExecutorDriver> Reconciler<D> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let Some(desired) = load_plan(&mut tx, owner_id, now()).await? else {
             tx.rollback().await?;
-            self.confirm_stop(owner_id).await?;
             return Ok(ReconcileOutcome::Missing);
         };
         let revision: i64 = sqlx::query_scalar("SELECT desired_revision FROM users WHERE id=?")
@@ -568,11 +567,17 @@ impl<D: ExecutorDriver> Reconciler<D> {
             self.confirm_stop(owner_id).await?;
             return Ok(ReconcileOutcome::StaleStopped);
         }
+        let slot = self
+            .runtime_slot(owner_id)
+            .await?
+            .ok_or(ReconcileError::Owner)?;
+        let mut runtime_plan = plan.clone();
+        runtime_plan.owner_id = slot;
         *runtime_changed = true;
         let result = if plan.stopped() {
-            tokio::time::timeout(self.timeout, self.driver.stop(owner_id)).await
+            tokio::time::timeout(self.timeout, self.driver.stop(slot)).await
         } else {
-            tokio::time::timeout(self.timeout, self.driver.apply(&plan)).await
+            tokio::time::timeout(self.timeout, self.driver.apply(&runtime_plan)).await
         };
         let result = match result {
             Ok(result) => result,
@@ -629,6 +634,9 @@ impl<D: ExecutorDriver> Reconciler<D> {
             .bind(owner_id)
             .execute(&mut *tx)
             .await?;
+        if plan.stopped() {
+            crate::subscriptions::finalize_deletion(&mut tx, owner_id).await?;
+        }
         tx.commit().await?;
         Ok(if plan.stopped() {
             ReconcileOutcome::Stopped
@@ -644,8 +652,18 @@ impl<D: ExecutorDriver> Reconciler<D> {
         Ok(current)
     }
 
+    async fn runtime_slot(&self, owner_id: i64) -> Result<Option<i64>, sqlx::Error> {
+        sqlx::query_scalar("SELECT COALESCE(runtime_slot,id) FROM users WHERE id=?")
+            .bind(owner_id)
+            .fetch_optional(&self.pool)
+            .await
+    }
+
     async fn confirm_stop(&self, owner_id: i64) -> Result<(), ReconcileError> {
-        match tokio::time::timeout(self.timeout, self.driver.stop(owner_id)).await {
+        let Some(slot) = self.runtime_slot(owner_id).await? else {
+            return Ok(());
+        };
+        match tokio::time::timeout(self.timeout, self.driver.stop(slot)).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) if error.retryable => {
                 Err(ReconcileError::Temporary(error_message(error)))

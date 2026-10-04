@@ -9,6 +9,9 @@ pub struct DbUser {
     pub enabled: bool,
     pub must_change_password: bool,
     pub expires_at: Option<i64>,
+    pub subscription_id: i64,
+    pub subscription_started_at: Option<i64>,
+    pub deletion_requested_at: Option<i64>,
     pub port_start: i64,
     pub port_end: i64,
     pub max_rules: i64,
@@ -35,6 +38,7 @@ pub struct DbUser {
 impl DbUser {
     pub fn available(&self) -> bool {
         self.enabled
+            && self.deletion_requested_at.is_none()
             && self
                 .expires_at
                 .is_none_or(|expiry| expiry > crate::db::now())
@@ -49,6 +53,10 @@ pub struct UserView {
     pub enabled: bool,
     pub must_change_password: bool,
     pub expires_at: Option<i64>,
+    pub subscription_id: i64,
+    pub subscription_started_at: Option<i64>,
+    pub deletion_requested_at: Option<i64>,
+    pub deletion_error: Option<String>,
     pub port_start: i64,
     pub port_end: i64,
     pub max_rules: i64,
@@ -71,6 +79,10 @@ impl UserView {
             enabled: user.enabled,
             must_change_password: user.must_change_password,
             expires_at: user.expires_at,
+            subscription_id: user.subscription_id,
+            subscription_started_at: user.subscription_started_at,
+            deletion_requested_at: user.deletion_requested_at,
+            deletion_error: None,
             port_start: user.port_start,
             port_end: user.port_end,
             max_rules: user.max_rules,

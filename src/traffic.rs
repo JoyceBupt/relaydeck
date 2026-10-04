@@ -62,13 +62,34 @@ impl TrafficBudget {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TrafficGrant {
+    #[serde(default)]
+    pub period: Option<TrafficPeriod>,
     pub owner_id: i64,
     pub budget: TrafficBudget,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TrafficPeriod {
+    pub id: i64,
+    pub start: i64,
+    pub end: i64,
+}
+impl TrafficPeriod {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            self.id > 0 && self.start >= 0 && self.end > self.start,
+            "invalid subscription period"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TrafficSnapshot {
+    #[serde(default)]
+    pub period_id: Option<i64>,
     pub owner_id: i64,
     pub budget: TrafficBudget,
     pub in_bytes: u64,
@@ -104,8 +125,8 @@ impl TrafficView {
             in_bytes: user.traffic_in_bytes,
             out_bytes: user.traffic_out_bytes,
             used_bytes: user.traffic_used_bytes,
-            period_start: user.traffic_period_start,
-            reset_at: user.traffic_reset_at,
+            period_start: user.subscription_started_at,
+            reset_at: user.expires_at,
             blocked: user.traffic_blocked,
             observed_at: user.traffic_observed_at,
             ready: user.traffic_ready,

@@ -2113,7 +2113,7 @@ async fn tcp_connectivity_distinguishes_listening_from_refused_targets() {
 }
 
 #[tokio::test]
-async fn traffic_budgets_are_admin_only_preserve_old_grants_and_resume_next_month() {
+async fn traffic_budgets_are_admin_only_and_follow_subscription_renewal() {
     use relaydeck::traffic::{TrafficBudget, TrafficMode, TrafficSnapshot};
     let f = Fixture::new().await;
     assert!(f.admin.user["traffic"]["limit_bytes"].is_null());
@@ -2192,8 +2192,15 @@ async fn traffic_budgets_are_admin_only_preserve_old_grants_and_resume_next_mont
         true,
     )
     .await;
-    let (start, next) = relaydeck::traffic::utc_month(relaydeck::db::now()).unwrap();
+    let (start, next, cycle): (i64, i64, i64) = sqlx::query_as(
+        "SELECT subscription_started_at,expires_at,subscription_id FROM users WHERE id=?",
+    )
+    .bind(owner)
+    .fetch_one(&f.state.pool)
+    .await
+    .unwrap();
     let mut snapshot = TrafficSnapshot {
+        period_id: Some(cycle),
         owner_id: owner,
         budget: TrafficBudget {
             limit_bytes: Some(1_000_000_000_000),
@@ -2242,39 +2249,56 @@ async fn traffic_budgets_are_admin_only_preserve_old_grants_and_resume_next_mont
     assert_eq!(event["actor_username"], "系统");
     assert_eq!(event["resource_kind"], "user");
     assert_eq!(event["resource_name"], "alice");
+    // A calendar rollover snapshot cannot reset a subscription's counters.
+    let old_snapshot = snapshot.clone();
     snapshot.period_start = next;
-    snapshot.reset_at = relaydeck::traffic::utc_month(next).unwrap().1;
-    snapshot.in_bytes = 0;
-    snapshot.out_bytes = 0;
+    snapshot.reset_at = next + relaydeck::subscriptions::PERIOD_SECONDS;
     snapshot.used_bytes = 0;
     snapshot.blocked = false;
     relaydeck::worker::record_traffic(&f.state.pool, &[snapshot.clone()])
         .await
         .unwrap();
-    let (_, _, traffic) = call(&f.app, "GET", &path, None, Some(&alice), false).await;
-    assert_eq!(traffic["blocked"], false);
-    assert_eq!(traffic["used_bytes"], 0);
-    assert!(
-        sqlx::query_scalar::<_, i64>("SELECT desired_revision FROM users WHERE id=?")
-            .bind(owner)
-            .fetch_one(&f.state.pool)
+    assert_eq!(
+        call(&f.app, "GET", &path, None, Some(&f.admin), false)
             .await
-            .unwrap()
-            > revision
+            .2["used_bytes"],
+        1_000_000_000_000_i64
     );
-    // A delayed root reply for an older month cannot restore old counters or block the new month.
-    snapshot.period_start = start;
-    snapshot.blocked = true;
-    snapshot.used_bytes = 1_000_000_000_000;
+    sqlx::query("UPDATE users SET expires_at=? WHERE id=?")
+        .bind(relaydeck::db::now() - 1)
+        .bind(owner)
+        .execute(&f.state.pool)
+        .await
+        .unwrap();
+    let (status, _, renewed) = call(
+        &f.app,
+        "POST",
+        &format!("/api/users/{owner}/subscription"),
+        Some(json!({"subscription_id":cycle})),
+        Some(&f.admin),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{renewed}");
+    assert_eq!(renewed["traffic"]["used_bytes"], 0);
+    assert_eq!(renewed["traffic"]["ready"], false);
+    snapshot.period_id = renewed["subscription_id"].as_i64();
+    snapshot.period_start = renewed["subscription_started_at"].as_i64().unwrap();
+    snapshot.reset_at = renewed["expires_at"].as_i64().unwrap();
+    snapshot.in_bytes = 0;
+    snapshot.out_bytes = 0;
     relaydeck::worker::record_traffic(&f.state.pool, &[snapshot])
         .await
         .unwrap();
-    assert_eq!(
-        call(&f.app, "GET", &path, None, Some(&alice), false)
-            .await
-            .2["blocked"],
-        false
-    );
+    relaydeck::worker::record_traffic(&f.state.pool, &[old_snapshot])
+        .await
+        .unwrap();
+    let traffic = call(&f.app, "GET", &path, None, Some(&f.admin), false)
+        .await
+        .2;
+    assert_eq!(traffic["blocked"], false);
+    assert_eq!(traffic["used_bytes"], 0);
+    assert_eq!(traffic["ready"], true);
 }
 
 #[tokio::test]
@@ -2296,4 +2320,407 @@ async fn invalid_traffic_limits_cannot_create_accounts() {
             StatusCode::BAD_REQUEST
         );
     }
+}
+
+#[derive(Clone, Default)]
+struct LifecycleDriver {
+    fail_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    calls: std::sync::Arc<std::sync::Mutex<Vec<(String, i64, i64)>>>,
+}
+impl relaydeck::executor::ExecutorDriver for LifecycleDriver {
+    fn apply<'a>(
+        &'a self,
+        plan: &'a relaydeck::executor::RuntimePlan,
+    ) -> relaydeck::executor::DriverFuture<'a> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("apply".into(), plan.owner_id(), plan.revision()));
+            Ok(())
+        })
+    }
+    fn stop(&self, slot: i64) -> relaydeck::executor::DriverFuture<'_> {
+        Box::pin(async move {
+            self.calls.lock().unwrap().push(("stop".into(), slot, 0));
+            if self.fail_stop.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(relaydeck::executor::DriverError::temporary(
+                    "stop unavailable",
+                ))
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn subscriptions_start_at_creation_and_only_expired_renewals_reset_usage() {
+    let f = Fixture::new().await;
+    let before = relaydeck::db::now();
+    let alice = f.add_user("monthly", 41000).await;
+    let id = alice.user["id"].as_i64().unwrap();
+    let start = alice.user["subscription_started_at"].as_i64().unwrap();
+    let end = alice.user["expires_at"].as_i64().unwrap();
+    let cycle = alice.user["subscription_id"].as_i64().unwrap();
+    assert!(start >= before && start <= relaydeck::db::now());
+    assert_eq!(end - start, relaydeck::subscriptions::PERIOD_SECONDS);
+    let path = format!("/api/users/{id}/subscription");
+    let payload = json!({"subscription_id":cycle});
+    assert_eq!(
+        call(
+            &f.app,
+            "POST",
+            &path,
+            Some(payload.clone()),
+            Some(&alice),
+            true
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        call(
+            &f.app,
+            "POST",
+            &path,
+            Some(payload.clone()),
+            Some(&f.admin),
+            false
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        call(
+            &f.app,
+            "POST",
+            &path,
+            Some(payload.clone()),
+            Some(&f.admin),
+            true
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    let (_, _, created) = call(
+        &f.app,
+        "POST",
+        "/api/rules",
+        Some(rule(42310)),
+        Some(&alice),
+        true,
+    )
+    .await;
+    assert!(created["id"].is_i64());
+    sqlx::query("UPDATE users SET traffic_used_bytes=1234,traffic_in_bytes=1234,traffic_blocked=1 WHERE id=?").bind(id).execute(&f.state.pool).await.unwrap();
+    for enabled in [false, true] {
+        let result = call(
+            &f.app,
+            "PUT",
+            &format!("/api/users/{id}"),
+            Some(json!({"enabled":enabled,"max_rules":3})),
+            Some(&f.admin),
+            true,
+        )
+        .await;
+        assert_eq!(result.0, StatusCode::OK, "{}", result.2);
+        assert_eq!(result.2["subscription_id"], cycle);
+        assert_eq!(result.2["expires_at"], end);
+        assert_eq!(result.2["traffic"]["used_bytes"], 1234);
+    }
+    sqlx::query("UPDATE users SET expires_at=? WHERE id=?")
+        .bind(relaydeck::db::now() - 1)
+        .bind(id)
+        .execute(&f.state.pool)
+        .await
+        .unwrap();
+    let driver = LifecycleDriver::default();
+    let reconciler = relaydeck::executor::Reconciler::new(
+        f.state.pool.clone(),
+        Default::default(),
+        driver.clone(),
+        std::time::Duration::from_secs(1),
+    )
+    .unwrap();
+    relaydeck::worker::reconcile_tick(&f.state.pool, &reconciler)
+        .await
+        .unwrap();
+    assert!(
+        driver
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(kind, slot, _)| kind == "stop" && *slot == id)
+    );
+    let renewal_start = relaydeck::db::now();
+    let renewed = call(
+        &f.app,
+        "POST",
+        &path,
+        Some(payload.clone()),
+        Some(&f.admin),
+        true,
+    )
+    .await;
+    assert_eq!(renewed.0, StatusCode::OK, "{}", renewed.2);
+    let user = renewed.2;
+    assert!(user["subscription_id"].as_i64().unwrap() > cycle);
+    assert!(user["subscription_started_at"].as_i64().unwrap() >= renewal_start);
+    assert_eq!(
+        user["expires_at"].as_i64().unwrap() - user["subscription_started_at"].as_i64().unwrap(),
+        2592000
+    );
+    assert_eq!(user["enabled"], true);
+    assert_eq!(user["traffic"]["used_bytes"], 0);
+    assert_eq!(user["traffic"]["blocked"], false);
+    assert_eq!(user["traffic"]["ready"], false);
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT enabled FROM rules WHERE id=?")
+            .bind(created["id"].as_i64().unwrap())
+            .fetch_one(&f.state.pool)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        call(&f.app, "POST", &path, Some(payload), Some(&f.admin), true)
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        call(
+            &f.app,
+            "POST",
+            "/api/users/1/subscription",
+            Some(json!({"subscription_id":1})),
+            Some(&f.admin),
+            true
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn account_deletion_waits_for_stop_preserves_audit_and_reuses_only_runtime_slots() {
+    let f = Fixture::new().await;
+    let alice = f.add_user("reusable", 41000).await;
+    let id = alice.user["id"].as_i64().unwrap();
+    let path = format!("/api/users/{id}");
+    let (_, _, created) = call(
+        &f.app,
+        "POST",
+        "/api/rules",
+        Some(rule(42320)),
+        Some(&alice),
+        true,
+    )
+    .await;
+    assert!(created["id"].is_i64());
+    for (target, login, csrf) in [
+        ("/api/users/1", &f.admin, true),
+        (path.as_str(), &alice, true),
+        (path.as_str(), &f.admin, false),
+    ] {
+        assert_eq!(
+            call(&f.app, "DELETE", target, None, Some(login), csrf)
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+    }
+    let driver = LifecycleDriver::default();
+    driver
+        .fail_stop
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let reconciler = relaydeck::executor::Reconciler::new(
+        f.state.pool.clone(),
+        Default::default(),
+        driver.clone(),
+        std::time::Duration::from_secs(1),
+    )
+    .unwrap();
+    assert_eq!(
+        call(&f.app, "DELETE", &path, None, Some(&f.admin), true)
+            .await
+            .0,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        call(&f.app, "GET", "/api/session", None, Some(&alice), false)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(reconciler.reconcile_owner(id).await.is_err());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM port_leases WHERE owner_id=?")
+            .bind(id)
+            .fetch_one(&f.state.pool)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE id=?")
+            .bind(id)
+            .fetch_one(&f.state.pool)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        call(
+            &f.app,
+            "PUT",
+            &path,
+            Some(json!({"enabled":true,"max_rules":3})),
+            Some(&f.admin),
+            true
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    let old_revision: i64 = sqlx::query_scalar("SELECT desired_revision FROM users WHERE id=?")
+        .bind(id)
+        .fetch_one(&f.state.pool)
+        .await
+        .unwrap();
+    driver
+        .fail_stop
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    relaydeck::worker::reconcile_tick(&f.state.pool, &reconciler)
+        .await
+        .unwrap();
+    for (table, key) in [
+        ("users", "id"),
+        ("rules", "owner_id"),
+        ("port_leases", "owner_id"),
+        ("sessions", "user_id"),
+        ("runtime_states", "owner_id"),
+        ("apply_jobs", "owner_id"),
+    ] {
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(&format!("SELECT COUNT(*) FROM {table} WHERE {key}=?"))
+                .bind(id)
+                .fetch_one(&f.state.pool)
+                .await
+                .unwrap(),
+            0,
+            "{table}"
+        );
+    }
+    let audit = call(&f.app, "GET", "/api/audit", None, Some(&f.admin), false)
+        .await
+        .2;
+    assert!(
+        audit
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["action"] == "user_deleted" && row["resource_name"] == "reusable")
+    );
+    assert!(
+        audit
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["action"] == "password_changed" && row["actor_username"] == "reusable")
+    );
+    let mut previous_id = id;
+    let mut previous_rule = created["id"].as_i64().unwrap();
+    for _ in 0..12 {
+        let result = call(
+            &f.app,
+            "POST",
+            "/api/users",
+            Some(json!({"username":"reusable","password":INITIAL_PASSWORD})),
+            Some(&f.admin),
+            true,
+        )
+        .await;
+        assert_eq!(result.0, StatusCode::CREATED, "{}", result.2);
+        let next = result.2["id"].as_i64().unwrap();
+        assert!(next > previous_id);
+        let slot: i64 = sqlx::query_scalar("SELECT runtime_slot FROM users WHERE id=?")
+            .bind(next)
+            .fetch_one(&f.state.pool)
+            .await
+            .unwrap();
+        assert_eq!(slot, id);
+        let mut input = rule(42320);
+        input["owner_id"] = next.into();
+        let result = call(
+            &f.app,
+            "POST",
+            "/api/rules",
+            Some(input),
+            Some(&f.admin),
+            true,
+        )
+        .await;
+        assert_eq!(result.0, StatusCode::CREATED, "{}", result.2);
+        let rule_id = result.2["id"].as_i64().unwrap();
+        assert!(rule_id > previous_rule);
+        reconciler.reconcile_owner(next).await.unwrap();
+        let revision: i64 = sqlx::query_scalar("SELECT desired_revision FROM users WHERE id=?")
+            .bind(next)
+            .fetch_one(&f.state.pool)
+            .await
+            .unwrap();
+        assert!(revision > old_revision);
+        assert!(
+            driver
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(kind, owner, rev)| kind == "apply" && *owner == slot && *rev == revision)
+        );
+        relaydeck::worker::record_runtime_failures(
+            &f.state.pool,
+            &[relaydeck::broker::Failure {
+                owner: slot,
+                revision: old_revision,
+                message: "stale previous tenant".into(),
+                retryable: true,
+            }],
+        )
+        .await
+        .unwrap();
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM runtime_states WHERE owner_id=?")
+                .bind(next)
+                .fetch_one(&f.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "active");
+        let calls = driver.calls.lock().unwrap().len();
+        reconciler.reconcile_owner(id).await.unwrap();
+        assert_eq!(driver.calls.lock().unwrap().len(), calls);
+        assert_eq!(
+            call(
+                &f.app,
+                "DELETE",
+                &format!("/api/users/{next}"),
+                None,
+                Some(&f.admin),
+                true
+            )
+            .await
+            .0,
+            StatusCode::ACCEPTED
+        );
+        reconciler.reconcile_owner(next).await.unwrap();
+        previous_id = next;
+        previous_rule = rule_id;
+    }
+    assert!(previous_id > 11);
 }
