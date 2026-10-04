@@ -28,11 +28,15 @@ def tcp():
   c,_=s.accept()
   with c:
    b=c.recv(4096)
-   if b:c.sendall(b)
+   if b:
+    try:c.sendall(b)
+    except OSError:pass
 threading.Thread(target=tcp,daemon=True).start()
 s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(('8.8.45.1',int(sys.argv[1])))
 while True:
- b,a=s.recvfrom(4096);s.sendto(b,a)
+ b,a=s.recvfrom(4096)
+ try:s.sendto(b,a)
+ except OSError:pass
 '''
     for owner in (1,2,3):
         children.append(subprocess.Popen(['ip','netns','exec',server_ns,'setpriv','--reuid',str(59999+owner),'--regid',str(59999+owner),'--clear-groups','--bounding-set=-all','python3','-c',echo,str(40990+owner*10)]))
