@@ -27,6 +27,74 @@ fn policy() -> BrokerPolicy {
 }
 
 #[test]
+fn wireguard_outer_allowance_is_exact_marked_udp_and_keeps_inner_policy() {
+    use relaydeck::linux::{parse_wireguard_peers, render_nft_with_tunnels};
+    let peers = parse_wireguard_peers(
+        "warp\t0xca6c\nunused\toff\n",
+        "warp\tpublic-key\t162.159.192.1:2408\nunused\tkey\t1.1.1.1:2408\nwarp\tkey2\t(none)\n",
+    )
+    .unwrap();
+    assert_eq!(peers.len(), 1);
+    let plans = [plan(1, 41000, "2001:4860:44::2".parse().unwrap(), vec![])];
+    let nft = render_nft_with_tunnels(&policy(), &plans, &[], 1000, &[], &peers).unwrap();
+    let allowance = "meta mark 51820 ip daddr 162.159.192.1 udp dport 2408 return";
+    assert!(nft.contains(allowance));
+    assert!(nft.find(allowance).unwrap() < nft.find("meta skuid 60000 jump owner_1").unwrap());
+    assert!(nft.contains("ct direction original ip6 daddr 2001:4860:44::2 tcp dport 443 return"));
+    assert!(nft.contains("fib daddr type local drop"));
+    assert!(!nft.contains("meta mark 51820 return"));
+    assert!(
+        parse_wireguard_peers("warp\toff\n", "warp\tkey\t162.159.192.1:2408\n")
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        parse_wireguard_peers("warp\t0x0\n", "warp\tkey\t162.159.192.1:2408\n")
+            .unwrap()
+            .is_empty()
+    );
+    assert!(parse_wireguard_peers("warp\t0xca6c\n", "other\tkey\t162.159.192.1:2408\n").is_err());
+    assert!(parse_wireguard_peers("warp\t0xca6c\n", "warp\tkey\t162.159.192.1:0\n").is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires isolated root Linux with nftables, iproute2, WireGuard and Python"]
+fn wireguard_kernel_forwarding_preserves_target_isolation() {
+    use relaydeck::linux::{WireguardPeer, render_nft_with_tunnels};
+    use std::io::Write;
+    let plans = [plan(1, 41000, "2001:4860:44::2".parse().unwrap(), vec![])];
+    let old = render_nft(&policy(), &plans, &[], 1000).unwrap();
+    let fixed = render_nft_with_tunnels(
+        &policy(),
+        &plans,
+        &[],
+        1000,
+        &[],
+        &[WireguardPeer {
+            mark: 51820,
+            endpoint: "8.8.45.2:51921".parse().unwrap(),
+        }],
+    )
+    .unwrap();
+    let mut child = std::process::Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/wireguard_egress.py"
+        ))
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(serde_json::to_string(&[old, fixed]).unwrap().as_bytes())
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
 fn unrelated_managed_port_listeners_are_rejected_before_firewall_changes() {
     use relaydeck::linux::validate_listener_inventory;
     assert!(

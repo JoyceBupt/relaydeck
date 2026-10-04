@@ -49,6 +49,13 @@ jobs:
         run: |
           sudo env PYTHONDONTWRITEBYTECODE=1 RELAYDECK_POLICY_TEST=1 RELAYDECK_TEST_BINARY="$PWD/target/debug/relaydeck" python3 tests/policy_preparation.py -v
           sudo env PYTHONDONTWRITEBYTECODE=1 RELAYDECK_POLICY_TEST=1 RELAYDECK_TEST_BINARY="$PWD/target/debug/relaydeck" python3 -m unittest discover -s tests -p 'test_legacy_update.py' -v
+      - name: Linux WireGuard forwarding acceptance
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends wireguard-tools
+          test_binary=$(./scripts/cargo.sh test --locked --test linux_contract --no-run --message-format=json | python3 -c 'import json,sys; items=[json.loads(line) for line in sys.stdin]; print(next(item["executable"] for item in items if item.get("reason") == "compiler-artifact" and item.get("executable") and item["target"]["name"] == "linux_contract"))')
+          sudo "$test_binary" wireguard_kernel_forwarding_preserves_target_isolation --ignored --exact --test-threads=1
       - name: Linux nonroot frontend and privileged startup acceptance
         if: matrix.os == 'ubuntu-24.04'
         run: |
