@@ -3,17 +3,19 @@
 单机、多租户的 [Realm](https://github.com/zhboner/realm) 转发面板。Rust 后端，Vue 前端，SQLite 存储。
 
 - TCP / UDP 转发、来源网段限制、域名自动更新。
-- 账户端口段、规则额度、有效期；租户仅管理自己的规则。
+- 共享高位端口、账户端口额度与有效期；租户仅管理自己的规则。
 - MFA、操作审计、独立运行身份、nftables 与 cgroup 隔离。
 - 列表 / 卡片、浅色 / 深色、桌面 / 手机。
 - 所有者专属面板升级，校验发布包，失败自动回滚。
 
 ## 预览
 
-截图使用示例数据。
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/previews/hero-dark.webp">
+  <img src="docs/previews/hero-light.webp" alt="RelayDeck 桌面总览与手机端转发列表">
+</picture>
 
-![桌面总览](docs/previews/overview.png)
-<img src="docs/previews/mobile.png" alt="手机转发卡片" width="300" />
+截图使用示例数据，随 GitHub 主题显示浅色或深色。
 
 ## 部署
 
