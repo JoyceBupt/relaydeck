@@ -61,6 +61,14 @@ class PolicyPreparation(unittest.TestCase):
         self.prepare()
         self.assertEqual(json.loads(self.output.read_text()), self.policy)
 
+    def test_large_valid_source_remains_readable_by_broker_after_serialization(self):
+        self.policy['reserved_ports'] = [7410] * 2400
+        self.write_policy()
+        self.assertLessEqual(self.source.stat().st_size, 16 * 1024)
+        self.prepare()
+        self.assertLessEqual(self.output.stat().st_size, 16 * 1024)
+        self.assertEqual(json.loads(self.output.read_text())['reserved_ports'], self.policy['reserved_ports'])
+
     def test_web_identity_cannot_generate_or_replace_root_policy(self):
         self.prepare()
         before = self.output.read_bytes()
