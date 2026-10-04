@@ -9,7 +9,10 @@ import time
 
 
 def run(*args, data=None):
-    return subprocess.run(args, input=data, text=True, capture_output=True, check=True, timeout=10).stdout
+    result = subprocess.run(args, input=data, text=True, capture_output=True, timeout=10)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or 'kernel command failed')
+    return result.stdout
 
 
 assert os.geteuid() == 0, 'isolated root Linux is required'
@@ -70,9 +73,9 @@ s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.settimeout(.5)
 try:s.setsockopt(socket.SOL_SOCKET,36,51820)
 except PermissionError:pass
 else:raise AssertionError('tenant forged WireGuard mark')
-s.sendto(b'direct-peer',('8.8.45.2',52921))
-try:s.recv(4096)
-except socket.timeout:pass
+try:
+ s.sendto(b'direct-peer',('8.8.45.2',52921));s.recv(4096)
+except (socket.timeout,PermissionError):pass
 else:raise AssertionError('unmarked tenant reached non-target peer')
 '''
         for rules, allowed in ((old, 'no'), (fixed, 'yes')):
