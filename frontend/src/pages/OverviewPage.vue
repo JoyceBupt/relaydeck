@@ -59,23 +59,25 @@ const recent = computed(() => (audit.data.value ?? []).slice(0, 5).map(entry => 
           <h2 id="topology-title" class="flex items-baseline gap-2">
             <span class="stat-label">转发</span>
             <span v-if="rules.isLoading.value" class="skeleton inline-block h-7 w-16 align-middle" />
-            <span v-else><span class="stat-value">{{ counts[0].count }}</span><span class="stat-unit">/ {{ all.length }} 运行中</span></span>
+            <span v-else-if="rules.data.value"><span class="stat-value">{{ counts[0].count }}</span><span class="stat-unit">/ {{ all.length }} 运行中</span></span>
           </h2>
-          <span v-if="!rules.isLoading.value" class="flex flex-wrap gap-x-3 text-xs text-muted">
+          <span v-if="rules.data.value" class="flex flex-wrap gap-x-3 text-xs text-muted">
             <template v-for="item in counts.slice(1)" :key="item.status">
               <RouterLink v-if="item.count" :to="{ path: '/rules', query: { status: item.status } }" class="tabular hover:text-fg">{{ statusLabels[item.status] }} <span class="font-medium" :class="['failed', 'blocked'].includes(item.status) ? 'text-danger' : 'text-fg'">{{ item.count }}</span></RouterLink>
             </template>
           </span>
         </div>
         <div v-if="rules.isLoading.value" class="grid gap-2"><div v-for="index in 4" :key="index" class="skeleton h-6" /></div>
-        <RelayTopology v-else :rules="all" :admin="isAdmin" />
+        <p v-if="rules.isError.value" class="flex items-center justify-between gap-3 py-3 text-sm text-danger">转发加载失败<button type="button" class="btn btn-secondary btn-sm" :disabled="rules.isFetching.value" @click="rules.refetch()">重试</button></p>
+        <RelayTopology v-if="rules.data.value" :rules="all" :admin="isAdmin" />
       </section>
 
       <div class="grid content-start gap-3">
         <RouterLink v-if="isAdmin" to="/accounts" class="panel flex flex-col gap-3 p-4 transition-colors duration-200 hover:border-line-strong">
           <span class="stat-label">租户</span>
           <span v-if="users.isLoading.value" class="skeleton h-9 w-20" />
-          <span v-else><span class="stat-value">{{ tenants.length }}</span><span class="stat-unit">/ {{ MAX_TENANTS }} 个</span></span>
+          <span v-else-if="users.data.value"><span class="stat-value">{{ tenants.length }}</span><span class="stat-unit">/ {{ MAX_TENANTS }} 个</span></span>
+          <span v-else class="text-sm text-danger">账户加载失败</span>
           <span class="meter" aria-hidden="true">
             <span v-for="index in MAX_TENANTS" :key="index" :class="tenantTone(index - 1)" />
           </span>
@@ -92,7 +94,9 @@ const recent = computed(() => (audit.data.value ?? []).slice(0, 5).map(entry => 
               <p class="text-xs text-faint">{{ relative(item.entry.created_at) }}</p>
             </li>
           </ol>
-          <p v-else-if="!audit.isLoading.value" class="py-4 text-center text-sm text-muted">暂无记录</p>
+          <div v-else-if="audit.isLoading.value" class="grid gap-2"><span v-for="index in 3" :key="index" class="skeleton h-6" /></div>
+          <p v-else-if="audit.isError.value" class="py-4 text-center text-sm text-danger">审计加载失败</p>
+          <p v-else class="py-4 text-center text-sm text-muted">暂无记录</p>
         </section>
         <template v-else>
           <div class="panel flex flex-col gap-3 p-4">

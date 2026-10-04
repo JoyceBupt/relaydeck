@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import BrandMark from './BrandMark.vue'
 import StatusMark from './StatusMark.vue'
 import type { Rule, RuntimeStatus } from '../types'
-import { hostText } from '../lib/format'
+import { hostText, statusLabels } from '../lib/format'
 
 // Every forward passes through this host: entry port on the left, target on
 // the right, one stream each through the hub. The login backdrop's language,
@@ -12,17 +12,33 @@ const props = defineProps<{ rules: Rule[]; admin?: boolean; limit?: number }>()
 
 const ROW = 32
 const order: RuntimeStatus[] = ['failed', 'blocked', 'pending', 'active', 'stopped']
-const shown = computed(() => [...props.rules]
-  .sort((a, b) => order.indexOf(a.runtime_status) - order.indexOf(b.runtime_status) || a.listen_port - b.listen_port)
-  .slice(0, props.limit ?? 12))
-const hidden = computed(() => props.rules.length - shown.value.length)
-const height = computed(() => Math.max(shown.value.length, 1) * ROW)
+const expanded = ref(new Set<number>())
+type Row = { key: string; rule: Rule; bundle?: Rule[] }
+const sorted = computed(() => [...props.rules]
+  .sort((a, b) => order.indexOf(a.runtime_status) - order.indexOf(b.runtime_status) || a.listen_port - b.listen_port))
+const rows = computed<Row[]>(() => {
+  const single = (rule: Rule): Row => ({ key: `rule-${rule.id}`, rule })
+  if (props.rules.length <= (props.limit ?? 12)) return sorted.value.map(single)
+  const groups = new Map<number, Rule[]>()
+  for (const rule of sorted.value) groups.set(rule.owner_id, [...(groups.get(rule.owner_id) ?? []), rule])
+  return [...groups.values()].flatMap(bundle => [
+    { key: `owner-${bundle[0].owner_id}`, rule: bundle[0], bundle },
+    ...(expanded.value.has(bundle[0].owner_id) ? bundle.map(single) : []),
+  ])
+})
+function toggle(owner: number) {
+  const next = new Set(expanded.value)
+  if (next.has(owner)) next.delete(owner)
+  else next.add(owner)
+  expanded.value = next
+}
+const height = computed(() => Math.max(rows.value.length, 1) * ROW)
 
 const streams = computed(() => {
   const hub = height.value / 2
-  return shown.value.map((rule, index) => {
+  return rows.value.map((row, index) => {
     const y = index * ROW + ROW / 2
-    return { rule, d: `M0 ${y} C 26 ${y}, 30 ${hub}, 50 ${hub} C 70 ${hub}, 74 ${y}, 100 ${y}` }
+    return { ...row, d: `M0 ${y} C 26 ${y}, 30 ${hub}, 50 ${hub} C 70 ${hub}, 74 ${y}, 100 ${y}` }
   })
 })
 
@@ -41,13 +57,18 @@ const pulses = [
 </script>
 
 <template>
-  <div class="grid grid-cols-[minmax(0,auto)_minmax(4rem,1fr)_minmax(0,auto)] items-stretch gap-x-3 md:gap-x-5">
+  <div v-if="rows.length" class="grid grid-cols-[minmax(0,1fr)_minmax(3rem,1fr)_minmax(0,1.5fr)] items-stretch gap-x-2 md:gap-x-5">
     <ul class="grid content-start" aria-label="入口">
-      <li v-for="item in shown" :key="item.id" class="h-8">
-        <RouterLink :to="`/rules/${item.id}`" class="flex h-8 items-center gap-2 rounded-lg pr-1 text-sm hover:text-accent" :title="item.name">
-          <StatusMark :status="item.runtime_status" />
-          <span class="font-medium tabular">{{ item.listen_port }}</span>
-          <span class="truncate text-xs text-muted max-sm:hidden">{{ admin ? item.owner_username : item.name }}</span>
+      <li v-for="row in rows" :key="row.key" class="min-w-0 h-8">
+        <button v-if="row.bundle" type="button" class="flex h-8 w-full items-center gap-1.5 rounded-lg text-left text-sm hover:text-accent" :aria-expanded="expanded.has(row.rule.owner_id)" :aria-label="`${row.rule.owner_username}，${row.bundle.length} 条转发，${expanded.has(row.rule.owner_id) ? '收起' : '展开'}`" @click="toggle(row.rule.owner_id)">
+          <StatusMark :status="row.rule.runtime_status" />
+          <span class="truncate font-medium">{{ row.rule.owner_username }}</span>
+          <span class="shrink-0 text-xs text-muted" aria-hidden="true">{{ expanded.has(row.rule.owner_id) ? '−' : '+' }}</span>
+        </button>
+        <RouterLink v-else :to="`/rules/${row.rule.id}`" class="flex h-8 items-center gap-1.5 rounded-lg pr-1 text-sm hover:text-accent" :aria-label="`${row.rule.name}，${row.rule.listen_port}，${statusLabels[row.rule.runtime_status]}`" :title="row.rule.name">
+          <StatusMark :status="row.rule.runtime_status" />
+          <span class="shrink-0 font-medium tabular">{{ row.rule.listen_port }}</span>
+          <span class="truncate text-xs text-muted max-sm:hidden">{{ row.rule.name }}</span>
         </RouterLink>
       </li>
     </ul>
@@ -55,26 +76,32 @@ const pulses = [
     <div class="relative" :style="{ height: `${height}px` }" aria-hidden="true">
       <svg class="absolute inset-0 size-full overflow-visible" :viewBox="`0 0 100 ${height}`" preserveAspectRatio="none">
         <g fill="none" stroke-linecap="round">
-          <path v-for="stream in streams" :key="`line-${stream.rule.id}`" :d="stream.d" stroke-width="1.5" vector-effect="non-scaling-stroke" :class="stroke[stream.rule.runtime_status]" />
-          <template v-for="(stream, index) in streams" :key="`pulse-${stream.rule.id}`">
+          <g v-for="stream in streams" :key="stream.key">
+            <path v-if="stream.bundle" :d="stream.d" stroke="transparent" stroke-width="14" vector-effect="non-scaling-stroke" class="cursor-pointer [pointer-events:stroke]" @click="toggle(stream.rule.owner_id)" />
+            <RouterLink v-else v-slot="{ href, navigate }" :to="`/rules/${stream.rule.id}`" custom>
+              <a :href="href" tabindex="-1" @click="navigate"><path :d="stream.d" stroke="transparent" stroke-width="14" vector-effect="non-scaling-stroke" class="cursor-pointer [pointer-events:stroke]" /></a>
+            </RouterLink>
+            <path :d="stream.d" :stroke-width="stream.bundle ? 3 : 1.5" vector-effect="non-scaling-stroke" class="pointer-events-none" :class="stroke[stream.rule.runtime_status]" />
+          </g>
+          <template v-for="(stream, index) in streams" :key="`pulse-${stream.key}`">
             <path
               v-if="stream.rule.runtime_status === 'active'" :d="stream.d" pathLength="1000" stroke-dasharray="22 978" stroke-width="2.5"
-              vector-effect="non-scaling-stroke" class="stroke-[var(--accent)] [stroke-dashoffset:1000]" :class="pulses[index % pulses.length]"
+              vector-effect="non-scaling-stroke" class="pointer-events-none stroke-[var(--accent)] [stroke-dashoffset:1000]" :class="pulses[index % pulses.length]"
             />
           </template>
         </g>
       </svg>
-      <span class="absolute top-1/2 left-1/2 flex size-10 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border border-line bg-surface shadow-[var(--shadow-card)]">
+      <span class="pointer-events-none absolute top-1/2 left-1/2 flex size-10 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border border-line bg-surface shadow-[var(--shadow-card)]">
         <BrandMark />
       </span>
     </div>
 
     <ul class="grid content-start" aria-label="落地">
-      <li v-for="item in shown" :key="item.id" class="flex h-8 items-center justify-end text-sm text-muted tabular">
-        <span class="max-w-[11rem] truncate" :title="item.target_ip !== item.target_host ? item.target_ip : undefined">{{ hostText(item.target_host) }}:{{ item.target_port }}</span>
+      <li v-for="row in rows" :key="row.key" class="flex min-w-0 h-8 items-center justify-end text-sm text-muted tabular">
+        <button v-if="row.bundle" type="button" class="h-8 rounded-lg text-xs hover:text-accent" :aria-expanded="expanded.has(row.rule.owner_id)" @click="toggle(row.rule.owner_id)">{{ row.bundle.length }} 条转发</button>
+        <RouterLink v-else :to="`/rules/${row.rule.id}`" class="truncate rounded-lg hover:text-accent" :title="`${hostText(row.rule.target_host)}:${row.rule.target_port}`">{{ hostText(row.rule.target_host) }}:{{ row.rule.target_port }}</RouterLink>
       </li>
     </ul>
   </div>
-  <p v-if="!shown.length" class="-mt-5 text-center text-sm text-muted">暂无转发</p>
-  <RouterLink v-if="hidden > 0" to="/rules" class="mt-2 block text-center text-xs text-muted hover:text-accent">另有 {{ hidden }} 条</RouterLink>
+  <p v-else class="py-8 text-center text-sm text-muted">暂无转发</p>
 </template>
