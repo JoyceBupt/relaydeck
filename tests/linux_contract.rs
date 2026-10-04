@@ -7,6 +7,7 @@ use relaydeck::{
 
 fn policy() -> BrokerPolicy {
     BrokerPolicy {
+        port_policy_version: 2,
         database: "/var/lib/relaydeck/relaydeck.db".into(),
         web_uid: 999,
         web_gid: None,
@@ -29,24 +30,44 @@ fn policy() -> BrokerPolicy {
 fn unrelated_managed_port_listeners_are_rejected_before_firewall_changes() {
     use relaydeck::linux::validate_listener_inventory;
     assert!(
-        validate_listener_inventory(&policy(), "LISTEN 0 128 0.0.0.0:41000 0.0.0.0:* ino:1")
-            .is_err()
+        validate_listener_inventory(
+            &policy(),
+            "LISTEN 0 128 0.0.0.0:41000 0.0.0.0:* ino:1",
+            &plan(1, 41000, "1.1.1.1".parse().unwrap(), vec![])
+        )
+        .is_err()
     );
     assert!(
-        validate_listener_inventory(&policy(), "UNCONN 0 0 [::]:41000 [::]:* uid:1000 ino:1")
-            .is_err()
+        validate_listener_inventory(
+            &policy(),
+            "UNCONN 0 0 [::]:41000 [::]:* uid:1000 ino:1",
+            &plan(1, 41000, "1.1.1.1".parse().unwrap(), vec![])
+        )
+        .is_err()
     );
     assert!(
-        validate_listener_inventory(&policy(), "LISTEN 0 128 [::]:41000 [::]:* uid:60000 ino:1")
-            .is_ok()
+        validate_listener_inventory(
+            &policy(),
+            "LISTEN 0 128 [::]:41000 [::]:* uid:60000 ino:1",
+            &plan(1, 41000, "1.1.1.1".parse().unwrap(), vec![])
+        )
+        .is_ok()
     );
     assert!(
-        validate_listener_inventory(&policy(), "LISTEN 0 128 0.0.0.0:40100 0.0.0.0:* ino:1")
-            .is_ok()
+        validate_listener_inventory(
+            &policy(),
+            "LISTEN 0 128 0.0.0.0:40100 0.0.0.0:* ino:1",
+            &plan(1, 41000, "1.1.1.1".parse().unwrap(), vec![])
+        )
+        .is_ok()
     );
     assert!(
-        validate_listener_inventory(&policy(), "LISTEN 0 128 127.0.0.1:7410 0.0.0.0:* ino:1")
-            .is_ok()
+        validate_listener_inventory(
+            &policy(),
+            "LISTEN 0 128 127.0.0.1:7410 0.0.0.0:* ino:1",
+            &plan(1, 41000, "1.1.1.1".parse().unwrap(), vec![])
+        )
+        .is_ok()
     );
 }
 
@@ -94,8 +115,8 @@ fn systemd_has_fixed_nonroot_identity_expiry_and_limits() {
         "MemoryMax=64M\n",
         "TasksMax=96\n",
         "SocketBindDeny=any\n",
-        "SocketBindAllow=tcp:41000-41009\n",
-        "SocketBindAllow=udp:41000-41009\n",
+        "SocketBindAllow=tcp:40000-42000\n",
+        "SocketBindAllow=udp:40000-42000\n",
         "ExecStart=/usr/local/libexec/relaydeck tenant-plan /usr/local/libexec/realm /var/lib/relaydeck-runtime/owner-2/plan.json 2000 60001 2\n",
         "Slice=relaydeck.slice\n",
     ] {
@@ -185,7 +206,7 @@ fn nft_preserves_scoped_client_replies_and_never_flushes_host_rules() {
         .unwrap();
     assert!(reply < local_block && local_block < tuple);
     assert!(!nft.contains("ct state established"));
-    assert!(nft.contains("elements = { 40000-40099, 40101-42000 }"));
+    assert!(nft.contains("elements = { 41000 }"));
 }
 
 #[test]
@@ -323,12 +344,18 @@ fn udp_readiness_accepts_ephemeral_upstream_sockets_but_stop_requires_none() {
 }
 
 #[test]
-fn managed_ports_must_be_reserved_from_outbound_auto_allocation() {
-    use relaydeck::linux::validate_reserved_ports;
-    assert!(validate_reserved_ports("8080,40000-60000\n", 40000, 60000).is_ok());
-    assert!(validate_reserved_ports("40000-49999,50001-60000", 40000, 60000).is_err());
-    assert!(validate_reserved_ports("", 40000, 60000).is_err());
-    assert!(validate_reserved_ports("60000-40000", 40000, 60000).is_err());
+fn firewall_manages_only_claimed_ports_in_a_shared_pool() {
+    let mut policy = policy();
+    policy.allowed_port_start = 1024;
+    policy.allowed_port_end = 65535;
+    let runtime = plan(1, 41000, "1.1.1.1".parse().unwrap(), vec![]);
+    let nft = render_nft(&policy, &[runtime], &[], 1000).unwrap();
+    assert!(nft.contains("elements = { 41000 }"));
+    assert!(!nft.contains("1024-65535"));
+    assert!(!nft.contains("23499"));
+    let stopped = render_nft(&policy, &[], &[], 1000).unwrap();
+    assert!(!stopped.contains("dport @managed_tcp_ports"));
+    assert!(stopped.contains("meta skuid 60000 jump owner_1"));
 }
 
 #[test]
@@ -344,4 +371,26 @@ fn supervisor_rejects_insufficient_process_budget_before_startup() {
     );
     policy.limits.tasks = 96;
     assert!(policy.validate().is_ok());
+}
+
+#[test]
+fn unkillable_tenant_sockets_remain_blocked_without_claiming_other_protocols() {
+    let mut policy = policy();
+    policy.allowed_port_start = 1024;
+    policy.allowed_port_end = 65535;
+    let nft = relaydeck::linux::render_nft_with_listeners(
+        &policy,
+        &[],
+        &[],
+        1000,
+        &[(Protocol::Tcp, 41000), (Protocol::Udp, 62001)],
+    )
+    .unwrap();
+    assert!(nft.contains("managed_tcp_ports { type inet_service; elements = { 41000 }"));
+    assert!(nft.contains("managed_udp_ports { type inet_service; elements = { 62001 }"));
+    assert!(!nft.contains("tcp dport 41000 return"));
+    assert!(!nft.contains("udp dport 62001 return"));
+    assert!(nft.contains("tcp dport @managed_tcp_ports jump ingress"));
+    assert!(nft.contains("udp dport @managed_udp_ports jump ingress"));
+    assert!(nft.contains("meta skuid 60000 jump owner_1"));
 }

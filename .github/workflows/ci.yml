@@ -3,7 +3,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -40,5 +39,15 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm test
           pnpm run build
+      - name: Linux shared-port kernel acceptance
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          test_binary=$(./scripts/cargo.sh test --locked --lib --no-run --message-format=json | python3 -c 'import json,sys; items=[json.loads(line) for line in sys.stdin]; print(next(item["executable"] for item in items if item.get("reason") == "compiler-artifact" and item.get("executable") and "lib" in item["target"]["kind"]))')
+          sudo "$test_binary" linux::shared_port_kernel_tests::udp_listener_history_survives_apply_failure_and_excludes_upstream_and_host_sockets --ignored --exact --test-threads=1
+      - name: Linux legacy panel update and root policy acceptance
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          sudo env PYTHONDONTWRITEBYTECODE=1 RELAYDECK_POLICY_TEST=1 RELAYDECK_TEST_BINARY="$PWD/target/debug/relaydeck" python3 tests/policy_preparation.py -v
+          sudo env PYTHONDONTWRITEBYTECODE=1 RELAYDECK_POLICY_TEST=1 RELAYDECK_TEST_BINARY="$PWD/target/debug/relaydeck" python3 -m unittest discover -s tests -p 'test_legacy_update.py' -v
       - name: Release validation tests
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py' -v

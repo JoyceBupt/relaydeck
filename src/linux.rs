@@ -7,12 +7,12 @@ use std::{
 };
 
 use anyhow::{Context, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::{io::AsyncWriteExt, process::Command, sync::Mutex};
 
 use crate::{
     db::now,
-    executor::{DriverError, DriverFuture, ExecutorDriver, ExecutorPolicy, RuntimePlan},
+    executor::{DriverError, DriverFuture, ExecutorDriver, ExecutorPolicy, Protocol, RuntimePlan},
 };
 
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
@@ -75,9 +75,11 @@ where
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrokerPolicy {
+    #[serde(default = "legacy_port_policy_version")]
+    pub port_policy_version: u32,
     pub database: PathBuf,
     pub web_uid: u32,
     #[serde(default)]
@@ -99,6 +101,10 @@ pub struct BrokerPolicy {
     pub limits: ResourceLimits,
 }
 
+fn legacy_port_policy_version() -> u32 {
+    1
+}
+
 fn default_socket() -> PathBuf {
     "/run/relaydeck/broker.sock".into()
 }
@@ -106,7 +112,7 @@ fn default_authorization_ttl() -> u64 {
     120
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ResourceLimits {
     pub memory_high_mb: u64,
@@ -134,6 +140,10 @@ impl Default for ResourceLimits {
 
 impl BrokerPolicy {
     pub fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            matches!(self.port_policy_version, 1 | 2),
+            "unsupported port policy version"
+        );
         ensure!(self.web_uid != 0, "web_uid must not be root");
         ensure!(self.web_gid != Some(0), "web_gid must not be root");
         ensure!(
@@ -231,6 +241,53 @@ impl BrokerPolicy {
     }
 }
 
+/// Old panel updaters keep executing their already-imported Python module.
+/// Preparing the new policy in ExecStartPre also covers that first upgrade;
+/// the original policy stays usable by the old units during rollback.
+pub fn prepare_broker_policy(source: &Path, destination: &Path) -> anyhow::Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (source, destination);
+        anyhow::bail!("broker policy preparation requires Linux root");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        ensure!(
+            unsafe { libc::geteuid() } == 0,
+            "policy preparation requires root"
+        );
+        secure_root_path(source, false)?;
+        ensure!(
+            std::fs::metadata(source)?.len() <= 16 * 1024,
+            "broker policy too large"
+        );
+        let mut policy: BrokerPolicy = serde_json::from_slice(&std::fs::read(source)?)?;
+        policy.validate()?;
+        ensure!(
+            destination == policy.runtime_dir.join("broker-effective.json")
+                && source != destination,
+            "effective policy must use its dedicated runtime path"
+        );
+        match std::fs::symlink_metadata(destination) {
+            Ok(_) => secure_root_path(destination, false)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error.into()),
+        }
+        if policy.port_policy_version == 1 {
+            policy.allowed_port_start = 1024;
+            policy.allowed_port_end = 65535;
+            policy.port_policy_version = 2;
+        }
+        policy.validate()?;
+        let bytes = serde_json::to_vec(&policy)?;
+        ensure!(
+            bytes.len() <= 16 * 1024,
+            "effective broker policy too large"
+        );
+        write_root_file(destination, &bytes, 0o644, 0)
+    }
+}
+
 fn validate_absolute_path(path: &Path) -> anyhow::Result<()> {
     ensure!(
         path.is_absolute()
@@ -278,13 +335,12 @@ pub fn render_systemd(
         nofile = policy.limits.nofile,
         revision = plan.revision(),
     );
-    // systemd's optional guard covers the account grant; the independent BPF
-    // guard below restricts binds to the currently active rules.
+    // The optional systemd guard covers the shared root boundary. The mandatory
+    // independent BPF guard restricts binds to this account's exact active rules.
     for protocol in ["tcp", "udp"] {
         unit.push_str(&format!(
             "SocketBindAllow={protocol}:{}-{}\n",
-            plan.port_start(),
-            plan.port_end()
+            policy.allowed_port_start, policy.allowed_port_end
         ));
     }
     unit.push_str(&format!(
@@ -298,37 +354,24 @@ pub fn render_systemd(
     Ok(unit)
 }
 
-fn allowed_port_intervals(policy: &BrokerPolicy) -> String {
-    let mut excluded: Vec<u16> = policy
-        .reserved_ports
-        .iter()
-        .copied()
-        .chain([22, 80, 443])
-        .filter(|port| (policy.allowed_port_start..=policy.allowed_port_end).contains(port))
-        .collect();
-    excluded.sort_unstable();
-    excluded.dedup();
-    let mut cursor = u32::from(policy.allowed_port_start);
-    let mut ranges = Vec::new();
-    let end = u32::from(policy.allowed_port_end);
-    for port in excluded.into_iter().map(u32::from).chain([end + 1]) {
-        if cursor < port {
-            ranges.push(if cursor == port - 1 {
-                cursor.to_string()
-            } else {
-                format!("{cursor}-{}", port - 1)
-            });
-        }
-        cursor = port + 1;
-    }
-    ranges.join(", ")
-}
-
 pub fn render_nft(
     policy: &BrokerPolicy,
     plans: &[RuntimePlan],
     local_ips: &[IpAddr],
     timestamp: i64,
+) -> anyhow::Result<String> {
+    render_nft_with_listeners(policy, plans, local_ips, timestamp, &[])
+}
+
+// Kernel-owned tenant sockets remain guarded even after a failed stop or broker
+// restart. Keep protocols separate: a UDP upstream port must not block an
+// unrelated TCP service using the same number.
+pub fn render_nft_with_listeners(
+    policy: &BrokerPolicy,
+    plans: &[RuntimePlan],
+    local_ips: &[IpAddr],
+    timestamp: i64,
+    listeners: &[(Protocol, u16)],
 ) -> anyhow::Result<String> {
     policy.validate()?;
     let mut boundary_ips = policy.local_ips.clone();
@@ -340,9 +383,10 @@ pub fn render_nft(
         policy.uid(raw.owner_id())?;
         let plan = raw.validate_again(&boundary, timestamp)?;
         ensure!(
-            plan.stopped()
-                || (plan.port_start() >= policy.allowed_port_start
-                    && plan.port_end() <= policy.allowed_port_end),
+            plan.rules()
+                .iter()
+                .all(|rule| (policy.allowed_port_start..=policy.allowed_port_end)
+                    .contains(&rule.listen_port)),
             "account grant exceeds root global port boundary"
         );
         for rule in plan.rules() {
@@ -356,14 +400,36 @@ pub fn render_nft(
             "duplicate runtime owner"
         );
     }
-    let intervals = allowed_port_intervals(policy);
     // add+flush only this fixed table, in a single nft transaction. Never flush
     // the host ruleset, and never depend on an accept overriding another table.
     let mut rules = String::from(
         "add table inet relaydeck\nflush table inet relaydeck\ntable inet relaydeck {\n",
     );
-    if !intervals.is_empty() {
-        rules.push_str(&format!(" set managed_ports {{ type inet_service; flags interval; elements = {{ {intervals} }}; }}\n"));
+    let mut managed = BTreeMap::new();
+    for (protocol, tcp) in [("tcp", true), ("udp", false)] {
+        let mut claimed = std::collections::BTreeSet::new();
+        for plan in validated.values() {
+            for rule in plan.rules() {
+                if (tcp && rule.protocol.tcp()) || (!tcp && rule.protocol.udp()) {
+                    claimed.insert(rule.listen_port);
+                }
+            }
+        }
+        for (kind, port) in listeners {
+            ensure!(*port > 0, "invalid kernel listener port");
+            if (tcp && kind.tcp()) || (!tcp && kind.udp()) {
+                claimed.insert(*port);
+            }
+        }
+        if !claimed.is_empty() {
+            let values = claimed
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            rules.push_str(&format!(" set managed_{protocol}_ports {{ type inet_service; elements = {{ {values} }}; }}\n"));
+        }
+        managed.insert(protocol, !claimed.is_empty());
     }
     rules.push_str(" chain ingress {\n");
     for plan in validated.values() {
@@ -394,10 +460,12 @@ pub fn render_nft(
         }
     }
     rules.push_str("  drop\n }\n chain input { type filter hook input priority -10; policy accept;\n  ct direction reply return\n");
-    if !intervals.is_empty() {
-        rules.push_str(
-            "  tcp dport @managed_ports jump ingress\n  udp dport @managed_ports jump ingress\n",
-        );
+    for protocol in ["tcp", "udp"] {
+        if managed[protocol] {
+            rules.push_str(&format!(
+                "  {protocol} dport @managed_{protocol}_ports jump ingress\n"
+            ));
+        }
     }
     rules.push_str(" }\n");
     for owner_id in 1..=i64::from(policy.max_owners) {
@@ -504,7 +572,11 @@ pub fn validate_runtime_listeners(
     Ok(())
 }
 
-pub fn validate_listener_inventory(policy: &BrokerPolicy, output: &str) -> anyhow::Result<()> {
+pub fn validate_listener_inventory(
+    policy: &BrokerPolicy,
+    output: &str,
+    plan: &RuntimePlan,
+) -> anyhow::Result<()> {
     policy.validate()?;
     for line in output.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
@@ -515,10 +587,7 @@ pub fn validate_listener_inventory(policy: &BrokerPolicy, output: &str) -> anyho
             .rsplit_once(':')
             .context("invalid listener inventory port")?;
         let port: u16 = value.parse().context("invalid listener inventory port")?;
-        if !(policy.allowed_port_start..=policy.allowed_port_end).contains(&port)
-            || policy.reserved_ports.contains(&port)
-            || [22, 80, 443].contains(&port)
-        {
+        if !plan.rules().iter().any(|rule| rule.listen_port == port) {
             continue;
         }
         // ss omits uid for root sockets. Treat absent uid as root, never as a
@@ -530,11 +599,127 @@ pub fn validate_listener_inventory(policy: &BrokerPolicy, output: &str) -> anyho
             .transpose()?
             .unwrap_or(0);
         ensure!(
-            (policy.uid_start..policy.uid_start + policy.max_owners).contains(&uid),
-            "managed port {port} already belongs to another service"
+            uid == policy.uid(plan.owner_id())?,
+            "port {port} is occupied by another service; choose another port"
         );
     }
     Ok(())
+}
+
+fn udp_grants_for_owner(policy: &BrokerPolicy, owner: i64) -> anyhow::Result<HashSet<u16>> {
+    let directory = policy.runtime_dir.join(format!("owner-{owner}"));
+    let held = directory.join("held-udp-ports.json");
+    if held.try_exists()? {
+        secure_root_path(&held, false)?;
+        ensure!(
+            std::fs::metadata(&held)?.len() <= 1024,
+            "UDP grant snapshot too large"
+        );
+        let ports: HashSet<u16> = serde_json::from_slice(&std::fs::read(held)?)?;
+        ensure!(
+            ports.len() <= crate::executor::MAX_RULES * 2 && ports.iter().all(|port| *port >= 1024),
+            "invalid UDP grant snapshot"
+        );
+        return Ok(ports);
+    }
+    // Compatibility with a runtime started by an earlier release.
+    let snapshot = directory.join("plan.json");
+    if !snapshot.try_exists()? {
+        return Ok(HashSet::new());
+    }
+    secure_root_path(&snapshot, false)?;
+    ensure!(
+        std::fs::metadata(&snapshot)?.len() <= 128 * 1024,
+        "runtime snapshot too large"
+    );
+    let plan: RuntimePlan = serde_json::from_slice(&std::fs::read(snapshot)?)?;
+    ensure!(plan.owner_id() == owner, "runtime snapshot owner mismatch");
+    Ok(plan
+        .rules()
+        .iter()
+        .filter(|rule| rule.protocol.udp())
+        .map(|rule| rule.listen_port)
+        .collect())
+}
+
+#[cfg(target_os = "linux")]
+fn save_udp_grants(
+    policy: &BrokerPolicy,
+    plan: &RuntimePlan,
+    retain_previous: bool,
+) -> anyhow::Result<()> {
+    let mut ports = if retain_previous {
+        udp_grants_for_owner(policy, plan.owner_id())?
+    } else {
+        HashSet::new()
+    };
+    ports.extend(
+        plan.rules()
+            .iter()
+            .filter(|rule| rule.protocol.udp())
+            .map(|rule| rule.listen_port),
+    );
+    ensure!(
+        ports.len() <= crate::executor::MAX_RULES * 2,
+        "too many retained UDP listener ports"
+    );
+    let mut ports: Vec<_> = ports.into_iter().collect();
+    ports.sort_unstable();
+    write_root_file(
+        &policy
+            .runtime_dir
+            .join(format!("owner-{}/held-udp-ports.json", plan.owner_id())),
+        &serde_json::to_vec(&ports)?,
+        0o600,
+        0,
+    )
+}
+
+fn tenant_kernel_listeners(policy: &BrokerPolicy) -> anyhow::Result<Vec<(Protocol, u16)>> {
+    use std::io::BufRead;
+    let mut udp_grants = BTreeMap::new();
+    for owner in 1..=i64::from(policy.max_owners) {
+        udp_grants.insert(policy.uid(owner)?, udp_grants_for_owner(policy, owner)?);
+    }
+    let mut held = Vec::new();
+    for (protocol, name) in [
+        (Protocol::Tcp, "tcp"),
+        (Protocol::Tcp, "tcp6"),
+        (Protocol::Udp, "udp"),
+        (Protocol::Udp, "udp6"),
+    ] {
+        let file = std::fs::File::open(Path::new("/proc/net").join(name))?;
+        for line in std::io::BufReader::new(file).lines().skip(1) {
+            let line = line?;
+            let fields: Vec<_> = line.split_whitespace().collect();
+            let uid: u32 = fields
+                .get(7)
+                .context("missing kernel socket UID")?
+                .parse()?;
+            if !(policy.uid_start..policy.uid_start + policy.max_owners).contains(&uid)
+                || (protocol == Protocol::Tcp && fields.get(3) != Some(&"0A"))
+            {
+                continue;
+            }
+            let port = fields
+                .get(1)
+                .and_then(|address| address.rsplit_once(':'))
+                .context("invalid kernel socket address")?
+                .1;
+            let port = u16::from_str_radix(port, 16)?;
+            // UDP upstream sockets also bind ephemeral ports. They are not
+            // managed listeners and must not capture other host services.
+            if protocol == Protocol::Udp
+                && !udp_grants
+                    .get(&uid)
+                    .is_some_and(|ports| ports.contains(&port))
+            {
+                continue;
+            }
+            held.push((protocol, port));
+        }
+    }
+    Ok(held)
 }
 
 #[cfg(target_os = "linux")]
@@ -838,16 +1023,7 @@ impl LinuxDriver {
             for tool in [SYSTEMCTL, NFT, SS, IP] {
                 system_tool(Path::new(tool))?;
             }
-            validate_reserved_ports(
-                &std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_reserved_ports")?,
-                policy.allowed_port_start,
-                policy.allowed_port_end,
-            )?;
             validate_uid_pool(&policy)?;
-            for flags in ["-Hlnte", "-Hlnue"] {
-                let listeners = command(SS, &[flags], None).await?;
-                validate_listener_inventory(&policy, std::str::from_utf8(&listeners)?)?;
-            }
             write_root_file(&Path::new(UNIT_DIR).join("relaydeck.slice"), format!("[Unit]\nDescription=RelayDeck runtime budget\n\n[Slice]\nMemoryMax={}M\nMemorySwapMax=0\nTasksMax={}\nCPUQuota={}%\n",policy.limits.total_memory_mb,policy.limits.tasks * policy.max_owners,policy.limits.total_cpu_percent).as_bytes(), 0o644, 0)?;
             command(SYSTEMCTL, &["daemon-reload"], None).await?;
             let driver = Self {
@@ -873,11 +1049,13 @@ impl LinuxDriver {
 
     async fn firewall(&self, plans: &BTreeMap<i64, RuntimePlan>) -> anyhow::Result<()> {
         let addresses = interface_ips().await?;
-        let nft = render_nft(
+        let held = tenant_kernel_listeners(&self.policy)?;
+        let nft = render_nft_with_listeners(
             &self.policy,
             &plans.values().cloned().collect::<Vec<_>>(),
             &addresses,
             now(),
+            &held,
         )?;
         command(NFT, &["--check", "-f", "-"], Some(nft.as_bytes())).await?;
         command(NFT, &["-f", "-"], Some(nft.as_bytes())).await?;
@@ -1136,7 +1314,18 @@ impl LinuxDriver {
                 "runtime did not stop"
             );
         }
-        self.confirm_listeners(owner_id, None).await
+        self.confirm_listeners(owner_id, None).await?;
+        #[cfg(target_os = "linux")]
+        {
+            let held = self
+                .policy
+                .runtime_dir
+                .join(format!("owner-{owner_id}/held-udp-ports.json"));
+            if held.try_exists()? {
+                write_root_file(&held, b"[]", 0o600, 0)?;
+            }
+        }
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -1249,11 +1438,20 @@ impl LinuxDriver {
             now(),
         )?;
         ensure!(
-            plan.stopped()
-                || (plan.port_start() >= self.policy.allowed_port_start
-                    && plan.port_end() <= self.policy.allowed_port_end),
+            plan.rules()
+                .iter()
+                .all(
+                    |rule| (self.policy.allowed_port_start..=self.policy.allowed_port_end)
+                        .contains(&rule.listen_port)
+                ),
             "account grant exceeds root global port boundary"
         );
+        // Check only requested ports. A shared pool must coexist with unrelated
+        // host services, and never install ACLs over another service's listener.
+        for flags in ["-Hlnte", "-Hlnue"] {
+            let listeners = command(SS, &[flags], None).await?;
+            validate_listener_inventory(&self.policy, std::str::from_utf8(&listeners)?, &plan)?;
+        }
         let mut plans = self.plans.lock().await;
         #[cfg(target_os = "linux")]
         if let Some(previous) = plans.get(&plan.owner_id())
@@ -1286,6 +1484,7 @@ impl LinuxDriver {
             self.renew_authorization(&plan)?;
             self.confirm_applied(&plan, &directory).await?;
             self.confirm_service(&plan).await?;
+            save_udp_grants(&self.policy, &plan, false)?;
             *plans = next;
             return Ok(());
         }
@@ -1353,6 +1552,7 @@ impl LinuxDriver {
             )?;
             self.confirm_applied(&plan, &directory).await?;
             self.confirm_service(&plan).await?;
+            save_udp_grants(&self.policy, &plan, false)?;
             plans.insert(plan.owner_id(), plan.clone());
             self.firewall(&plans).await?;
             Ok(())
@@ -1443,6 +1643,7 @@ impl LinuxDriver {
 
     #[cfg(target_os = "linux")]
     fn write_plan(&self, plan: &RuntimePlan, directory: &Path) -> anyhow::Result<()> {
+        save_udp_grants(&self.policy, plan, true)?;
         let uid = self.policy.uid(plan.owner_id())?;
         for rule in plan.rules() {
             write_root_file(
@@ -1628,22 +1829,133 @@ fn read_ack(path: &Path, uid: u32) -> anyhow::Result<Option<i64>> {
     Ok(value.parse().ok())
 }
 
-/// The kernel excludes these ports from automatic outbound allocation.
-pub fn validate_reserved_ports(value: &str, start: u16, end: u16) -> anyhow::Result<()> {
-    let mut reserved = HashSet::new();
-    for item in value.trim().split(',').filter(|item| !item.is_empty()) {
-        let mut parts = item.split('-');
-        let low: u16 = parts.next().context("missing reserved port")?.parse()?;
-        let high: u16 = parts.next().unwrap_or(item).parse()?;
-        ensure!(
-            low > 0 && high >= low && parts.next().is_none(),
-            "invalid reserved port range"
-        );
-        reserved.extend(low..=high);
+#[cfg(all(test, target_os = "linux"))]
+mod shared_port_kernel_tests {
+    use super::*;
+    use crate::executor::{DesiredPlan, DesiredRule};
+    use std::{
+        io::{BufRead, BufReader},
+        process::{Child, Command, Stdio},
+    };
+
+    struct Process(Child);
+    impl Drop for Process {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
-    ensure!(
-        (start..=end).all(|port| reserved.contains(&port)),
-        "forwarding range must be included in net.ipv4.ip_local_reserved_ports; rerun the verified installer/updater before starting broker"
-    );
-    Ok(())
+
+    #[test]
+    #[ignore = "requires an isolated root Linux environment with Python and setpriv"]
+    fn udp_listener_history_survives_apply_failure_and_excludes_upstream_and_host_sockets() {
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let dir = tempfile::Builder::new()
+            .prefix("relaydeck-port-tests-")
+            .tempdir_in("/run")
+            .unwrap();
+        let mut policy: BrokerPolicy =
+            serde_json::from_str(include_str!("../deploy/broker.example.json")).unwrap();
+        policy.runtime_dir = dir.path().to_path_buf();
+        let owner = dir.path().join("owner-1");
+        std::fs::create_dir(&owner).unwrap();
+        let host = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let script = r#"import socket,json,sys
+a=socket.socket();a.bind(('127.0.0.1',0));a.listen()
+sockets=[a];ports=[a.getsockname()[1]]
+for _ in range(2):
+ for attempt in range(3):
+  s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(('127.0.0.1',0))
+  port=s.getsockname()[1]
+  if port not in ports:
+   sockets.append(s);ports.append(port);break
+  s.close()
+ else: raise RuntimeError('cannot allocate distinct fixture ports')
+print(json.dumps(ports),flush=True)
+sys.stdin.read(1)
+"#;
+        let mut child = Process(
+            Command::new("setpriv")
+                .args([
+                    "--reuid",
+                    "60000",
+                    "--regid",
+                    "60000",
+                    "--clear-groups",
+                    "python3",
+                    "-u",
+                    "-c",
+                    script,
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut line = String::new();
+        BufReader::new(child.0.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let ports: Vec<u16> = serde_json::from_str(&line).unwrap();
+        let rule = |id, port, protocol| DesiredRule {
+            id,
+            listen_port: port,
+            target_ip: "1.1.1.1".parse().unwrap(),
+            target_port: 443,
+            protocol,
+            source_cidrs: vec![],
+            enabled: true,
+        };
+        let mut desired = DesiredPlan {
+            owner_id: 1,
+            revision: 1,
+            enabled: true,
+            expires_at: None,
+            port_start: 1024,
+            port_end: 65535,
+            max_rules: 10,
+            rules: vec![
+                rule(1, ports[0], Protocol::Tcp),
+                rule(2, ports[1], Protocol::Udp),
+            ],
+        };
+        let first = desired.validate(&ExecutorPolicy::default(), 0).unwrap();
+        write_root_file(
+            &owner.join("plan.json"),
+            &serde_json::to_vec(&first).unwrap(),
+            0o600,
+            0,
+        )
+        .unwrap();
+        let held = tenant_kernel_listeners(&policy).unwrap();
+        assert!(held.contains(&(Protocol::Tcp, ports[0])));
+        assert!(held.contains(&(Protocol::Udp, ports[1])));
+        assert!(!held.contains(&(Protocol::Udp, ports[2])));
+        assert!(!held.contains(&(Protocol::Udp, host.local_addr().unwrap().port())));
+        // A new snapshot cannot erase the old UDP listener's ACL before stop
+        // confirmation. The history is root-owned and survives broker restart.
+        desired.revision = 2;
+        desired.rules[1].listen_port = ports[2];
+        let next = desired.validate(&ExecutorPolicy::default(), 0).unwrap();
+        save_udp_grants(&policy, &next, true).unwrap();
+        write_root_file(
+            &owner.join("plan.json"),
+            &serde_json::to_vec(&next).unwrap(),
+            0o600,
+            0,
+        )
+        .unwrap();
+        let held = tenant_kernel_listeners(&policy).unwrap();
+        assert!(held.contains(&(Protocol::Udp, ports[1])));
+        assert!(held.contains(&(Protocol::Udp, ports[2])));
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        save_udp_grants(&policy, &next, false).unwrap();
+        assert!(
+            !udp_grants_for_owner(&policy, 1)
+                .unwrap()
+                .contains(&ports[1])
+        );
+        assert!(tenant_kernel_listeners(&policy).unwrap().is_empty());
+    }
 }

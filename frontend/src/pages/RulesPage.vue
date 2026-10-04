@@ -50,9 +50,10 @@ const counts = computed(() => {
   for (const rule of searched.value) result[rule.runtime_status]++
   return result
 })
-const filterOptions = computed(() => (['all', 'active', 'pending', 'failed', 'blocked', 'stopped'] as Filter[]).map(value => ({
-  value, label: value === 'all' ? '全部' : statusLabels[value], count: counts.value[value],
-})))
+// Empty states are hidden (except the active one) so the bar stays short and fits on phones.
+const filterOptions = computed(() => (['all', 'active', 'pending', 'failed', 'blocked', 'stopped'] as Filter[])
+  .filter(value => value === 'all' || value === filter.value || counts.value[value] > 0)
+  .map(value => ({ value, label: value === 'all' ? '全部' : statusLabels[value], count: counts.value[value] })))
 const ownerOptions = computed(() => (users.data.value ?? []).filter(user => all.value.some(rule => rule.owner_id === user.id) || user.id === ownerFilter.value))
 const filtering = computed(() => filter.value !== 'all' || ownerFilter.value !== null || search.value.trim() !== '')
 function clearFilters() { search.value = ''; router.replace({ query: {} }) }
@@ -78,7 +79,7 @@ const subtitle = computed(() => {
     const owners = new Set(all.value.map(rule => rule.owner_id)).size
     return `${all.value.length} 条 · ${owners} 个账户`
   }
-  return `${user.port_start}–${user.port_end} · ${user.rule_count} / ${user.max_rules} 条`
+  return `已用 ${user.rule_count} / ${user.max_rules} 个端口`
 })
 
 // Drawer state lives in the URL so a rule can be linked, refreshed and navigated with Back.
@@ -221,21 +222,24 @@ const cloneSource = computed(() => (route.name === 'rule-new' && route.query.fro
       </div>
 
       <div v-else class="panel overflow-hidden">
-        <div class="grid grid-cols-[1.25rem_minmax(9rem,1.1fr)_minmax(13rem,1.6fr)_6rem_minmax(7rem,1fr)_2.25rem_2rem] items-center gap-x-4 border-b border-line px-4 pt-3 pb-2 text-xs text-muted max-md:hidden">
+        <div class="grid grid-cols-[1.25rem_minmax(10rem,1.2fr)_minmax(14rem,1.8fr)_6rem_2.75rem_2rem] items-center gap-x-4 border-b border-line px-4 pt-3 pb-2 text-xs text-muted max-md:hidden">
           <input type="checkbox" class="size-4 accent-[var(--accent)]" :checked="allSelected" :indeterminate="selected.size > 0 && !allSelected" aria-label="全选当前列表" @change="toggleAll" />
-          <span>名称</span><span>入口 → 落地</span><span>协议</span><span>来源</span><span class="sr-only">启用</span><span class="sr-only">操作</span>
+          <span>名称</span><span>入口 → 落地</span><span>协议</span><span class="sr-only">启用</span><span class="sr-only">操作</span>
         </div>
         <ul class="group-list">
           <li
             v-for="rule in visible" :key="rule.id"
-            class="group relative grid cursor-pointer items-center gap-x-4 px-4 py-3 transition-colors duration-150 hover:bg-fill/60 md:grid-cols-[1.25rem_minmax(9rem,1.1fr)_minmax(13rem,1.6fr)_6rem_minmax(7rem,1fr)_2.25rem_2rem] max-md:grid-cols-[minmax(0,1fr)_auto] max-md:gap-y-1"
+            class="group relative grid cursor-pointer items-center gap-x-4 px-4 py-3 transition-colors duration-150 hover:bg-fill/60 md:grid-cols-[1.25rem_minmax(10rem,1.2fr)_minmax(14rem,1.8fr)_6rem_2.75rem_2rem] max-md:grid-cols-[minmax(0,1fr)_auto] max-md:gap-y-1"
             :class="selected.has(rule.id) ? 'bg-accent-soft/50' : ''" @click="openRule(rule)"
           >
             <input type="checkbox" class="size-4 accent-[var(--accent)] max-md:hidden" :checked="selected.has(rule.id)" :aria-label="`选择「${rule.name}」`" @click.stop @change="toggleSelected(rule.id)" />
             <div class="flex min-w-0 items-center gap-2.5">
               <StatusMark :status="rule.runtime_status" />
               <div class="min-w-0">
-                <RouterLink :to="{ path: `/rules/${rule.id}`, query: route.query }" class="block truncate font-medium text-fg" @click.stop>{{ rule.name }}</RouterLink>
+                <span class="flex min-w-0 items-center gap-1.5">
+                  <RouterLink :to="{ path: `/rules/${rule.id}`, query: route.query }" class="truncate font-medium text-fg" @click.stop>{{ rule.name }}</RouterLink>
+                  <span v-if="rule.source_cidrs.length" class="chip shrink-0 !h-5 !px-1.5" :title="rule.source_cidrs.join('\n')">限 {{ rule.source_cidrs.length }} 段</span>
+                </span>
                 <p class="truncate text-xs" :class="rule.runtime_error ? 'text-danger' : rule.dns_error ? 'text-warning' : 'text-muted'">
                   <template v-if="rule.runtime_status === 'failed'">失败{{ rule.runtime_error ? `：${rule.runtime_error}` : '' }}</template>
                   <template v-else-if="rule.runtime_status === 'blocked'">已阻断{{ rule.dns_error ? `：${rule.dns_error}` : '' }}</template>
@@ -246,7 +250,6 @@ const cloneSource = computed(() => (route.name === 'rule-new' && route.query.fro
             </div>
             <RuleEndpoint class="min-w-0 max-md:col-start-1 max-md:row-start-2 max-md:pl-6" :port="rule.listen_port" :host="rule.target_host" :target-port="rule.target_port" :resolved="rule.target_ip" />
             <span class="text-sm text-muted max-md:hidden">{{ protocolLabels[rule.protocol] }}</span>
-            <span class="truncate text-sm text-muted max-md:hidden" :title="rule.source_cidrs.join('\n') || undefined">{{ sourcesText(rule.source_cidrs) }}</span>
             <div class="flex justify-end max-md:col-start-2 max-md:row-start-1" @click.stop>
               <UiSwitch :model-value="rule.enabled" :label="`${rule.enabled ? '停用' : '启用'}「${rule.name}」`" :disabled="toggle.isPending.value" @update:model-value="toggle.mutate({ rule, enabled: $event })" />
             </div>

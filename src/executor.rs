@@ -349,8 +349,6 @@ struct PlanUser {
     id: i64,
     enabled: bool,
     expires_at: Option<i64>,
-    port_start: i64,
-    port_end: i64,
     max_rules: i64,
     desired_revision: i64,
 }
@@ -372,7 +370,7 @@ async fn load_plan(
     timestamp: i64,
 ) -> Result<Option<Result<DesiredPlan, PlanError>>, sqlx::Error> {
     let Some(user) = sqlx::query_as::<_, PlanUser>(
-        "SELECT id,enabled,expires_at,port_start,port_end,max_rules,desired_revision FROM users WHERE id=?",
+        "SELECT id,enabled,expires_at,max_rules,desired_revision FROM users WHERE id=?",
     )
     .bind(owner_id)
     .fetch_optional(&mut **tx)
@@ -441,14 +439,8 @@ async fn load_plan(
             revision: user.desired_revision,
             enabled: user.enabled,
             expires_at: user.expires_at,
-            port_start: user
-                .port_start
-                .try_into()
-                .map_err(|_| PlanError::StoredRule)?,
-            port_end: user
-                .port_end
-                .try_into()
-                .map_err(|_| PlanError::StoredRule)?,
+            port_start: 1024,
+            port_end: 65535,
             max_rules: user
                 .max_rules
                 .try_into()

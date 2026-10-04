@@ -806,10 +806,13 @@ pub async fn mutation_limit(
 struct CreateUser {
     username: String,
     password: String,
-    port_start: i64,
-    port_end: i64,
+    #[serde(default = "default_port_quota")]
     max_rules: i64,
     expires_at: Option<i64>,
+}
+
+fn default_port_quota() -> i64 {
+    10
 }
 
 fn validate_expiry(expiry: Option<i64>) -> Result<(), ApiError> {
@@ -827,7 +830,7 @@ async fn create_user(
     auth.admin()?;
     policy::validate_username(&input.username)?;
     policy::validate_password(&input.password)?;
-    policy::validate_port_grant(input.port_start, input.port_end, input.max_rules)?;
+    policy::validate_port_grant(1024, 65535, input.max_rules)?;
     validate_expiry(input.expires_at)?;
     let hash = state.credentials.hash_password(input.password).await?;
     let mut tx = state.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -841,17 +844,8 @@ async fn create_user(
     if count >= 10 {
         return Err(ApiError::conflict("首版最多10个用户"));
     }
-    let overlap: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE port_start<=? AND port_end>=?")
-            .bind(input.port_end)
-            .bind(input.port_start)
-            .fetch_one(&mut *tx)
-            .await?;
-    if overlap > 0 {
-        return Err(ApiError::conflict("端口范围与已有授权重叠"));
-    }
     let id=sqlx::query("INSERT INTO users(username,password_hash,role,port_start,port_end,max_rules,expires_at,created_at) VALUES(?,?,'user',?,?,?,?,?)")
-        .bind(input.username).bind(hash).bind(input.port_start).bind(input.port_end).bind(input.max_rules).bind(input.expires_at).bind(now()).execute(&mut *tx).await?.last_insert_rowid();
+        .bind(input.username).bind(hash).bind(1024).bind(65535).bind(input.max_rules).bind(input.expires_at).bind(now()).execute(&mut *tx).await?.last_insert_rowid();
     record_audit(&mut tx, &actor, "user_created", Some(id)).await?;
     tx.commit().await?;
     Ok((StatusCode::CREATED, Json(user_view(&state.pool, id).await?)))
@@ -882,8 +876,6 @@ async fn list_users(
 #[serde(deny_unknown_fields)]
 struct UpdateUser {
     enabled: bool,
-    port_start: i64,
-    port_end: i64,
     max_rules: i64,
     expires_at: Option<i64>,
 }
@@ -895,7 +887,7 @@ async fn update_user(
     Json(input): Json<UpdateUser>,
 ) -> Result<Json<UserView>, ApiError> {
     auth.admin()?;
-    policy::validate_port_grant(input.port_start, input.port_end, input.max_rules)?;
+    policy::validate_port_grant(1024, 65535, input.max_rules)?;
     if input.enabled {
         validate_expiry(input.expires_at)?;
     }
@@ -912,26 +904,13 @@ async fn update_user(
     if target.role == "admin" && (!input.enabled || input.expires_at.is_some()) {
         return Err(ApiError::bad_request("管理员不能停用或设置到期时间"));
     }
-    let overlap: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM users WHERE id<>? AND port_start<=? AND port_end>=?",
-    )
-    .bind(id)
-    .bind(input.port_end)
-    .bind(input.port_start)
-    .fetch_one(&mut *tx)
-    .await?;
-    if overlap > 0 {
-        return Err(ApiError::conflict("端口范围与已有授权重叠"));
-    }
     sqlx::query("UPDATE users SET enabled=?,port_start=?,port_end=?,max_rules=?,expires_at=?,auth_version=auth_version+1 WHERE id=?")
-        .bind(input.enabled).bind(input.port_start).bind(input.port_end).bind(input.max_rules).bind(input.expires_at).bind(id).execute(&mut *tx).await?;
+        .bind(input.enabled).bind(1024).bind(65535).bind(input.max_rules).bind(input.expires_at).bind(id).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM sessions WHERE user_id=?")
         .bind(id)
         .execute(&mut *tx)
         .await?;
-    // Narrowing grants never leaves an out-of-policy desired rule enabled.
-    sqlx::query("UPDATE rules SET enabled=0,updated_at=? WHERE owner_id=? AND deleted_at IS NULL AND (listen_port<? OR listen_port>?)")
-        .bind(now()).bind(id).bind(input.port_start).bind(input.port_end).execute(&mut *tx).await?;
+    // Lowering the quota never leaves more active rules than authorized.
     sqlx::query("UPDATE rules SET enabled=0,updated_at=? WHERE id IN (SELECT id FROM rules WHERE owner_id=? AND deleted_at IS NULL AND enabled=1 ORDER BY created_at,id LIMIT -1 OFFSET ?)")
         .bind(now()).bind(id).bind(input.max_rules).execute(&mut *tx).await?;
     enqueue_apply(&mut tx, id).await?;
@@ -1067,14 +1046,14 @@ async fn port_usage(
         .await?;
     Ok(Json(PortUsage {
         owner_id: owner.id,
-        port_start: owner.port_start,
-        port_end: owner.port_end,
+        port_start: 1024,
+        port_end: 65535,
         reserved: state
             .config
             .reserved_ports
             .iter()
             .copied()
-            .filter(|port| (owner.port_start..=owner.port_end).contains(&i64::from(*port)))
+            .filter(|port| *port >= 1024)
             .collect(),
         leases: rows
             .into_iter()
@@ -1100,7 +1079,7 @@ pub async fn initialize_admin(
         .fetch_one(&mut *tx)
         .await?;
     anyhow::ensure!(count == 0, "an administrator already exists");
-    sqlx::query("INSERT INTO users(username,password_hash,role,must_change_password,port_start,port_end,max_rules,created_at) VALUES(?,?,'admin',0,40000,40049,30,?)")
+    sqlx::query("INSERT INTO users(username,password_hash,role,must_change_password,port_start,port_end,max_rules,created_at) VALUES(?,?,'admin',0,1024,65535,10,?)")
         .bind(username).bind(hash).bind(now()).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())

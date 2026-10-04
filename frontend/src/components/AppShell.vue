@@ -70,11 +70,11 @@ useEventListener(window, 'keydown', (event: KeyboardEvent) => {
       <RouterLink to="/" class="flex items-center gap-2.5 rounded-lg font-semibold text-fg" aria-label="RelayDeck 总览">
         <BrandMark /><span class="max-sm:hidden">RelayDeck</span>
       </RouterLink>
-      <nav v-if="nav.length" aria-label="主导航" class="flex items-center gap-0.5 rounded-xl border border-line bg-surface p-[3px] max-md:hidden">
+      <nav v-if="nav.length" aria-label="主导航" class="flex items-center gap-1 max-md:hidden">
         <RouterLink
           v-for="item in nav" :key="item.to" :to="item.to"
-          class="flex h-8 items-center gap-2 rounded-[9px] border border-transparent px-3 text-muted transition-colors duration-200 hover:text-fg"
-          :class="item.match(route.name) ? '!border-line-strong bg-surface-2 font-medium !text-fg shadow-[0_1px_2px_rgb(0_0_0/0.06)]' : ''"
+          class="flex h-8 items-center gap-2 rounded-lg px-3 text-muted transition-colors duration-200 hover:text-fg"
+          :class="item.match(route.name) ? 'bg-fill font-medium !text-fg' : 'hover:bg-fill/60'"
           :aria-current="item.match(route.name) ? 'page' : undefined"
         >
           <component :is="item.icon" class="size-4" :class="item.match(route.name) ? 'text-accent' : ''" aria-hidden="true" />
@@ -85,7 +85,7 @@ useEventListener(window, 'keydown', (event: KeyboardEvent) => {
         <span class="max-sm:hidden"><ExecutorStatus /></span>
         <span class="sm:hidden"><ExecutorStatus compact /></span>
         <DropdownMenuRoot>
-          <DropdownMenuTrigger class="flex size-9 items-center justify-center rounded-full border border-line bg-surface text-xs font-semibold text-accent shadow-[var(--shadow-card)] transition-colors hover:border-line-strong" aria-label="账户菜单">
+          <DropdownMenuTrigger class="flex size-8 items-center justify-center rounded-full bg-accent-soft text-xs font-semibold text-accent transition-colors hover:bg-fill-hover data-[state=open]:bg-fill-hover" aria-label="账户菜单">
             {{ initials }}
           </DropdownMenuTrigger>
           <DropdownMenuPortal>

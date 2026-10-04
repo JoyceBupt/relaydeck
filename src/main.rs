@@ -13,7 +13,7 @@ async fn main() -> anyhow::Result<()> {
     }
     if arguments.as_slice() == ["--help"] {
         println!(
-            "relaydeck [serve | init-admin <username> | init-key | migrate | backup <new-directory> | worker <policy.json> | broker <policy.json>]"
+            "relaydeck [serve | init-admin <username> | init-key | migrate | backup <new-directory> | worker <policy.json> | broker <policy.json> | prepare-broker-policy <source.json> <effective.json>]"
         );
         return Ok(());
     }
@@ -62,6 +62,14 @@ async fn main() -> anyhow::Result<()> {
     {
         return relaydeck::linux::run(std::path::Path::new(path)).await;
     }
+    if let [command, source, destination] = arguments.as_slice()
+        && command == "prepare-broker-policy"
+    {
+        return relaydeck::linux::prepare_broker_policy(
+            std::path::Path::new(source),
+            std::path::Path::new(destination),
+        );
+    }
     let config = relaydeck::config::Config::from_env()?;
     let pool = relaydeck::db::connect(&config.database).await?;
     match arguments.as_slice() {
@@ -102,7 +110,7 @@ async fn main() -> anyhow::Result<()> {
         [] => (),
         [command] if command == "serve" => (),
         _ => anyhow::bail!(
-            "usage: relaydeck [serve | init-admin <username> | init-key | backup <new-directory> | worker <policy.json> | broker <policy.json>]"
+            "usage: relaydeck [serve | init-admin <username> | init-key | migrate | backup <new-directory> | worker <policy.json> | broker <policy.json> | prepare-broker-policy <source.json> <effective.json>]"
         ),
     }
     let state = relaydeck::api::AppState::new(pool.clone(), config.clone()).await?;

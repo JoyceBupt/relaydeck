@@ -17,7 +17,8 @@ const state = computed(() => {
 </script>
 
 <template>
-  <TooltipRoot>
+  <span v-if="health.isLoading.value" class="skeleton inline-block rounded-full" :class="props.compact ? 'h-6 w-6' : 'h-6 w-24'" role="status" aria-label="加载中" />
+  <TooltipRoot v-else>
     <TooltipTrigger as-child>
       <span :class="props.compact ? 'px-2 py-1' : 'border border-line bg-surface px-2.5 py-1 shadow-[var(--shadow-card)]'" class="inline-flex items-center gap-2 rounded-full text-xs text-muted" tabindex="0" :aria-label="state.help ? `${state.text}，${state.help}` : state.text">
         <span class="size-2 rounded-full" :class="state.tone" />

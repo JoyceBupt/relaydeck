@@ -129,8 +129,8 @@ impl Fixture {
             admin,
         }
     }
-    async fn add_user(&self, username: &str, start: i64) -> Login {
-        let (status,_,value)=call(&self.app,"POST","/api/users",Some(json!({"username":username,"password":INITIAL_PASSWORD,"port_start":start,"port_end":start+9,"max_rules":3,"expires_at":null})),Some(&self.admin),true).await;
+    async fn add_user(&self, username: &str, _start: i64) -> Login {
+        let (status,_,value)=call(&self.app,"POST","/api/users",Some(json!({"username":username,"password":INITIAL_PASSWORD,"max_rules":3,"expires_at":null})),Some(&self.admin),true).await;
         assert_eq!(status, StatusCode::CREATED, "{value}");
         let initial = sign_in(&self.app, username, INITIAL_PASSWORD).await;
         let (status, _, value) = call(
@@ -476,7 +476,8 @@ async fn authentication_csrf_and_first_login_are_enforced() {
         call(&f.app, "GET", "/api/users", None, None, false).await.0,
         StatusCode::UNAUTHORIZED
     );
-    let input = json!({"username":"alice","password":INITIAL_PASSWORD,"port_start":41000,"port_end":41009,"max_rules":3,"expires_at":null});
+    let input =
+        json!({"username":"alice","password":INITIAL_PASSWORD,"max_rules":3,"expires_at":null});
     assert_eq!(
         call(
             &f.app,
@@ -598,7 +599,7 @@ async fn ports_targets_quotas_and_pending_leases_are_checked() {
             &f.app,
             "POST",
             "/api/rules",
-            Some(rule(41100)),
+            Some(rule(1023)),
             Some(&alice),
             true
         )
@@ -780,7 +781,7 @@ async fn disabling_resetting_and_expiring_revoke_sessions() {
     let f = Fixture::new().await;
     let alice = f.add_user("alice", 41000).await;
     let id = alice.user["id"].as_i64().unwrap();
-    let update = json!({"enabled":false,"port_start":41000,"port_end":41009,"max_rules":3,"expires_at":null});
+    let update = json!({"enabled":false,"max_rules":3,"expires_at":null});
     assert_eq!(
         call(
             &f.app,
@@ -963,8 +964,8 @@ async fn rules_audit_and_ports_expose_readable_runtime_context() {
     let ports_path = format!("/api/users/{owner}/ports");
     let (status, _, ports) = call(&f.app, "GET", &ports_path, None, Some(&alice), false).await;
     assert_eq!(status, StatusCode::OK, "{ports}");
-    assert_eq!(ports["port_start"], 41000);
-    assert_eq!(ports["port_end"], 41009);
+    assert_eq!(ports["port_start"], 1024);
+    assert_eq!(ports["port_end"], 65535);
     assert_eq!(
         ports["leases"],
         json!([
@@ -1296,8 +1297,7 @@ async fn ddns_refresh_revalidates_targets_and_retains_leases_until_stop() {
 async fn administrator_grants_are_editable_without_allowing_self_revocation() {
     let f = Fixture::new().await;
     let id = f.admin.user["id"].as_i64().unwrap();
-    let input =
-        json!({"enabled":true,"port_start":40050,"port_end":40079,"max_rules":8,"expires_at":null});
+    let input = json!({"enabled":true,"max_rules":8,"expires_at":null});
     let (status, _, user) = call(
         &f.app,
         "PUT",
@@ -1309,9 +1309,9 @@ async fn administrator_grants_are_editable_without_allowing_self_revocation() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(user["max_rules"], 8);
-    assert_eq!(user["port_start"], 40050);
+    assert_eq!(user["port_start"], 1024);
     let fresh = sign_in(&f.app, "adminroot", ADMIN_PASSWORD).await;
-    let input = json!({"enabled":false,"port_start":40050,"port_end":40079,"max_rules":8,"expires_at":null});
+    let input = json!({"enabled":false,"max_rules":8,"expires_at":null});
     assert_eq!(
         call(
             &f.app,
@@ -1728,4 +1728,171 @@ async fn panel_upgrade_snapshot_blocks_external_writes_until_commit() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn default_quota_allows_ten_arbitrary_ports_in_shared_pool() {
+    let f = Fixture::new().await;
+    let (status, _, user) = call(
+        &f.app,
+        "POST",
+        "/api/users",
+        Some(json!({
+            "username":"freeports", "password":INITIAL_PASSWORD, "expires_at":null
+        })),
+        Some(&f.admin),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{user}");
+    assert_eq!(user["max_rules"], 10);
+    assert_eq!(user["port_start"], 1024);
+    assert_eq!(user["port_end"], 65535);
+    for (index, port) in [
+        13579, 25007, 62011, 16103, 22107, 45017, 49019, 52021, 57023, 61027,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut input = rule(port);
+        input["owner_id"] = user["id"].clone();
+        input["protocol"] = json!("both");
+        input["enabled"] = json!(index != 0);
+        let (status, _, value) = call(
+            &f.app,
+            "POST",
+            "/api/rules",
+            Some(input),
+            Some(&f.admin),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{port}: {value}");
+    }
+    let mut input = rule(63029);
+    input["owner_id"] = user["id"].clone();
+    input["enabled"] = json!(false);
+    let (status, _, value) = call(
+        &f.app,
+        "POST",
+        "/api/rules",
+        Some(input),
+        Some(&f.admin),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{value}");
+    assert_eq!(value["error"]["message"], "端口额度已满");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM port_leases WHERE owner_id=?")
+        .bind(user["id"].as_i64().unwrap())
+        .fetch_one(&f.state.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 10);
+}
+
+#[tokio::test]
+async fn host_tcp_udp_ipv4_ipv6_conflicts_leave_no_rules_or_leases() {
+    let f = Fixture::new().await;
+    let tcp4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let tcp6 = std::net::TcpListener::bind("[::1]:0").unwrap();
+    let udp4 = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let udp6 = std::net::UdpSocket::bind("[::1]:0").unwrap();
+    for port in [
+        tcp4.local_addr().unwrap().port(),
+        tcp6.local_addr().unwrap().port(),
+        udp4.local_addr().unwrap().port(),
+        udp6.local_addr().unwrap().port(),
+    ] {
+        let (status, _, value) = call(
+            &f.app,
+            "POST",
+            "/api/rules",
+            Some(rule(i64::from(port))),
+            Some(&f.admin),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{port}: {value}");
+        assert_eq!(value["error"]["code"], "port_unavailable");
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(&port.to_string())
+        );
+    }
+    for table in ["rules", "port_leases"] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(&f.state.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+}
+
+#[tokio::test]
+async fn shared_port_and_quota_races_have_one_winner() {
+    let f = Fixture::new().await;
+    let alice = f.add_user("alice", 41000).await;
+    let bob = f.add_user("bob", 41000).await;
+    let (a, b) = tokio::join!(
+        call(
+            &f.app,
+            "POST",
+            "/api/rules",
+            Some(rule(63211)),
+            Some(&alice),
+            true
+        ),
+        call(
+            &f.app,
+            "POST",
+            "/api/rules",
+            Some(rule(63211)),
+            Some(&bob),
+            true
+        )
+    );
+    let mut statuses = [a.0.as_u16(), b.0.as_u16()];
+    statuses.sort_unstable();
+    assert_eq!(statuses, [201, 409]);
+    let winner = if a.0 == StatusCode::CREATED {
+        &alice
+    } else {
+        &bob
+    };
+    let owner = winner.user["id"].as_i64().unwrap();
+    sqlx::query("UPDATE users SET max_rules=2 WHERE id=?")
+        .bind(owner)
+        .execute(&f.state.pool)
+        .await
+        .unwrap();
+    let (a, b) = tokio::join!(
+        call(
+            &f.app,
+            "POST",
+            "/api/rules",
+            Some(rule(63213)),
+            Some(winner),
+            true
+        ),
+        call(
+            &f.app,
+            "POST",
+            "/api/rules",
+            Some(rule(63217)),
+            Some(winner),
+            true
+        )
+    );
+    let mut statuses = [a.0.as_u16(), b.0.as_u16()];
+    statuses.sort_unstable();
+    assert_eq!(statuses, [201, 409]);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rules WHERE owner_id=?")
+        .bind(owner)
+        .fetch_one(&f.state.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
 }

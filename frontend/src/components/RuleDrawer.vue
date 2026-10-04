@@ -10,7 +10,7 @@ import PortRuler from './PortRuler.vue'
 import Segmented from './Segmented.vue'
 import UiSwitch from './UiSwitch.vue'
 import ConfirmDialog from './ConfirmDialog.vue'
-import { errorMessage, isStaleError } from '../api/client'
+import { ApiError, errorMessage, isStaleError } from '../api/client'
 import type { Health, Protocol, Rule, RuleInput, User } from '../types'
 import { currentUser, isAdmin } from '../lib/session'
 import { sharedToggle, useDeleteRule, usePorts, useRetry, useSaveRule } from '../lib/queries'
@@ -51,6 +51,8 @@ const baseline = ref('')
 const initializedFor = ref<string | null>(null)
 const submitted = ref(false)
 const serverError = ref('')
+const serverPortError = ref('')
+watch(() => form.listen_port, () => { serverPortError.value = '' })
 const confirmDelete = ref(false)
 const confirmDiscard = ref(false)
 let pendingNavigation: (() => void) | null = null
@@ -85,6 +87,7 @@ function load() {
   }
   submitted.value = false
   serverError.value = ''
+  serverPortError.value = ''
   initializedFor.value = key
   baseline.value = snapshot()
 }
@@ -103,14 +106,6 @@ watch(creatableOwners, list => {
     form.owner_id = (list.find(user => user.id === props.presetOwner) ?? list.find(user => user.id === currentUser.value?.id) ?? list[0]).id
   })
 })
-// New rules start on the first free port of the chosen account once its usage is known.
-watch(() => [ports.data.value, form.owner_id] as const, ([usage]) => {
-  if (!isNew.value || !usage || usage.owner_id !== form.owner_id || form.listen_port !== null) return
-  const taken = new Set([...usage.reserved, 22, 80, 443, ...usage.leases.map(lease => lease.port)])
-  fillDefault(() => {
-    for (let port = usage.port_start; port <= usage.port_end; port++) if (!taken.has(port)) { form.listen_port = port; break }
-  })
-})
 function changeOwner(event: Event) {
   form.owner_id = Number((event.target as HTMLSelectElement).value)
   form.listen_port = null
@@ -120,8 +115,7 @@ const dirty = computed(() => initializedFor.value !== null && snapshot() !== bas
 
 const errors = computed(() => {
   const usage = ports.data.value
-  const range = owner.value ? { min: owner.value.port_start, max: owner.value.port_end } : { min: 1024, max: 65535 }
-  let port = validatePort(form.listen_port, range.min, range.max)
+  let port = validatePort(form.listen_port, 1024, 65535)
   if (!port && form.listen_port !== null) {
     if ([22, 80, 443, ...(usage?.reserved ?? [])].includes(form.listen_port)) port = '系统保留端口'
     const lease = usage?.leases.find(item => item.port === form.listen_port)
@@ -140,7 +134,7 @@ const errors = computed(() => {
   }
 })
 const valid = computed(() => Object.values(errors.value).every(message => !message))
-const show = (field: keyof typeof errors.value) => (submitted.value ? errors.value[field] : '')
+const show = (field: keyof typeof errors.value) => (field === 'port' && serverPortError.value ? serverPortError.value : submitted.value ? errors.value[field] : '')
 
 
 const save = useSaveRule()
@@ -151,6 +145,7 @@ const retry = useRetry()
 async function submit() {
   submitted.value = true
   serverError.value = ''
+  serverPortError.value = ''
   if (!valid.value || save.isPending.value) return
   const input: RuleInput = {
     name: form.name.trim(), listen_port: form.listen_port!, target_host: form.target_host.trim(), target_port: form.target_port!,
@@ -167,7 +162,10 @@ async function submit() {
       await router.replace(`/rules/${saved.id}`)
     }
   } catch (error) {
-    if (!isStaleError(error)) serverError.value = errorMessage(error)
+    if (error instanceof ApiError && error.code === 'port_unavailable') {
+      serverPortError.value = error.message
+      body.value?.querySelector<HTMLInputElement>('#rule-port')?.focus()
+    } else if (!isStaleError(error)) serverError.value = errorMessage(error)
   }
 }
 
@@ -236,7 +234,6 @@ const runtime = computed(() => {
 })
 const resolvedNote = computed(() => (rule.value && rule.value.target_ip !== rule.value.target_host ? rule.value.target_ip : ''))
 const protocolOptions = (['tcp', 'udp', 'both'] as Protocol[]).map(option => ({ value: option, label: protocolLabels[option] }))
-const portRange = computed(() => (owner.value ? `${owner.value.port_start}–${owner.value.port_end}` : ''))
 
 defineExpose({ dirty })
 </script>
@@ -272,26 +269,29 @@ defineExpose({ dirty })
             <select class="input" :value="form.owner_id ?? ''" :aria-invalid="!!show('owner')" @change="changeOwner">
               <option v-if="!creatableOwners.length" value="" disabled>没有可用额度的账户</option>
               <option v-for="user in owners" :key="user.id" :value="user.id" :disabled="!canCreateFor(user)">
-                {{ user.username }} · {{ user.port_start }}–{{ user.port_end }} · 已用 {{ user.rule_count }}/{{ user.max_rules }}
+                {{ user.username }} · 端口 {{ user.rule_count }}/{{ user.max_rules }}
               </option>
             </select>
             <span v-if="show('owner')" class="field-error">{{ show('owner') }}</span>
           </label>
 
-          <div class="field">
-            <label class="field-label" for="rule-port">入口端口</label>
-            <input id="rule-port" v-model.number="form.listen_port" class="input input-mono w-40" type="number" inputmode="numeric" :min="owner?.port_start" :max="owner?.port_end" :aria-invalid="!!show('port')" />
-            <span v-if="show('port')" class="field-error">{{ show('port') }}</span>
-            <span v-else-if="portRange" class="field-hint tabular">可用 {{ portRange }}</span>
-            <div v-if="ports.data.value" class="mt-1.5">
-              <PortRuler :usage="ports.data.value" :statuses="statuses" :selected="form.listen_port" :own-rule-id="ruleId" interactive @select="form.listen_port = $event" />
+          <div class="grid gap-1.5">
+            <div class="grid grid-cols-[8rem_minmax(0,1fr)] items-end gap-3">
+              <div class="field">
+                <label class="field-label" for="rule-port">入口端口</label>
+                <input id="rule-port" v-model.number="form.listen_port" class="input input-mono" type="number" inputmode="numeric" min="1024" max="65535" :aria-invalid="!!show('port')" />
+              </div>
+              <div class="field">
+                <span id="rule-protocol" class="field-label">协议</span>
+                <Segmented v-model="form.protocol" label="协议" :options="protocolOptions" aria-labelledby="rule-protocol" class="h-[2.375rem] w-full [&>*]:flex-1 [&>*]:justify-center" />
+              </div>
             </div>
-            <div v-else-if="ports.isLoading.value" class="skeleton mt-1.5 h-10" />
-          </div>
-
-          <div class="field">
-            <span id="rule-protocol" class="field-label">协议</span>
-            <Segmented v-model="form.protocol" label="协议" :options="protocolOptions" aria-labelledby="rule-protocol" />
+            <span v-if="show('port')" class="field-error">{{ show('port') }}</span>
+            <span v-else class="field-hint">1024–65535，不含已占用端口</span>
+            <div v-if="ports.data.value" class="mt-1">
+              <PortRuler :usage="ports.data.value" :statuses="statuses" :selected="form.listen_port" :own-rule-id="ruleId" />
+            </div>
+            <div v-else-if="ports.isLoading.value" class="skeleton mt-1 h-6" />
           </div>
 
           <div class="grid grid-cols-[minmax(0,1fr)_7rem] gap-3">
