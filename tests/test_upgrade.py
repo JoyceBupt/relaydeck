@@ -81,10 +81,11 @@ class UpgradeFlow(unittest.TestCase):
 
     def test_network_error_keeps_an_existing_offer_and_does_not_start_update(self):
         token = self.offer()
-        self.controller.checked_at = 0
-        with patch.object(upgrade, 'fetch_json', side_effect=OSError('network unavailable')):
+        self.controller.checked_at -= 61
+        with patch.object(upgrade, 'fetch_json', side_effect=OSError('network unavailable')) as fetch:
             with self.assertRaises(OSError):
                 self.controller.dispatch({'op': 'check'})
+            fetch.assert_called_once()
         self.assertEqual(self.controller.status()['latest']['offer'], token)
 
     def test_job_checks_manifest_and_reports_success_after_update(self):
