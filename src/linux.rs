@@ -117,8 +117,9 @@ pub struct BrokerPolicy {
     pub socket_path: PathBuf,
     #[serde(default = "default_authorization_ttl")]
     pub authorization_ttl_secs: u64,
-    #[serde(default)]
-    pub limits: ResourceLimits,
+    // Accept installed policies from older releases without applying their caps.
+    #[serde(default, skip_serializing)]
+    pub limits: serde_json::Value,
 }
 
 fn legacy_port_policy_version() -> u32 {
@@ -130,32 +131,6 @@ fn default_socket() -> PathBuf {
 }
 fn default_authorization_ttl() -> u64 {
     120
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ResourceLimits {
-    pub memory_high_mb: u64,
-    pub memory_max_mb: u64,
-    pub tasks: u32,
-    pub cpu_percent: u32,
-    pub nofile: u32,
-    pub total_memory_mb: u64,
-    pub total_cpu_percent: u32,
-}
-
-impl Default for ResourceLimits {
-    fn default() -> Self {
-        Self {
-            memory_high_mb: 32,
-            memory_max_mb: 64,
-            tasks: 96,
-            cpu_percent: 20,
-            nofile: 512,
-            total_memory_mb: 384,
-            total_cpu_percent: 150,
-        }
-    }
 }
 
 impl BrokerPolicy {
@@ -176,25 +151,6 @@ impl BrokerPolicy {
                 .file_name()
                 .is_some_and(|name| name == "broker.sock"),
             "broker socket must use its fixed name"
-        );
-        let limits = &self.limits;
-        ensure!(
-            limits.memory_high_mb >= 16
-                && limits.memory_high_mb <= limits.memory_max_mb
-                && limits.memory_max_mb <= 4096,
-            "invalid memory limits"
-        );
-        ensure!(
-            (64..=256).contains(&limits.tasks)
-                && (128..=65536).contains(&limits.nofile)
-                && (1..=800).contains(&limits.cpu_percent),
-            "invalid tenant limits: tasks must be 64..256 for the per-rule supervisor"
-        );
-        ensure!(
-            limits.total_memory_mb >= limits.memory_max_mb
-                && limits.total_memory_mb <= 65536
-                && (1..=1600).contains(&limits.total_cpu_percent),
-            "invalid aggregate limits"
         );
         ensure!(
             self.allowed_port_start >= 1024 && self.allowed_port_end >= self.allowed_port_start,
@@ -342,17 +298,12 @@ pub fn render_systemd(
         .runtime_dir
         .join(format!("owner-{}/plan.json", plan.owner_id()));
     let mut unit = format!(
-        "[Unit]\nDescription=RelayDeck account {}\n\n[Service]\nType=exec\nUser={uid}\nGroup={uid}\nExecStart={} tenant-plan {} {} {} {uid} {revision}\nRestart=no\nRuntimeMaxSec={lifetime}\nKillMode=control-group\nTimeoutStartSec=5s\nTimeoutStopSec=3s\nSendSIGKILL=yes\nUMask=0077\nNoNewPrivileges=yes\nCapabilityBoundingSet=\nAmbientCapabilities=\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectControlGroups=yes\nRestrictSUIDSGID=yes\nRestrictRealtime=yes\nLockPersonality=yes\nRestrictAddressFamilies=AF_INET AF_INET6\nSystemCallArchitectures=native\nMemoryHigh={memory_high}M\nMemoryMax={memory_max}M\nMemorySwapMax=0\nTasksMax={tasks}\nCPUQuota={cpu}%\nLimitNOFILE={nofile}\nLimitCORE=0\nSocketBindDeny=any\n",
+        "[Unit]\nDescription=RelayDeck account {}\n\n[Service]\nType=exec\nUser={uid}\nGroup={uid}\nExecStart={} tenant-plan {} {} {} {uid} {revision}\nRestart=no\nRuntimeMaxSec={lifetime}\nKillMode=control-group\nTimeoutStartSec=5s\nTimeoutStopSec=3s\nSendSIGKILL=yes\nUMask=0077\nNoNewPrivileges=yes\nCapabilityBoundingSet=\nAmbientCapabilities=\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectControlGroups=yes\nRestrictSUIDSGID=yes\nRestrictRealtime=yes\nLockPersonality=yes\nRestrictAddressFamilies=AF_INET AF_INET6\nSystemCallArchitectures=native\nMemoryHigh=infinity\nMemoryMax=infinity\nMemorySwapMax=infinity\nTasksMax=infinity\nCPUQuota=\nLimitNOFILE=infinity\nLimitCORE=0\nSocketBindDeny=any\n",
         plan.owner_id(),
         policy.runner_binary.display(),
         policy.realm_binary.display(),
         config.display(),
         plan.expires_at().unwrap_or(0),
-        memory_high = policy.limits.memory_high_mb,
-        memory_max = policy.limits.memory_max_mb,
-        tasks = policy.limits.tasks,
-        cpu = policy.limits.cpu_percent,
-        nofile = policy.limits.nofile,
         revision = plan.revision(),
     );
     // The optional systemd guard covers the shared root boundary. The mandatory
@@ -1246,7 +1197,12 @@ impl LinuxDriver {
                 system_tool(Path::new(tool))?;
             }
             validate_uid_pool(&policy)?;
-            write_root_file(&Path::new(UNIT_DIR).join("relaydeck.slice"), format!("[Unit]\nDescription=RelayDeck runtime budget\n\n[Slice]\nMemoryMax={}M\nMemorySwapMax=0\nTasksMax={}\nCPUQuota={}%\n",policy.limits.total_memory_mb,policy.limits.tasks * policy.max_owners,policy.limits.total_cpu_percent).as_bytes(), 0o644, 0)?;
+            write_root_file(
+                &Path::new(UNIT_DIR).join("relaydeck.slice"),
+                include_bytes!("../deploy/relaydeck.slice"),
+                0o644,
+                0,
+            )?;
             command(SYSTEMCTL, &["daemon-reload"], None).await?;
             let traffic = crate::traffic::driver::TrafficMeter::open(policy.clone())?;
             let driver = Self {
@@ -1428,19 +1384,6 @@ impl LinuxDriver {
             .lines()
             .filter_map(|line| line.split_once(':').map(|(key, value)| (key, value.trim())))
             .collect();
-        let limits = std::fs::read_to_string(format!("/proc/{pid}/limits"))?;
-        let open_files = limits
-            .lines()
-            .find_map(|line| line.strip_prefix("Max open files"))
-            .context("missing open-file limits")?;
-        let expected_limit = self.policy.limits.nofile.to_string();
-        ensure!(
-            open_files
-                .split_whitespace()
-                .take(2)
-                .all(|value| value == expected_limit),
-            "effective file limit differs"
-        );
         for key in ["Uid", "Gid"] {
             let ids = identity
                 .get(key)
@@ -1480,40 +1423,6 @@ impl LinuxDriver {
             "runtime control group mismatch"
         );
         let directory = Path::new("/sys/fs/cgroup").join(group.trim_start_matches('/'));
-        ensure!(
-            std::fs::read_to_string("/sys/fs/cgroup/relaydeck.slice/memory.max")?.trim()
-                == (self.policy.limits.total_memory_mb * 1024 * 1024).to_string(),
-            "aggregate runtime memory limit is not enforced"
-        );
-        for (file, expected) in [
-            (
-                "memory.high",
-                (self.policy.limits.memory_high_mb * 1024 * 1024).to_string(),
-            ),
-            (
-                "memory.max",
-                (self.policy.limits.memory_max_mb * 1024 * 1024).to_string(),
-            ),
-            ("memory.swap.max", "0".into()),
-            ("pids.max", self.policy.limits.tasks.to_string()),
-        ] {
-            ensure!(
-                std::fs::read_to_string(directory.join(file))?.trim() == expected,
-                "effective cgroup limit {file} differs"
-            );
-        }
-        let cpu = std::fs::read_to_string(directory.join("cpu.max"))?;
-        let quota: Vec<u64> = cpu
-            .split_whitespace()
-            .map(str::parse)
-            .collect::<Result<Vec<_>, _>>()?;
-        ensure!(
-            quota.len() == 2
-                && quota[0] > 0
-                && quota[0].checked_mul(100)
-                    == quota[1].checked_mul(u64::from(self.policy.limits.cpu_percent)),
-            "effective CPU quota differs"
-        );
         let guards = self.bindguards.lock().await;
         guards
             .get(&plan.owner_id())

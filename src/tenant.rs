@@ -122,22 +122,37 @@ async fn run_inner(
                 _ = async {
                     if let Some(deadline) = deadline { tokio::time::sleep_until(deadline).await; }
                     else { std::future::pending::<()>().await; }
-                } => break,
+                } => {
+                    tracing::info!(uid, expires_at, "tenant account expired");
+                    break;
+                },
                 _ = clock_check.tick() => {
                     // A forward wall-clock adjustment must also revoke promptly.
-                    if expires_at != 0 && crate::db::now() >= expires_at { break; }
+                    if expires_at != 0 && crate::db::now() >= expires_at {
+                        tracing::info!(uid, expires_at, "tenant account expired after clock adjustment");
+                        break;
+                    }
                     let renewed = (|| -> anyhow::Result<i64> {
                         validate_root_file(&authorization)?;
                         let value: i64=std::fs::read_to_string(&authorization)?.parse()?;
                         ensure!(value-crate::db::now()<=300,"invalid authorization deadline");
                         Ok(value)
                     })();
-                    let Ok(until)=renewed else { break; };
+                    let until = match renewed {
+                        Ok(until) => until,
+                        Err(error) => {
+                            tracing::warn!(uid, %error, "tenant authorization could not be read");
+                            break;
+                        }
+                    };
                     if until>authorized_until {
                         authorized_until=until;
                         authorization_deadline=Instant::now()+Duration::from_secs((until-crate::db::now()).max(0) as u64);
                     }
-                    if until<=crate::db::now() || Instant::now()>=authorization_deadline { break; }
+                    if until<=crate::db::now() || Instant::now()>=authorization_deadline {
+                        tracing::warn!(uid, until, "tenant authorization expired");
+                        break;
+                    }
                     children.check()?;
                     if supervisor { applied=children.apply(realm,config,expires_at,uid,applied).await?; }
                 }
@@ -231,7 +246,9 @@ impl Children {
             .iter_mut()
             .chain(self.rules.values_mut().map(|(_, child)| child))
         {
-            anyhow::ensure!(child.try_wait()?.is_none(), "realm child exited");
+            if let Some(status) = child.try_wait()? {
+                anyhow::bail!("realm child exited: {status}");
+            }
         }
         Ok(())
     }

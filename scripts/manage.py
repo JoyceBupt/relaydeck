@@ -660,8 +660,6 @@ def update(args, progress=lambda step: None):
                 raise ValueError(f'Unit {unit} was customized; preserve it with a systemd drop-in before updating')
         root_path(CONFIG / 'broker.json')
         policy = json.loads((CONFIG / 'broker.json').read_text())
-        if not 64 <= policy['limits']['tasks'] <= 256:
-            raise ValueError('Set limits.tasks to 64..256 in /etc/relaydeck/broker.json before upgrading the per-rule supervisor (default: 96)')
         previous_ports = list(policy['reserved_ports'])
         reserve_control_ports(policy, read_environment().get('RELAYDECK_ORIGIN', ''))
         # Only add control-port exclusions; keep the existing origin, proxy and

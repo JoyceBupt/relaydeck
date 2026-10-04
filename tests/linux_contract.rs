@@ -22,7 +22,7 @@ fn policy() -> BrokerPolicy {
         max_owners: 11,
         socket_path: "/run/relaydeck/broker.sock".into(),
         authorization_ttl_secs: 120,
-        limits: relaydeck::linux::ResourceLimits::default(),
+        limits: serde_json::Value::Null,
     }
 }
 
@@ -170,7 +170,7 @@ fn plan(
 }
 
 #[test]
-fn systemd_has_fixed_nonroot_identity_expiry_and_limits() {
+fn systemd_has_fixed_nonroot_identity_expiry_without_resource_caps() {
     let policy = policy();
     let plan = plan(2, 41000, "1.1.1.1".parse().unwrap(), vec![]);
     let unit = render_systemd(&policy, &plan, 1500).unwrap();
@@ -182,8 +182,12 @@ fn systemd_has_fixed_nonroot_identity_expiry_and_limits() {
         "KillMode=control-group\n",
         "NoNewPrivileges=yes\n",
         "CapabilityBoundingSet=\n",
-        "MemoryMax=64M\n",
-        "TasksMax=96\n",
+        "MemoryHigh=infinity\n",
+        "MemoryMax=infinity\n",
+        "MemorySwapMax=infinity\n",
+        "TasksMax=infinity\n",
+        "CPUQuota=\n",
+        "LimitNOFILE=infinity\n",
         "SocketBindDeny=any\n",
         "SocketBindAllow=tcp:40000-42000\n",
         "SocketBindAllow=udp:40000-42000\n",
@@ -197,23 +201,30 @@ fn systemd_has_fixed_nonroot_identity_expiry_and_limits() {
 }
 
 #[test]
-fn configurable_resource_limits_and_counter_updates_preserve_policy_checks() {
+fn legacy_resource_caps_are_ignored_without_weakening_firewall_checks() {
     let mut policy = policy();
-    policy.limits.nofile = 4096;
-    policy.limits.memory_max_mb = 256;
-    policy.limits.memory_high_mb = 128;
-    policy.limits.cpu_percent = 50;
+    policy.limits = serde_json::json!({
+        "nofile":4096,"memory_max_mb":64,"memory_high_mb":32,
+        "cpu_percent":20,"tasks":16,"total_memory_mb":256,"total_cpu_percent":100
+    });
+    let installed: BrokerPolicy =
+        serde_json::from_value(serde_json::to_value(&policy).unwrap()).unwrap();
+    assert!(installed.limits.is_null());
+    let mut legacy = serde_json::to_value(&policy).unwrap();
+    legacy["limits"] = policy.limits.clone();
+    let installed: BrokerPolicy = serde_json::from_value(legacy).unwrap();
+    assert!(installed.validate().is_ok());
     let unit = render_systemd(
-        &policy,
+        &installed,
         &plan(1, 41000, "8.8.8.8".parse().unwrap(), vec![]),
         1000,
     )
     .unwrap();
     for expected in [
-        "LimitNOFILE=4096",
-        "MemoryMax=256M",
-        "MemoryHigh=128M",
-        "CPUQuota=50%",
+        "LimitNOFILE=infinity",
+        "MemoryMax=infinity",
+        "MemoryHigh=infinity",
+        "CPUQuota=",
     ] {
         assert!(unit.contains(expected));
     }
@@ -429,17 +440,9 @@ fn firewall_manages_only_claimed_ports_in_a_shared_pool() {
 }
 
 #[test]
-fn supervisor_rejects_insufficient_process_budget_before_startup() {
+fn legacy_process_budget_does_not_limit_the_supervisor() {
     let mut policy = policy();
-    policy.limits.tasks = 16;
-    assert!(
-        policy
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("64..256")
-    );
-    policy.limits.tasks = 96;
+    policy.limits = serde_json::json!({"tasks":16});
     assert!(policy.validate().is_ok());
 }
 

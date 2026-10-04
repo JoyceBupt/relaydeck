@@ -83,6 +83,7 @@ class LegacyPanelUpdate(unittest.TestCase):
             db.commit()
         (self.state / 'secrets/mfa.key').write_bytes(b'fixture key preserved byte-for-byte')
         self.policy = json.loads((SOURCE / 'deploy/broker.example.json').read_text())
+        self.policy['limits'] = {'tasks': 96}
         self.policy.pop('port_policy_version')
         self.policy.update(database=str(self.database), runtime_dir=str(self.state / 'runtime'), allowed_port_start=40000, allowed_port_end=40999)
         (self.config / 'broker.json').write_text(json.dumps(self.policy))
