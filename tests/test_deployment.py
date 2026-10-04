@@ -192,7 +192,7 @@ class PanelOrigin(unittest.TestCase):
                 installed = json.loads((config / 'broker.json').read_text())
                 self.assertIn(panel_port, installed['reserved_ports'])
                 self.assertEqual(installed['custom_field'], 'preserve')
-                self.assertEqual((installed['allowed_port_start'], installed['allowed_port_end']), (1024, 65535))
+                self.assertEqual((installed['allowed_port_start'], installed['allowed_port_end']), (40000, 60000))
                 self.assertIn(panel_port, calls[0]['reserved_ports'])
                 self.assertFalse((state / 'transaction.json').exists())
 

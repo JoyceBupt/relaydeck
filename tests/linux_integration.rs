@@ -379,6 +379,7 @@ fn realm_data_plane_enforces_dual_stack_acl_targets_and_account_uids() {
         &private,
     ]);
     let policy = BrokerPolicy {
+        port_policy_version: 2,
         database: "/var/lib/relaydeck/relaydeck.db".into(),
         web_uid: 1000,
         web_gid: None,
