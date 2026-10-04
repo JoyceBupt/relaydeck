@@ -42,8 +42,8 @@ jobs:
       - name: Accept the packaged release executable and legacy upgrade
         run: |
           docker run --rm --read-only \
-            --tmpfs /run:rw,nosuid,nodev,mode=0755,size=128m \
-            --tmpfs /tmp:rw,nosuid,nodev,mode=1777,size=256m \
+            --tmpfs /run:rw,exec,nosuid,nodev,mode=0755,size=128m \
+            --tmpfs /tmp:rw,exec,nosuid,nodev,mode=1777,size=256m \
             --volume "$PWD:/workspace:ro" --workdir /workspace \
             --env PYTHONDONTWRITEBYTECODE=1 --env RELAYDECK_EXPECTED_REVISION="$GITHUB_SHA" \
             rust:1.99-bookworm@sha256:59037199c44290f2befcdd58dcc540164763fc296950255aaefeef096a1866b0 \
