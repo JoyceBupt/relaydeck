@@ -32,7 +32,10 @@ def main():
             member=next(item for item in tar.getmembers() if pathlib.PurePosixPath(item.name).name=='realm' and item.isfile())
             (work / 'realm').write_bytes(tar.extractfile(member).read())
         shutil.copy2(binary,work / 'relaydeck')
-        (work / 'Dockerfile').write_text('''FROM debian:bookworm-slim
+        base=os.environ.get('RELAYDECK_RUNTIME_IMAGE','debian:bookworm-slim')
+        if base not in ('debian:bookworm-slim','ubuntu:24.04'): raise ValueError('Unsupported runtime test image')
+        (work / 'Dockerfile').write_text('FROM '+base+'''
+ENV container=docker
 RUN apt-get update -qq && apt-get install -y --no-install-recommends systemd systemd-sysv nftables iproute2 python3 ca-certificates procps && rm -rf /var/lib/apt/lists/*
 RUN groupadd -g 1100 relaydeck && useradd -u 1100 -g 1100 -M -d /nonexistent -s /usr/sbin/nologin relaydeck && for i in $(seq 1 11); do n=$((62000+i-1)); groupadd -g $n relaydeck-runner-$i; useradd -u $n -g $n -M -d /nonexistent -s /usr/sbin/nologin relaydeck-runner-$i; done
 COPY relaydeck realm /usr/local/libexec/
@@ -66,6 +69,9 @@ while True:
             if result.returncode == 0:
                 result=subprocess.run(['docker','exec','-e','PYTHONDONTWRITEBYTECODE=1',host,'unshare','--net','python3','/fixture/tests/recovery_acceptance.py','-v'])
             if result.returncode:
+                subprocess.run(['docker','info','--format','{{.CgroupVersion}} {{.CgroupDriver}}'])
+                subprocess.run(['docker','inspect','--format','{{json .State}}',host])
+                subprocess.run(['docker','logs',host])
                 subprocess.run(['docker','exec',host,'cat','/var/lib/relaydeck-qa/broker.log'])
                 subprocess.run(['docker','exec',host,'journalctl','--no-pager','-n','80'])
                 raise RuntimeError('Systemd runtime acceptance failed')

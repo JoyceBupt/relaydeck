@@ -270,8 +270,6 @@ class SharedPortDeployment(unittest.TestCase):
             self.assertFalse(transaction.exists())
 
 
-if __name__ == '__main__':
-    unittest.main()
 
 
 class IdentityCapacity(unittest.TestCase):
@@ -300,3 +298,7 @@ class ForwardingRecoveryBaseline(unittest.TestCase):
         ledger['accounts']['7']['budget']['mode']='ingress'
         with patch.object(manage,'run',return_value='[[91,41,null,7]]'):
             self.assertEqual(manage.forwarding_baseline(pathlib.Path('/unused'),ledger),[[91,41,None]])
+
+
+if __name__ == '__main__':
+    unittest.main()
