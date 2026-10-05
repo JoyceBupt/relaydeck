@@ -12,7 +12,7 @@ import Segmented from './Segmented.vue'
 import UiSwitch from './UiSwitch.vue'
 import ConfirmDialog from './ConfirmDialog.vue'
 import { ApiError, errorMessage, isStaleError } from '../api/client'
-import { api } from '../api/endpoints'
+import { api, ruleInput } from '../api/endpoints'
 import type { Health, Protocol, Rule, RuleInput, User } from '../types'
 import { currentUser, isAdmin } from '../lib/session'
 import { sharedToggle, useDeleteRule, usePorts, useRetry, useSaveRule } from '../lib/queries'
@@ -145,7 +145,13 @@ const toggle = sharedToggle()
 const retry = useRetry()
 const check = useMutation({ mutationFn: (id: number) => api.checkRule(id) })
 const checkError = ref('')
-watch(() => [props.ruleId, rule.value?.updated_at, rule.value?.runtime_status], () => { check.reset(); checkError.value = '' })
+// Polling replaces rule objects as runtime observations change. Only saved
+// configuration changes invalidate a completed check, which has its own timestamp.
+const checkKey = computed(() => JSON.stringify([props.ruleId, rule.value && {
+  ...ruleInput(rule.value), owner_id: rule.value.owner_id, target_ip: rule.value.target_ip, updated_at: rule.value.updated_at,
+}]))
+let checkGeneration = 0
+watch(checkKey, () => { checkGeneration += 1; check.reset(); checkError.value = '' }, { flush: 'sync' })
 const checkResult = computed(() => {
   const result = check.data.value
   return result && rule.value && result.rule_id === rule.value.id && result.target_ip === rule.value.target_ip && result.target_port === rule.value.target_port && !dirty.value ? result : null
@@ -153,8 +159,9 @@ const checkResult = computed(() => {
 async function runCheck() {
   if (!rule.value || dirty.value || check.isPending.value) return
   const id = rule.value.id
+  const generation = checkGeneration
   checkError.value = ''
-  try { await check.mutateAsync(id) } catch (error) { if (!isStaleError(error) && rule.value?.id === id) checkError.value = errorMessage(error) }
+  try { await check.mutateAsync(id) } catch (error) { if (!isStaleError(error) && generation === checkGeneration && rule.value?.id === id) checkError.value = errorMessage(error) }
 }
 const targetCheckLabels = { connected: '已连通', timeout: '连接超时', refused: '连接被拒绝', unreachable: '无法连接' }
 
