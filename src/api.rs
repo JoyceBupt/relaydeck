@@ -746,13 +746,32 @@ async fn health(State(state): State<AppState>) -> Result<Json<serde_json::Value>
         sqlx::query_as("SELECT last_seen,status FROM executor_status WHERE id=1")
             .fetch_optional(&state.pool)
             .await?;
-    let executor = match runtime {
+    let mut executor = match runtime {
         None => "unconfigured",
         Some((seen, status)) if status == "running" && now().saturating_sub(seen) < 10 => "running",
         Some(_) => "offline",
     };
+    let upgrade_ready = match crate::readiness::upgrade_ready(&state.pool, &state.config).await {
+        Ok(ready) => ready,
+        Err(error) => {
+            tracing::warn!(%error,"upgrade forwarding readiness unavailable");
+            false
+        }
+    };
+    if executor == "running" && !upgrade_ready {
+        executor = "recovering";
+    }
+    let (expected,active,failed):(i64,i64,i64)=sqlx::query_as("SELECT COUNT(*),COALESCE(SUM(s.status='active' AND s.revision=u.desired_revision AND u.applied_revision=u.desired_revision AND rs.revision=u.desired_revision AND rs.active=1 AND rs.observed_at>?),0),COALESCE(SUM((s.revision=u.desired_revision AND s.status='failed') OR (rs.revision=u.desired_revision AND rs.active=0)),0) FROM rules r JOIN users u ON u.id=r.owner_id LEFT JOIN runtime_states s ON s.owner_id=u.id LEFT JOIN rule_runtime_states rs ON rs.rule_id=r.id WHERE r.deleted_at IS NULL AND r.enabled=1 AND r.dns_blocked=0 AND u.enabled=1 AND u.traffic_blocked=0 AND (u.expires_at IS NULL OR u.expires_at>?)")
+        .bind(now()-20).bind(now()).fetch_one(&state.pool).await?;
+    let status = if !upgrade_ready {
+        "recovering"
+    } else if active < expected {
+        "degraded"
+    } else {
+        "ok"
+    };
     Ok(Json(
-        serde_json::json!({"status":"ok","name":"RelayDeck","version":env!("CARGO_PKG_VERSION"),"executor":executor}),
+        serde_json::json!({"status":status,"name":"RelayDeck","version":env!("CARGO_PKG_VERSION"),"executor":executor,"upgrade_ready":upgrade_ready,"forwarding":{"expected":expected,"active":active,"failed":failed,"pending":(expected-active-failed).max(0)}}),
     ))
 }
 
@@ -783,7 +802,7 @@ async fn retry_apply(
     if pending != 0 {
         return Ok(StatusCode::ACCEPTED);
     }
-    let failed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runtime_states s JOIN users u ON u.id=s.owner_id WHERE s.owner_id=? AND s.revision=u.desired_revision AND s.status='failed'").bind(id).fetch_one(&mut *tx).await?;
+    let failed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runtime_states s JOIN users u ON u.id=s.owner_id WHERE s.owner_id=? AND s.revision=u.desired_revision AND (s.status='failed' OR EXISTS(SELECT 1 FROM rule_runtime_states rs JOIN rules r ON r.id=rs.rule_id WHERE r.owner_id=u.id AND r.deleted_at IS NULL AND r.enabled=1 AND rs.revision=u.desired_revision AND rs.active=0))").bind(id).fetch_one(&mut *tx).await?;
     if failed != 1 {
         return Err(ApiError::conflict("当前无需重试"));
     }

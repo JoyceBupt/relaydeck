@@ -128,8 +128,8 @@ const recent = computed(() => (audit.data.value ?? []).slice(0, 5).map(entry => 
         <li v-if="executor && executor !== 'running'" class="flex items-start gap-3 px-4 py-3.5">
           <ServerOff class="mt-0.5 size-4 text-danger" aria-hidden="true" />
           <div class="min-w-0 flex-1">
-            <p class="font-medium">{{ executor === 'offline' ? '执行器离线' : '执行器未连接' }}</p>
-            <p class="text-sm text-muted">{{ executor === 'offline' ? '新变更等待同步' : '转发尚未生效' }}</p>
+            <p class="font-medium">{{ executor === 'recovering' ? '转发恢复中' : executor === 'offline' ? '执行器离线' : '执行器未连接' }}</p>
+            <p class="text-sm text-muted">{{ executor === 'recovering' ? '等待运行确认' : executor === 'offline' ? '新变更等待同步' : '转发尚未生效' }}</p>
           </div>
         </li>
         <li v-for="group in failedOwners" :key="group.ownerId" class="flex items-start gap-3 px-4 py-3.5">

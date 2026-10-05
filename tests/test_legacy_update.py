@@ -161,7 +161,9 @@ class LegacyPanelUpdate(unittest.TestCase):
         broker = (self.units / 'relaydeck-broker.service').read_text()
         self.starts.append(broker)
         if 'ExecStartPre=' not in broker: return
-        command = shlex.split(next(line.split('=', 1)[1] for line in broker.splitlines() if line.startswith('ExecStartPre=')))
+        commands = [shlex.split(line.split('=',1)[1]) for line in broker.splitlines() if line.startswith('ExecStartPre=')]
+        self.assertEqual(commands[0],['+/usr/bin/python3','-B','/usr/local/libexec/relaydeck-manage.py','prepare-recovery'])
+        command = commands[1]
         self.assertEqual(command, ['/usr/local/libexec/relaydeck', 'prepare-broker-policy', '/etc/relaydeck/broker.json', '/var/lib/relaydeck/runtime/broker-effective.json'])
         self.preparations.append(command)
         if self.fail == 'prestart': raise RuntimeError('injected prestart failure')

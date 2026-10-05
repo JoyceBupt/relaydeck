@@ -373,7 +373,7 @@ def as_web(binary, *arguments):
 
 def wait_health(version):
     last = 'not ready'
-    for _ in range(80):
+    for _ in range(480):
         try:
             with urllib.request.urlopen('http://127.0.0.1:7410/api/health', timeout=1) as response:
                 health = json.load(response)
@@ -634,6 +634,205 @@ def verify_cached_release(existing, stage):
         if path.is_dir() != source.is_dir() or path.is_file() != source.is_file() or path.is_file() and (path.stat().st_nlink != 1 or digest(path) != digest(source)):
             raise ValueError('Cached release contents differ from the verified bundle')
 
+RECOVERY_FILES = {'relaydeck.db', 'mfa.key', 'traffic-ledger.json', 'traffic-subscriptions.json',
+                  'broker.json', 'upgrade.json', 'relaydeck.env', 'installation.json', 'Caddyfile'}
+
+
+def recovery_directory(backup):
+    backup = pathlib.Path(backup)
+    if backup.parent != STATE / 'backups' or not re.fullmatch(r'update-[0-9]+', backup.name):
+        raise ValueError('Unexpected recovery backup path')
+    return STATE / 'recovery' / backup.name
+
+
+def copy_web_snapshot(source, destination):
+    # Never let root follow a path beneath a web-writable directory. The child
+    # reads with the application's UID; root only receives bytes into its own FD.
+    script = "import os,stat,sys,shutil;f=os.fdopen(os.open(sys.argv[1],os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK),'rb');s=os.fstat(f.fileno());assert stat.S_ISREG(s.st_mode) and s.st_nlink==1;shutil.copyfileobj(f,sys.stdout.buffer)"
+    with destination.open('xb') as output:
+        os.chmod(destination, 0o600)
+        subprocess.run(['runuser','-u','relaydeck','--','python3','-c',script,str(source)],stdout=output,env=SAFE_ENV,check=True)
+        output.flush(); os.fsync(output.fileno())
+
+
+def forwarding_baseline(backup):
+    # Schema inspection and SQLite parsing always happen as the web identity.
+    script = """import json,sqlite3,sys
+from urllib.parse import quote
+s=sqlite3.connect('file:'+quote(sys.argv[1])+'?mode=ro&immutable=1',uri=True)
+cols=lambda table:{r[1] for r in s.execute('PRAGMA table_info('+table+')')}
+extra=''
+if 'traffic_blocked' in cols('users'): extra+=' AND u.traffic_blocked=0'
+if 'dns_blocked' in cols('rules'): extra+=' AND r.dns_blocked=0'
+if s.execute("SELECT 1 FROM sqlite_master WHERE name='rule_runtime_states'").fetchone(): extra+=" AND EXISTS(SELECT 1 FROM rule_runtime_states rs WHERE rs.rule_id=r.id AND rs.revision=s.revision AND rs.active=1)"
+rows=s.execute("SELECT r.id,r.owner_id,u.expires_at FROM rules r JOIN users u ON u.id=r.owner_id JOIN runtime_states s ON s.owner_id=u.id WHERE r.deleted_at IS NULL AND r.enabled=1 AND u.enabled=1 AND s.status='active' AND s.revision=u.desired_revision AND u.applied_revision=u.desired_revision"+extra).fetchall()
+print(json.dumps(rows))
+"""
+    value = json.loads(run('runuser','-u','relaydeck','--','python3','-c',script,str(backup / 'relaydeck.db'),capture=True))
+    if not isinstance(value,list) or any(not isinstance(row,list) or len(row)!=3 or any(type(v) is not int or v<=0 for v in row[:2]) or row[2] is not None and type(row[2]) is not int for row in value):
+        raise ValueError('Invalid forwarding recovery baseline')
+    return value
+
+
+def complete_recovery(record, binary=BIN):
+    backup = pathlib.Path(record['backup'])
+    destination = recovery_directory(backup)
+    if destination.exists():
+        manifest=verify_recovery(destination)
+        publish_readiness(backup,manifest['forwarding'])
+        return destination
+    root_path(STATE)
+    destination.parent.mkdir(mode=0o700,exist_ok=True)
+    root_path(destination.parent)
+    with tempfile.TemporaryDirectory(prefix='.pending-',dir=destination.parent) as directory:
+        stage=pathlib.Path(directory)
+        run(str(binary),'checkpoint-traffic',str(CONFIG / 'broker.json'))
+        for name in ('relaydeck.db','mfa.key'):
+            copy_web_snapshot(backup / name,stage / name)
+        for name in ('traffic-ledger.json','traffic-subscriptions.json'):
+            source=STATE / 'runtime' / name
+            root_path(source)
+            atomic_copy(source,stage / name,0o600)
+        for name in ('broker.json','upgrade.json','relaydeck.env','installation.json','Caddyfile'):
+            source=CONFIG / name
+            if source.exists():
+                root_path(source); atomic_copy(source,stage / name,0o600)
+        previous=pathlib.Path(record['previous'])
+        root_path(previous)
+        manifest={'version':1,'release':str(previous),'release_sha256':digest(previous / 'release.json'),'forwarding':forwarding_baseline(backup),
+                  'files':{p.name:digest(p) for p in stage.iterdir()}}
+        atomic_json(stage / 'manifest.json',manifest)
+        # Publish only a complete, fsynced root-owned recovery bundle.
+        os.rename(stage,destination)
+        descriptor=os.open(destination.parent,os.O_RDONLY|os.O_DIRECTORY)
+        try: os.fsync(descriptor)
+        finally: os.close(descriptor)
+    publish_readiness(backup,manifest['forwarding'])
+    return destination
+
+
+def publish_readiness(backup,baseline):
+    path=STATE / 'upgrade-readiness.json'
+    atomic_json(path,{'backup':str(backup),'observed_after':int(time.time()),'rules':baseline},0o640)
+    os.chown(path,0,pwd.getpwnam('relaydeck').pw_gid)
+
+
+def verify_recovery(path):
+    path=pathlib.Path(path)
+    root_path(path)
+    meta=path / 'manifest.json'
+    root_path(meta)
+    info=meta.stat()
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink!=1 or info.st_mode & 0o077 or info.st_size>4*1024*1024:
+        raise ValueError('Invalid recovery manifest')
+    manifest=json.loads(meta.read_text())
+    files=manifest.get('files',{})
+    required={'relaydeck.db','mfa.key','traffic-ledger.json','traffic-subscriptions.json','broker.json','upgrade.json','relaydeck.env','installation.json'}
+    if not isinstance(files,dict) or manifest.get('version')!=1 or not required<=set(files)<=RECOVERY_FILES or {p.name for p in path.iterdir()}!=set(files)|{'manifest.json'}:
+        raise ValueError('Incomplete recovery bundle')
+    for name,checksum in files.items():
+        item=path / name
+        root_path(item)
+        if not item.is_file() or item.stat().st_nlink!=1 or item.stat().st_mode & 0o077 or digest(item)!=checksum:
+            raise ValueError('Recovery integrity check failed: '+name)
+    release=pathlib.Path(manifest['release'])
+    root_path(release)
+    if release.parent!=RELEASES or digest(release / 'release.json')!=manifest['release_sha256']:
+        raise ValueError('Recovery release is unavailable or changed')
+    return manifest
+
+
+def restore_recovery(path):
+    path=pathlib.Path(path)
+    manifest=verify_recovery(path)
+    # Parsing/overwriting application files remains unprivileged. Input is an
+    # already-open root-owned snapshot, never an arbitrary privileged pathname.
+    dbscript="""import os,sqlite3,sys,tempfile,shutil
+from urllib.parse import quote
+with tempfile.NamedTemporaryFile(dir=sys.argv[1]) as f:
+ shutil.copyfileobj(sys.stdin.buffer,f);f.flush()
+ s=sqlite3.connect('file:'+quote(f.name)+'?mode=ro',uri=True)
+ assert s.execute('PRAGMA quick_check').fetchone()[0]=='ok'
+ d=sqlite3.connect(os.path.join(sys.argv[1],'relaydeck.db'));s.backup(d);d.close();s.close()
+"""
+    keyscript="""import os,sys,tempfile
+value=sys.stdin.buffer.read(66);assert len(value) in (64,65) and (len(value)==64 or value[-1:]==bytes([10])) and len(bytes.fromhex(value.decode().strip()))==32
+fd,name=tempfile.mkstemp(dir=sys.argv[1])
+with os.fdopen(fd,'wb') as f: f.write(value);f.flush();os.fsync(f.fileno())
+os.replace(name,os.path.join(sys.argv[1],'mfa.key'))
+"""
+    for name,script,directory in (('relaydeck.db',dbscript,'data'),('mfa.key',keyscript,'secrets')):
+        with (path / name).open('rb') as source:
+            subprocess.run(['runuser','-u','relaydeck','--','python3','-c',script,str(STATE / directory)],stdin=source,env=SAFE_ENV,check=True)
+    for name in ('traffic-ledger.json','traffic-subscriptions.json'):
+        atomic_copy(path / name,STATE / 'runtime' / name,0o600)
+    # All managed tenants are stopped; stale kernel counters must not override
+    # the selected snapshot or be charged to a subsequently reused runtime UID.
+    tables=json.loads(run('nft','-j','list','tables',capture=True))['nftables']
+    for name in ('relaydeck_usage','relaydeck_usage_guard'):
+        if any(row.get('table',{}).get('name')==name and row['table'].get('family')=='inet' for row in tables):
+            run('nft','delete','table','inet',name)
+    for name in ('broker.json','upgrade.json','relaydeck.env','installation.json','Caddyfile'):
+        if name in manifest['files']:
+            atomic_copy(path / name,CONFIG / name,0o600 if name=='relaydeck.env' else 0o644)
+    publish_readiness(STATE / 'backups' / path.name,manifest['forwarding'])
+    return manifest
+
+
+def prepare_recovery():
+    # Also runs from the new broker's privileged pre-start hook when the updater
+    # currently in memory belongs to an older release.
+    if not TRANSACTION.exists(): return
+    root_path(TRANSACTION)
+    record=json.loads(TRANSACTION.read_text())
+    if record.get('phase') in ('committed','rolled_back','restoring') or not record.get('backup'): return
+    complete_recovery(record)
+
+
+def backup(args):
+    preflight(); confirm_update(args.yes)
+    with manage_lock():
+        if TRANSACTION.exists(): raise ValueError('Recover the interrupted upgrade first')
+        snapshot=STATE / 'backups' / ('update-'+str(time.time_ns()))
+        run('systemctl','stop',*UNITS)
+        try:
+            as_web(BIN,'backup',str(snapshot))
+            destination=complete_recovery({'backup':str(snapshot),'previous':str(CURRENT.resolve())})
+        finally:
+            run('systemctl','start',*UNITS)
+        wait_health(json.loads((CURRENT / 'release.json').read_text())['version'])
+        print('Complete recovery bundle: '+str(destination))
+
+
+def restore(args):
+    preflight(); confirm_update(args.yes)
+    with manage_lock():
+        if TRANSACTION.exists(): raise ValueError('Recover the interrupted upgrade first')
+        selected=pathlib.Path(args.backup).resolve()
+        manifest=verify_recovery(selected)
+        snapshot=STATE / 'backups' / ('update-'+str(time.time_ns()))
+        run('systemctl','stop',*UNITS)
+        as_web(BIN,'backup',str(snapshot))
+        safety=complete_recovery({'backup':str(snapshot),'previous':str(CURRENT.resolve())})
+        record={'previous':str(CURRENT.resolve()),'release':manifest['release'],'backup':str(snapshot),'phase':'restoring',
+                'installation':json.loads((CONFIG / 'installation.json').read_text()),'broker_policy':json.loads((CONFIG / 'broker.json').read_text())}
+        atomic_json(TRANSACTION,record)
+        try:
+            restore_recovery(selected)
+            release=pathlib.Path(manifest['release'])
+            atomic_copy(release / 'bin/relaydeck',BIN)
+            current_link(release); management_tools(release)
+            for unit in ALL_UNITS: atomic_copy(release / 'deploy' / unit,pathlib.Path('/etc/systemd/system') / unit,0o644)
+            run('systemctl','daemon-reload'); run('systemctl','start',*UNITS)
+            wait_health(json.loads((release / 'release.json').read_text())['version'])
+            record['phase']='committed';atomic_json(TRANSACTION,record);TRANSACTION.unlink()
+        except BaseException:
+            restore_transaction(record)
+            raise
+        print('Restored complete state. Previous state: '+str(safety))
+
+
+
 class UpdateRolledBack(RuntimeError):
     pass
 
@@ -647,7 +846,10 @@ def restore_transaction(record):
             raise ValueError('Unexpected recovery release path')
     old_version = json.loads((previous / 'release.json').read_text())['version']
     run('systemctl', 'stop', *UNITS)
-    if record['backup']:
+    full = recovery_directory(record['backup']) if record.get('backup') else None
+    if full and full.exists():
+        restore_recovery(full)
+    elif record['backup']:
         backup = pathlib.Path(record['backup'])
         if backup.parent != STATE / 'backups' or not re.fullmatch('update-[0-9]+', backup.name):
             raise ValueError('Unexpected recovery backup path')
@@ -748,6 +950,7 @@ def update(args, progress=lambda step: None):
             transaction.update(backup=str(backup), phase='backed_up')
             atomic_json(TRANSACTION, transaction)
             run('systemctl', 'stop', 'relaydeck-broker.service')
+            complete_recovery(transaction, release / 'bin/relaydeck')
             progress('install')
             # New broker units prepare a versioned effective policy at startup.
             # Keep the source policy readable by the previous release on rollback.
@@ -827,12 +1030,19 @@ def main():
     cap.add_argument('--yes', action='store_true')
     commands.add_parser('recover')
     commands.add_parser('prepare-frontend')
+    commands.add_parser('prepare-recovery')
+    commands.add_parser('backup').add_argument('--yes',action='store_true')
+    sub=commands.add_parser('restore')
+    sub.add_argument('--backup',type=pathlib.Path,required=True)
+    sub.add_argument('--yes',action='store_true')
     sub = commands.add_parser('package')
     sub.add_argument('--target', required=True)
     sub.add_argument('--output', default='dist')
     args = parser.parse_args()
     if args.command == 'prepare-frontend':
         prepare_frontend()
+    elif args.command == 'prepare-recovery':
+        prepare_recovery()
     elif args.command == 'recover':
         recover_update()
     elif args.command == 'inspect':

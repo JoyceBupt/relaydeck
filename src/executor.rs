@@ -206,6 +206,10 @@ impl RuntimePlan {
         self.max_rules
     }
 
+    pub(crate) fn exclude_ports(&mut self, ports: &HashSet<u16>) {
+        self.rules.retain(|rule| !ports.contains(&rule.listen_port));
+    }
+
     pub fn rules(&self) -> &[DesiredRule] {
         &self.rules
     }

@@ -20,6 +20,8 @@ enum Request {
     Apply(RuntimePlan),
     Stop(i64),
     Inspect,
+    Rules(Vec<i64>),
+    Renew(Vec<(i64, i64)>),
     Acknowledge(Vec<(i64, i64)>),
     Check(crate::connectivity::CheckRequest),
     Traffic(Vec<crate::traffic::TrafficGrant>),
@@ -34,6 +36,16 @@ pub struct Failure {
     pub retryable: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuleStatus {
+    pub owner: i64,
+    pub revision: i64,
+    pub rule_id: i64,
+    pub active: bool,
+    pub observed_at: i64,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Reply {
@@ -43,6 +55,8 @@ struct Reply {
     events: Vec<Failure>,
     check: Option<crate::connectivity::RuleCheck>,
     traffic: Option<Vec<crate::traffic::TrafficSnapshot>>,
+    #[serde(default)]
+    rules: Vec<RuleStatus>,
 }
 
 impl crate::connectivity::CheckChannel for SocketDriver {
@@ -111,8 +125,13 @@ impl SocketDriver {
     }
     #[cfg(unix)]
     async fn request(&self, request: Request) -> anyhow::Result<Reply> {
+        let path = if matches!(request, Request::Renew(_)) {
+            self.path.with_file_name("renew.sock")
+        } else {
+            self.path.clone()
+        };
         let operation = async {
-            let mut stream = tokio::net::UnixStream::connect(&self.path)
+            let mut stream = tokio::net::UnixStream::connect(&path)
                 .await
                 .map_err(transport)?;
             ensure!(stream.peer_cred()?.uid() == 0, "broker peer must be root");
@@ -145,6 +164,13 @@ impl SocketDriver {
     #[cfg(not(unix))]
     async fn request(&self, _request: Request) -> anyhow::Result<Reply> {
         anyhow::bail!("Unix sockets are required")
+    }
+    pub async fn renew(&self, revisions: Vec<(i64, i64)>) -> anyhow::Result<()> {
+        self.request(Request::Renew(revisions)).await?;
+        Ok(())
+    }
+    pub async fn rule_states(&self, owners: Vec<i64>) -> anyhow::Result<Vec<RuleStatus>> {
+        Ok(self.request(Request::Rules(owners)).await?.rules)
     }
     pub async fn inspect(&self) -> anyhow::Result<Vec<Failure>> {
         Ok(self.request(Request::Inspect).await?.events)
@@ -238,8 +264,78 @@ pub async fn run(policy_path: &Path) -> anyhow::Result<()> {
             "cannot assign broker socket group"
         );
         std::fs::set_permissions(&policy.socket_path, std::fs::Permissions::from_mode(0o660))?;
-        let driver = LinuxDriver::new(policy.clone()).await?;
-        let mut leases: BTreeMap<i64, (i64, i64)> = BTreeMap::new();
+        let driver = std::sync::Arc::new(LinuxDriver::new(policy.clone()).await?);
+        let leases = std::sync::Arc::new(std::sync::Mutex::new(
+            BTreeMap::<i64, (RuntimePlan, i64)>::new(),
+        ));
+        let renew_path = policy.socket_path.with_file_name("renew.sock");
+        if let Ok(meta) = std::fs::symlink_metadata(&renew_path) {
+            ensure!(
+                meta.file_type().is_socket() && meta.uid() == 0 && meta.nlink() == 1,
+                "unexpected renewal socket object"
+            );
+            ensure!(
+                tokio::net::UnixStream::connect(&renew_path).await.is_err(),
+                "renewal service is already running"
+            );
+            std::fs::remove_file(&renew_path)?;
+        }
+        let renew_listener = tokio::net::UnixListener::bind(&renew_path)?;
+        let path = std::ffi::CString::new(renew_path.as_os_str().as_encoded_bytes())?;
+        ensure!(
+            unsafe { libc::chown(path.as_ptr(), 0, policy.web_gid.unwrap_or(policy.web_uid)) } == 0,
+            "cannot assign renewal socket group"
+        );
+        std::fs::set_permissions(&renew_path, std::fs::Permissions::from_mode(0o660))?;
+        let renewal_driver = driver.clone();
+        let renewal_leases = leases.clone();
+        let renewal_policy = policy.clone();
+        let mut renewer = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = renew_listener.accept().await?;
+                if stream.peer_cred()?.uid() != renewal_policy.web_uid {
+                    continue;
+                }
+                // This dedicated socket never queues behind systemd, nft, DNS,
+                // connectivity probes or reconciliation. No plan can be created here.
+                let request = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    read_frame::<Request>(&mut stream),
+                )
+                .await;
+                let mut reply = Reply::default();
+                let result = (|| -> anyhow::Result<()> {
+                    let Ok(Ok(Request::Renew(revisions))) = request else {
+                        anyhow::bail!("expected renewal");
+                    };
+                    ensure!(revisions.len() <= 64, "too many renewals");
+                    let mut active = renewal_leases.lock().unwrap();
+                    for (owner, revision) in revisions {
+                        if let Some((plan, until)) = active.get_mut(&owner)
+                            && plan.revision() == revision
+                            && *until > crate::db::now()
+                            && plan
+                                .expires_at()
+                                .is_none_or(|expiry| expiry > crate::db::now())
+                        {
+                            renewal_driver.renew_authorization(plan)?;
+                            *until =
+                                crate::db::now() + renewal_policy.authorization_ttl_secs as i64;
+                        }
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    reply.error = Some(error.to_string());
+                    reply.retryable = true;
+                }
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(1), write_frame(&mut stream, &reply))
+                        .await;
+            }
+            #[allow(unreachable_code)]
+            Ok::<(), anyhow::Error>(())
+        });
         let mut events: BTreeMap<i64, Failure> = BTreeMap::new();
         let mut blocked: BTreeMap<i64, i64> = BTreeMap::new();
         let mut stopping = std::collections::BTreeSet::new();
@@ -273,21 +369,23 @@ pub async fn run(policy_path: &Path) -> anyhow::Result<()> {
                                     if let Err(error) = driver.apply(&plan).await {
                                         reply.retryable=error.retryable;
                                         if error.crashed {events.insert(plan.owner_id(),Failure{owner:plan.owner_id(),revision:plan.revision(),message:error.message.clone(),retryable:true});}
+                                        leases.lock().unwrap().remove(&plan.owner_id());
                                         let cleanup = driver.stop(plan.owner_id()).await;
-                                        leases.remove(&plan.owner_id());
                                         if let Err(cleanup) = cleanup { stopping.insert(plan.owner_id()); reply.retryable=true; return Err(anyhow::anyhow!(cleanup).context("failed apply cleanup")); }
                                         return Err(anyhow::anyhow!(error));
                                     }
                                     driver.renew_authorization(&plan)?;
-                                    leases.insert(plan.owner_id(),(plan.revision(),crate::db::now()+policy.authorization_ttl_secs as i64));
+                                    leases.lock().unwrap().insert(plan.owner_id(),(plan.clone(),crate::db::now()+policy.authorization_ttl_secs as i64));
                                     blocked.remove(&plan.owner_id());
                                     events.remove(&plan.owner_id());
                                 }
-                                Request::Stop(owner) => { leases.remove(&owner); if let Err(error)=driver.stop(owner).await { stopping.insert(owner); reply.retryable=true; return Err(error.into()); } stopping.remove(&owner); }
+                                Request::Stop(owner) => { leases.lock().unwrap().remove(&owner); if let Err(error)=driver.stop(owner).await { stopping.insert(owner); reply.retryable=true; return Err(error.into()); } stopping.remove(&owner); }
+                                Request::Renew(_) => anyhow::bail!("renewals require the dedicated socket"),
+                                Request::Rules(owners) => {reply.rules=driver.rule_states(&owners).await?;},
                                 Request::Inspect => { reply.events = events.values().cloned().collect(); }
                                 Request::Traffic(grants) => {reply.retryable=true;reply.traffic=Some(driver.traffic(&grants).await?);}
                                 Request::Check(check) => {
-                                    ensure!(leases.get(&check.owner_id).is_some_and(|(revision,until)|*revision == check.revision && *until > crate::db::now()), "connectivity authorization is stale");
+                                    ensure!(leases.lock().unwrap().get(&check.owner_id).is_some_and(|(plan,until)|plan.revision() == check.revision && *until > crate::db::now()), "connectivity authorization is stale");
                                     ensure!(last_check.is_none_or(|time| time.elapsed() >= Duration::from_secs(5)), "connectivity checks are rate limited");
                                     last_check = Some(std::time::Instant::now());
                                     reply.check = Some(driver.check_rule(&check).await?);
@@ -309,15 +407,19 @@ pub async fn run(policy_path: &Path) -> anyhow::Result<()> {
                                 Err(error) => tracing::warn!(owner,%error,"tenant stop remains pending"),
                             }
                         }
-                        let expired: Vec<_> = leases.iter().filter(|(_,(_,until))|*until<=crate::db::now()).map(|(owner,(revision,_))|(*owner,*revision)).collect();
+                        let expired: Vec<_> = {
+                            let mut active=leases.lock().unwrap();
+                            let expired:Vec<_>=active.iter().filter(|(_,(_,until))|*until<=crate::db::now()).map(|(owner,(plan,_))|(*owner,plan.revision())).collect();
+                            for (owner,_) in &expired {active.remove(owner);}
+                            expired
+                        };
                         for (owner,revision) in expired {
-                            leases.remove(&owner);
                             if let Err(error)=driver.stop(owner).await { tracing::error!(owner,%error,"stale tenant isolated; stop will be retried"); stopping.insert(owner); }
                             events.insert(owner,Failure{owner,revision,message:"运行授权已过期".into(),retryable:true});
                         }
                         for (owner,revision,message,retryable) in driver.unhealthy_owners().await {
                             tracing::warn!(owner_id=owner,revision,retryable,%message,"tenant runtime unhealthy");
-                            leases.remove(&owner);
+                            leases.lock().unwrap().remove(&owner);
                             if let Err(error)=driver.stop(owner).await { tracing::error!(owner,%error,"unhealthy tenant isolated; stop will be retried"); stopping.insert(owner); }
                             if !retryable { blocked.insert(owner,revision); }
                             events.insert(owner,Failure{owner,revision,message,retryable});
@@ -326,13 +428,21 @@ pub async fn run(policy_path: &Path) -> anyhow::Result<()> {
                     _ = traffic_clock.tick() => {
                         if let Err(error)=driver.traffic_month().await {tracing::error!(%error,"traffic period transition deferred");}
                     }
+                    result = &mut renewer => { result??; anyhow::bail!("renewal service stopped"); },
                     _ = terminate.recv() => break,
                     _ = tokio::signal::ctrl_c() => break,
                 }
             }
             Ok::<_,anyhow::Error>(())
         }.await;
+        let renewal_finished = renewer.is_finished();
+        renewer.abort();
+        if !renewal_finished {
+            let _ = renewer.await;
+        }
+        leases.lock().unwrap().clear();
         let shutdown = driver.shutdown().await;
+        std::fs::remove_file(&renew_path)?;
         drop(listener);
         std::fs::remove_file(&policy.socket_path)?;
         result?;

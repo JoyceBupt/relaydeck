@@ -205,7 +205,7 @@ class PanelOrigin(unittest.TestCase):
                                     ('manage_lock', nullcontext), ('prepare', prepare_release),
                                     ('reserve_forwarding_ports', lambda policy: calls.append(policy.copy()) or {}),
                                     ('ensure_upgrade_policy', lambda: None), ('management_tools', lambda _: None),
-                                    ('current_link', lambda _: None), ('as_web', lambda *_: None),
+                                    ('current_link', lambda _: None), ('as_web', lambda *_: None), ('complete_recovery', lambda *_: None),
                                     ('atomic_json', lambda path, value, mode=0o600: path.write_text(json.dumps(value))),
                                     ('atomic_copy', lambda *_: None), ('run', lambda *_: None), ('wait_health', lambda _: None)]:
                     patches.enter_context(patch.object(manage, name, value))

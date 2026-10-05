@@ -180,6 +180,27 @@ where
     Ok(())
 }
 
+pub async fn record_rule_states(
+    pool: &SqlitePool,
+    states: &[crate::broker::RuleStatus],
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    for state in states {
+        sqlx::query("INSERT INTO rule_runtime_states(rule_id,revision,active,observed_at) SELECT r.id,?,?,? FROM rules r JOIN users u ON u.id=r.owner_id WHERE r.id=? AND COALESCE(u.runtime_slot,u.id)=? AND u.desired_revision=? AND r.deleted_at IS NULL ON CONFLICT(rule_id) DO UPDATE SET revision=excluded.revision,active=excluded.active,observed_at=excluded.observed_at WHERE rule_runtime_states.observed_at<=excluded.observed_at")
+            .bind(state.revision).bind(state.active).bind(state.observed_at).bind(state.rule_id).bind(state.owner).bind(state.revision).execute(&mut *tx).await?;
+    }
+    tx.commit().await
+}
+
+#[cfg(target_os = "linux")]
+async fn observe_rules(pool: &SqlitePool, driver: &SocketDriver) -> anyhow::Result<()> {
+    let slots:Vec<i64>=sqlx::query_scalar("SELECT COALESCE(runtime_slot,id) FROM users WHERE enabled=1 AND deletion_requested_at IS NULL").fetch_all(pool).await?;
+    for batch in slots.chunks(16) {
+        record_rule_states(pool, &driver.rule_states(batch.to_vec()).await?).await?;
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 async fn receive_failures(pool: &SqlitePool, driver: &SocketDriver) -> anyhow::Result<()> {
     let events = driver.inspect().await?;
@@ -236,6 +257,27 @@ pub async fn record_runtime_failures(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+async fn renewal_loop(pool: SqlitePool, driver: Arc<SocketDriver>) {
+    let mut clock = tokio::time::interval(Duration::from_secs(5));
+    clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        clock.tick().await;
+        let renewed=async {
+            let revisions:Vec<(i64,i64)>=sqlx::query_as("SELECT COALESCE(u.runtime_slot,u.id),s.revision FROM users u JOIN runtime_states s ON s.owner_id=u.id WHERE u.enabled=1 AND u.deletion_requested_at IS NULL AND u.traffic_blocked=0 AND (u.expires_at IS NULL OR u.expires_at>?) AND s.status='active' AND s.revision=u.desired_revision AND u.applied_revision=u.desired_revision")
+                .bind(now()).fetch_all(&pool).await?;
+            // An empty renewal is also a broker liveness check.
+            if revisions.is_empty() { driver.renew(Vec::new()).await?; }
+            for batch in revisions.chunks(64) {driver.renew(batch.to_vec()).await?;}
+            sqlx::query("INSERT INTO executor_status(id,last_seen,status) VALUES(1,?,'running') ON CONFLICT(id) DO UPDATE SET last_seen=excluded.last_seen,status=excluded.status").bind(now()).execute(&pool).await?;
+            Ok::<(),anyhow::Error>(())
+        }.await;
+        if let Err(error) = renewed {
+            tracing::warn!(%error,"independent runtime renewal deferred");
+        }
+    }
+}
+
 pub async fn run(policy_path: &Path) -> anyhow::Result<()> {
     #[cfg(not(target_os = "linux"))]
     {
@@ -274,6 +316,7 @@ pub async fn run(policy_path: &Path) -> anyhow::Result<()> {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        let mut renewal = tokio::spawn(renewal_loop(pool.clone(), driver.clone()));
         let result = async {
             loop {
                 tokio::select! {
@@ -282,6 +325,7 @@ pub async fn run(policy_path: &Path) -> anyhow::Result<()> {
                             if let Err(error)=refresh_traffic(&pool,&driver).await {tracing::error!(%error,"traffic synchronization deferred; existing authorizations continue independently");}
                             receive_failures(&pool,&driver).await?;
                             reconcile_tick(&pool,&reconciler).await?;
+                            observe_rules(&pool,&driver).await?;
                             refresh_dns(&pool,&local_ips,|host,port| {let ips=local_ips.clone();async move {crate::rules::resolve_host(&host,port,&ips).await}}).await
                         }.await;
                         if let Err(error) = tick {
@@ -300,12 +344,18 @@ pub async fn run(policy_path: &Path) -> anyhow::Result<()> {
                             tracing::warn!(%error,"database temporarily busy; retrying without stopping unrelated accounts");
                         }
                     }
+                    result = &mut renewal => {result?;anyhow::bail!("renewal worker stopped");},
                     _ = terminate.recv() => break,
                     _ = tokio::signal::ctrl_c() => break,
                 }
             }
             Ok::<_,anyhow::Error>(())
         }.await;
+        let renewal_finished = renewal.is_finished();
+        renewal.abort();
+        if !renewal_finished {
+            let _ = renewal.await;
+        }
         crate::db::close(&pool)
             .await
             .context("close worker database")?;

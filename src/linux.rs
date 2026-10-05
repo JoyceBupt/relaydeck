@@ -597,9 +597,42 @@ pub fn render_nft_with_tunnels(
     Ok(rules)
 }
 
+#[cfg(target_os = "linux")]
+fn kernel_sockets(uid: u32) -> anyhow::Result<HashSet<(&'static str, u16)>> {
+    use std::io::BufRead;
+    let mut sockets = HashSet::new();
+    for (protocol, name) in [
+        ("tcp", "tcp"),
+        ("tcp", "tcp6"),
+        ("udp", "udp"),
+        ("udp", "udp6"),
+    ] {
+        let file = std::fs::File::open(Path::new("/proc/net").join(name))?;
+        for line in std::io::BufReader::new(file).lines().skip(1) {
+            let line = line?;
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if fields.get(7).and_then(|value| value.parse::<u32>().ok()) != Some(uid)
+                || (protocol == "tcp" && fields.get(3) != Some(&"0A"))
+            {
+                continue;
+            }
+            let port = fields
+                .get(1)
+                .and_then(|address| address.rsplit_once(':'))
+                .context("invalid kernel socket address")?
+                .1;
+            sockets.insert((protocol, u16::from_str_radix(port, 16)?));
+        }
+    }
+    Ok(sockets)
+}
+
 pub struct LinuxDriver {
     policy: BrokerPolicy,
     plans: Mutex<BTreeMap<i64, RuntimePlan>>,
+    requested: Mutex<BTreeMap<i64, RuntimePlan>>,
+    #[cfg(target_os = "linux")]
+    authorization_lock: std::sync::Mutex<()>,
     firewall_digest: Mutex<Option<Vec<u8>>>,
     tunnel_peers: Mutex<Vec<WireguardPeer>>,
     #[cfg(target_os = "linux")]
@@ -654,7 +687,20 @@ pub fn validate_listener_inventory(
     output: &str,
     plan: &RuntimePlan,
 ) -> anyhow::Result<()> {
+    ensure!(
+        occupied_listener_ports(policy, output, plan)?.is_empty(),
+        "requested port is occupied by another service; choose another port"
+    );
+    Ok(())
+}
+
+fn occupied_listener_ports(
+    policy: &BrokerPolicy,
+    output: &str,
+    plan: &RuntimePlan,
+) -> anyhow::Result<HashSet<u16>> {
     policy.validate()?;
+    let mut occupied = HashSet::new();
     for line in output.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
         let local = fields
@@ -675,12 +721,11 @@ pub fn validate_listener_inventory(
             .map(str::parse::<u32>)
             .transpose()?
             .unwrap_or(0);
-        ensure!(
-            uid == policy.uid(plan.owner_id())?,
-            "port {port} is occupied by another service; choose another port"
-        );
+        if uid != policy.uid(plan.owner_id())? {
+            occupied.insert(port);
+        }
     }
-    Ok(())
+    Ok(occupied)
 }
 
 fn udp_grants_for_owner(policy: &BrokerPolicy, owner: i64) -> anyhow::Result<HashSet<u16>> {
@@ -1209,6 +1254,8 @@ impl LinuxDriver {
                 traffic: Mutex::new(traffic),
                 policy,
                 plans: Mutex::new(BTreeMap::new()),
+                requested: Mutex::new(BTreeMap::new()),
+                authorization_lock: std::sync::Mutex::new(()),
                 firewall_digest: Mutex::new(None),
                 tunnel_peers: Mutex::new(Vec::new()),
                 global_failures: Mutex::new(0),
@@ -1321,7 +1368,10 @@ impl LinuxDriver {
                 )?;
                 ensure!(!validated.stopped(), "runtime expired");
                 self.confirm_service(plan).await?;
-                self.confirm_listeners(plan.owner_id(), Some(plan)).await
+                if !self.runtime_present(plan)? {
+                    return Err(RuntimeExited.into());
+                }
+                Ok::<(), anyhow::Error>(())
             }
             .await;
             if let Err(error) = check {
@@ -1553,6 +1603,7 @@ impl LinuxDriver {
             let mut plans = self.plans.lock().await;
             if plans.get(&raw.owner_id()).is_some_and(|existing| {
                 existing.rules() == raw.rules()
+                    && existing.revision() == raw.revision()
                     && existing.expires_at() == raw.expires_at()
                     && existing.port_start() == raw.port_start()
                     && existing.port_end() == raw.port_end()
@@ -1581,7 +1632,7 @@ impl LinuxDriver {
             }
         }
         let local_ips = interface_ips().await?;
-        let plan = raw.validate_again(
+        let mut plan = raw.validate_again(
             &self.policy.boundary(
                 self.policy
                     .local_ips
@@ -1603,10 +1654,20 @@ impl LinuxDriver {
         );
         // Check only requested ports. A shared pool must coexist with unrelated
         // host services, and never install ACLs over another service's listener.
+        let mut occupied = HashSet::new();
         for flags in ["-Hlnte", "-Hlnue"] {
             let listeners = command(SS, &[flags], None).await?;
-            validate_listener_inventory(&self.policy, std::str::from_utf8(&listeners)?, &plan)?;
+            occupied.extend(occupied_listener_ports(
+                &self.policy,
+                std::str::from_utf8(&listeners)?,
+                &plan,
+            )?);
         }
+        // A colliding new listener must not claim another host service's port,
+        // nor stop unchanged, authorized siblings. Its status stays failed and
+        // the next reconciliation retries it after the collision is resolved.
+        plan.exclude_ports(&occupied);
+        ensure!(!plan.stopped(), "all requested ports are occupied");
         let mut plans = self.plans.lock().await;
         #[cfg(target_os = "linux")]
         if let Some(previous) = plans.get(&plan.owner_id())
@@ -1639,6 +1700,10 @@ impl LinuxDriver {
             self.renew_authorization(&plan)?;
             self.confirm_applied(&plan, &directory).await?;
             self.confirm_service(&plan).await?;
+            ensure!(
+                self.runtime_present(&plan)?,
+                "runtime supervisor exited during apply"
+            );
             save_udp_grants(&self.policy, &plan, false)?;
             *plans = next;
             return Ok(());
@@ -1707,6 +1772,10 @@ impl LinuxDriver {
             )?;
             self.confirm_applied(&plan, &directory).await?;
             self.confirm_service(&plan).await?;
+            ensure!(
+                self.runtime_present(&plan)?,
+                "runtime supervisor exited during apply"
+            );
             save_udp_grants(&self.policy, &plan, false)?;
             plans.insert(plan.owner_id(), plan.clone());
             self.firewall(&plans).await?;
@@ -1725,7 +1794,6 @@ impl LinuxDriver {
 
     #[cfg(target_os = "linux")]
     fn runtime_present(&self, plan: &RuntimePlan) -> anyhow::Result<bool> {
-        use std::io::BufRead;
         let directory = Path::new("/sys/fs/cgroup/relaydeck.slice")
             .join(format!("relaydeck-owner-{}.service", plan.owner_id()));
         let pids = match std::fs::read_to_string(directory.join("cgroup.procs")) {
@@ -1741,12 +1809,12 @@ impl LinuxDriver {
             let base = Path::new("/proc").join(pid.to_string());
             let executable = match std::fs::read_link(base.join("exe")) {
                 Ok(path) => path,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error.into()),
             };
             let status = match std::fs::read_to_string(base.join("status")) {
                 Ok(status) => status,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error.into()),
             };
             ensure!(
@@ -1766,34 +1834,60 @@ impl LinuxDriver {
                 anyhow::bail!("unexpected runtime executable");
             }
         }
-        if runners != 1 || children != plan.rules().len() {
+        if runners != 1 || children > plan.rules().len() {
             return Ok(false);
         }
-        let mut sockets = HashSet::new();
-        for (protocol, name) in [
-            ("tcp", "tcp"),
-            ("tcp", "tcp6"),
-            ("udp", "udp"),
-            ("udp", "udp6"),
-        ] {
-            let file = std::fs::File::open(Path::new("/proc/net").join(name))?;
-            for line in std::io::BufReader::new(file).lines().skip(1) {
-                let line = line?;
-                let fields: Vec<_> = line.split_whitespace().collect();
-                if fields.get(7).and_then(|value| value.parse::<u32>().ok()) != Some(uid)
-                    || (protocol == "tcp" && fields.get(3) != Some(&"0A"))
-                {
-                    continue;
+        let sockets = kernel_sockets(uid)?;
+        ensure!(
+            sockets
+                .iter()
+                .filter(|(protocol, _)| *protocol == "tcp")
+                .all(|(_, port)| plan
+                    .rules()
+                    .iter()
+                    .any(|rule| rule.protocol.tcp() && rule.listen_port == *port)),
+            "unexpected tenant TCP listener"
+        );
+        let held_udp = udp_grants_for_owner(&self.policy, plan.owner_id())?;
+        ensure!(
+            sockets
+                .iter()
+                .filter(|(protocol, port)| *protocol == "udp" && held_udp.contains(port))
+                .all(|(_, port)| plan
+                    .rules()
+                    .iter()
+                    .any(|rule| rule.protocol.udp() && rule.listen_port == *port)),
+            "revoked tenant UDP listener remains bound"
+        );
+        Ok(true)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub async fn rule_states(
+        &self,
+        owners: &[i64],
+    ) -> anyhow::Result<Vec<crate::broker::RuleStatus>> {
+        ensure!(owners.len() <= 16, "too many observed owners");
+        let requested = self.requested.lock().await;
+        let mut states = Vec::new();
+        for owner in owners {
+            if let Some(plan) = requested.get(owner) {
+                let sockets = kernel_sockets(self.policy.uid(*owner)?)?;
+                for rule in plan.rules() {
+                    let active = (!rule.protocol.tcp()
+                        || sockets.contains(&("tcp", rule.listen_port)))
+                        && (!rule.protocol.udp() || sockets.contains(&("udp", rule.listen_port)));
+                    states.push(crate::broker::RuleStatus {
+                        owner: *owner,
+                        revision: plan.revision(),
+                        rule_id: rule.id,
+                        active,
+                        observed_at: now(),
+                    });
                 }
-                let port = fields
-                    .get(1)
-                    .and_then(|address| address.rsplit_once(':'))
-                    .context("invalid kernel socket address")?
-                    .1;
-                sockets.insert((protocol, u16::from_str_radix(port, 16)?));
             }
         }
-        Ok(validate_runtime_listeners(Some(plan), &sockets).is_ok())
+        Ok(states)
     }
 
     #[cfg(target_os = "linux")]
@@ -1828,12 +1922,7 @@ impl LinuxDriver {
                 &directory.join("applied-revision"),
                 self.policy.uid(plan.owner_id())?,
             )?;
-            if acknowledged == Some(plan.revision())
-                && self
-                    .confirm_listeners(plan.owner_id(), Some(plan))
-                    .await
-                    .is_ok()
-            {
+            if acknowledged == Some(plan.revision()) {
                 return Ok(());
             }
             ensure!(
@@ -1850,11 +1939,13 @@ impl LinuxDriver {
         if self.policy.uid(owner_id).is_err() {
             return Ok(());
         }
+        self.requested.lock().await.remove(&owner_id);
         let mut plans = self.plans.lock().await;
         plans.remove(&owner_id);
         // Revoke the tenant's independent monotonic lease before invoking tools.
         #[cfg(target_os = "linux")]
         {
+            let _authorization = self.authorization_lock.lock().unwrap();
             let path = self
                 .policy
                 .runtime_dir
@@ -1874,6 +1965,7 @@ impl LinuxDriver {
     pub(crate) fn renew_authorization(&self, plan: &RuntimePlan) -> anyhow::Result<()> {
         #[cfg(target_os = "linux")]
         {
+            let _authorization = self.authorization_lock.lock().unwrap();
             let until = now() + self.policy.authorization_ttl_secs as i64;
             write_root_file(
                 &self
@@ -1903,7 +1995,14 @@ impl LinuxDriver {
 impl ExecutorDriver for LinuxDriver {
     fn apply<'a>(&'a self, plan: &'a RuntimePlan) -> DriverFuture<'a> {
         Box::pin(async move {
-            self.apply_plan(plan).await.map_err(|error| {
+            let result = self.apply_plan(plan).await;
+            if result.is_ok() {
+                self.requested
+                    .lock()
+                    .await
+                    .insert(plan.owner_id(), plan.clone());
+            }
+            result.map_err(|error| {
                 if error.downcast_ref::<RuntimeExited>().is_some() {
                     DriverError::crashed(error.to_string())
                 } else if error.downcast_ref::<CommandUnavailable>().is_some() {

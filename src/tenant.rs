@@ -153,7 +153,7 @@ async fn run_inner(
                         tracing::warn!(uid, until, "tenant authorization expired");
                         break;
                     }
-                    children.check()?;
+                    children.check(realm, config)?;
                     if supervisor { applied=children.apply(realm,config,expires_at,uid,applied).await?; }
                 }
                 _ = terminate.recv() => break,
@@ -234,31 +234,78 @@ fn spawn(realm: &Path, config: &Path) -> anyhow::Result<tokio::process::Child> {
 #[cfg(target_os = "linux")]
 #[derive(Default)]
 struct Children {
-    rules: std::collections::BTreeMap<i64, (crate::executor::DesiredRule, tokio::process::Child)>,
+    rules: std::collections::BTreeMap<i64, RuleChild>,
     legacy: Option<tokio::process::Child>,
 }
 
 #[cfg(target_os = "linux")]
+struct RuleChild {
+    rule: crate::executor::DesiredRule,
+    child: Option<tokio::process::Child>,
+    failures: u8,
+    retry_at: std::time::Instant,
+    started: std::time::Instant,
+}
+
+#[cfg(target_os = "linux")]
+impl RuleChild {
+    fn attempt(&mut self, realm: &Path, directory: &Path) {
+        match spawn(
+            realm,
+            &directory.join(format!("rule-{}.json", self.rule.id)),
+        ) {
+            Ok(child) => {
+                self.child = Some(child);
+                self.started = std::time::Instant::now();
+            }
+            Err(error) => {
+                tracing::error!(rule_id=self.rule.id,%error,"rule start failed");
+                self.failed();
+            }
+        }
+    }
+    fn failed(&mut self) {
+        self.child = None;
+        self.failures = self.failures.saturating_add(1);
+        self.retry_at = std::time::Instant::now()
+            + std::time::Duration::from_secs(1u64 << self.failures.min(5));
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl Children {
-    fn check(&mut self) -> anyhow::Result<()> {
-        for child in self
-            .legacy
-            .iter_mut()
-            .chain(self.rules.values_mut().map(|(_, child)| child))
+    fn check(&mut self, realm: &Path, config: &Path) -> anyhow::Result<()> {
+        if let Some(child) = self.legacy.as_mut()
+            && let Some(status) = child.try_wait()?
         {
-            if let Some(status) = child.try_wait()? {
-                anyhow::bail!("realm child exited: {status}");
+            anyhow::bail!("legacy realm exited: {status}");
+        }
+        let directory = config.parent().unwrap();
+        for state in self.rules.values_mut() {
+            if let Some(child) = state.child.as_mut() {
+                if let Some(status) = child.try_wait()? {
+                    tracing::warn!(rule_id=state.rule.id,%status,"realm rule exited; sibling connections retained");
+                    state.failed();
+                } else if state.started.elapsed() >= std::time::Duration::from_secs(300) {
+                    state.failures = 0;
+                }
+            }
+            if state.child.is_none()
+                && state.failures <= 3
+                && std::time::Instant::now() >= state.retry_at
+            {
+                state.attempt(realm, directory);
             }
         }
         Ok(())
     }
     async fn stop_all(&mut self) -> anyhow::Result<()> {
         let mut error = None;
-        for child in self
-            .legacy
-            .iter_mut()
-            .chain(self.rules.values_mut().map(|(_, child)| child))
-        {
+        for child in self.legacy.iter_mut().chain(
+            self.rules
+                .values_mut()
+                .filter_map(|state| state.child.as_mut()),
+        ) {
             if let Err(failure) = child.kill().await {
                 error = Some(failure);
             }
@@ -296,7 +343,8 @@ impl Children {
         let changed: Vec<_> = self
             .rules
             .iter()
-            .filter(|(id, (old, _))| {
+            .filter(|(id, state)| {
+                let old = &state.rule;
                 !plan.rules().iter().any(|new| {
                     new.id == **id
                         && old.listen_port == new.listen_port
@@ -309,17 +357,35 @@ impl Children {
             .map(|(id, _)| *id)
             .collect();
         for id in changed {
-            let (_, mut child) = self.rules.remove(&id).unwrap();
-            child
-                .kill()
-                .await
-                .context("cannot stop changed realm child")?;
+            let mut state = self.rules.remove(&id).unwrap();
+            if let Some(child) = state.child.as_mut() {
+                child
+                    .kill()
+                    .await
+                    .context("cannot stop changed realm child")?;
+            }
         }
         for rule in plan.rules() {
             if let std::collections::btree_map::Entry::Vacant(entry) = self.rules.entry(rule.id) {
-                let config = directory.join(format!("rule-{}.json", rule.id));
-                entry.insert((rule.clone(), spawn(realm, &config)?));
+                let mut state = RuleChild {
+                    rule: rule.clone(),
+                    child: None,
+                    failures: 0,
+                    retry_at: std::time::Instant::now(),
+                    started: std::time::Instant::now(),
+                };
+                state.attempt(realm, directory);
+                entry.insert(state);
             }
+        }
+        // A fresh manual retry revision also rearms only failed children.
+        for state in self
+            .rules
+            .values_mut()
+            .filter(|state| state.child.is_none())
+        {
+            state.failures = 0;
+            state.retry_at = std::time::Instant::now();
         }
         // Only this fixed, pre-created file is tenant-writable. The directory,
         // plans, executables and child configurations stay immutable to tenants.

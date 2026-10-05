@@ -19,3 +19,5 @@ pub mod tenant;
 pub mod traffic;
 pub mod upgrade;
 pub mod worker;
+
+pub mod readiness;

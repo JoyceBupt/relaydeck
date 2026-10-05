@@ -1,7 +1,7 @@
 export type ViewMode = 'table' | 'cards'
 export type Protocol = 'tcp' | 'udp' | 'both'
 export type RuntimeStatus = 'pending' | 'active' | 'stopped' | 'failed' | 'blocked'
-export type ExecutorState = 'unconfigured' | 'running' | 'offline'
+export type ExecutorState = 'unconfigured' | 'running' | 'offline' | 'recovering'
 
 export interface User {
   id: number

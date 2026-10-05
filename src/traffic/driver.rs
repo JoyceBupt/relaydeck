@@ -445,6 +445,24 @@ impl TrafficMeter {
         Ok(())
     }
 
+    /// Called only after all tenant runtimes are stopped. No table is rebuilt
+    /// or quota reset; final kernel counters are durably folded into the ledger.
+    pub async fn checkpoint(&mut self) -> anyhow::Result<()> {
+        if let Some(value) = Self::table().await? {
+            ensure!(
+                self.path.try_exists()?
+                    || self
+                        .policy
+                        .runtime_dir
+                        .join("traffic-ledger.json")
+                        .try_exists()?,
+                "traffic ledger missing; refusing an incomplete backup"
+            );
+            self.absorb(&value)?;
+        }
+        self.persist()
+    }
+
     async fn initialize(&mut self) -> anyhow::Result<()> {
         if self.initialized {
             return Ok(());
@@ -690,4 +708,38 @@ impl TrafficMeter {
                     })
             })
     }
+}
+
+pub async fn checkpoint(path: &std::path::Path) -> anyhow::Result<()> {
+    secure_root_path(path, false)?;
+    ensure!(
+        std::fs::metadata(path)?.len() <= 16 * 1024,
+        "policy too large"
+    );
+    let policy: BrokerPolicy = serde_json::from_slice(&std::fs::read(path)?)?;
+    policy.validate()?;
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        if !entry
+            .file_name()
+            .as_encoded_bytes()
+            .iter()
+            .all(u8::is_ascii_digit)
+        {
+            continue;
+        }
+        if let Ok(status) = std::fs::read_to_string(entry.path().join("status")) {
+            let uid = status.lines().find_map(|line| {
+                line.strip_prefix("Uid:")
+                    .and_then(|value| value.split_whitespace().next()?.parse::<u32>().ok())
+            });
+            ensure!(
+                uid.is_none_or(
+                    |uid| !(policy.uid_start..policy.uid_start + policy.max_owners).contains(&uid)
+                ),
+                "stop all tenant runtimes before checkpointing traffic"
+            );
+        }
+    }
+    TrafficMeter::open(policy)?.checkpoint().await
 }

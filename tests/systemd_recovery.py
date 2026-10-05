@@ -11,6 +11,7 @@ import signal
 import socket
 import subprocess
 import time
+import threading
 import unittest
 
 ROOT = pathlib.Path('/var/lib/relaydeck-qa')
@@ -39,18 +40,32 @@ def wait_for(predicate, seconds=15):
     raise AssertionError('Timed out waiting for runtime state')
 
 
+LEASES = {}
+LEASE_LOCK = threading.Lock()
+
 def request(op, data=None, success=True):
     if op == 'apply':
         request('traffic', [{'owner_id': data['owner_id'], 'budget': {'limit_bytes': None, 'mode': 'both'}}])
     value = {'op': op}
     if data is not None:
         value['data'] = data
-    result = subprocess.run(['runuser', '-u', 'relaydeck', '--', 'python3', '-c', TRANSPORT, str(ROOT / 'broker.sock')],
+    result = subprocess.run(['runuser', '-u', 'relaydeck', '--', 'python3', '-c', TRANSPORT, str(ROOT / ('renew.sock' if op=='renew' else 'broker.sock'))],
                             input=json.dumps(value), capture_output=True, text=True, check=True, timeout=45)
     reply = json.loads(result.stdout)
     if success:
         assert reply['error'] is None, reply
+    if reply['error'] is None:
+        with LEASE_LOCK:
+            if op=='apply': LEASES[data['owner_id']]=data['revision']
+            if op=='stop': LEASES.pop(data,None)
     return reply
+
+
+def renew_loop(stopping):
+    while not stopping.wait(2):
+        with LEASE_LOCK: revisions=list(LEASES.items())
+        try: request('renew',revisions)
+        except Exception: pass  # Broker restart is intentionally exercised.
 
 
 def plan(owner, revision=1, target='8.8.43.20', ports=None):
@@ -99,11 +114,14 @@ class Recovery(unittest.TestCase):
             raise RuntimeError('Launch the isolated container with --sysctl net.ipv4.ip_local_reserved_ports=41000-41019')
         policy = json.loads(pathlib.Path('/fixture/deploy/broker.example.json').read_text())
         policy.update(database=str(ROOT / 'data.db'), web_uid=1100, web_gid=1100, runtime_dir=str(ROOT / 'runtime'),
-                      socket_path=str(ROOT / 'broker.sock'), allowed_port_start=41000, allowed_port_end=41019,
+                      socket_path=str(ROOT / 'broker.sock'), uid_start=62000, allowed_port_start=41000, allowed_port_end=41019,
                       authorization_ttl_secs=30)
         (ROOT / 'policy.json').write_text(json.dumps(policy))
         cls.log = (ROOT / 'broker.log').open('ab')
         cls.start()
+        cls.renewal_stop=threading.Event()
+        cls.renewal=threading.Thread(target=renew_loop,args=(cls.renewal_stop,),daemon=True)
+        cls.renewal.start()
 
     @classmethod
     def start(cls):
@@ -117,6 +135,7 @@ class Recovery(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        cls.renewal_stop.set();cls.renewal.join(timeout=45)
         cls.broker.send_signal(signal.SIGTERM)
         cls.broker.wait(timeout=30)
         cls.log.close()
@@ -136,6 +155,23 @@ class Recovery(unittest.TestCase):
         other = connection(41010)
         self.addCleanup(other.close)
         parent = pid(1)
+        # One crashed rule cannot close its siblings' established connections.
+        children=pathlib.Path(f'/proc/{parent}/task/{parent}/children').read_text().split()
+        victim=next(int(child) for child in children if b'rule-100.json' in pathlib.Path(f'/proc/{child}/cmdline').read_bytes())
+        os.kill(victim,signal.SIGKILL)
+        for _ in range(20):
+            echo(stable);echo(other);time.sleep(.2)
+        self.assertEqual(parent,pid(1))
+        with connection(41000) as recovered: echo(recovered)
+        # A host listener racing with a new rule leaves existing rules alive.
+        occupied=socket.socket();occupied.bind(('0.0.0.0',41002));occupied.listen()
+        try:
+            request('apply',plan(1,2,ports=[41000,41001,41002]))
+            states=request('rules',[1])['rules']
+            self.assertFalse(next(row['active'] for row in states if row['rule_id']==102))
+            self.assertTrue(next(row['active'] for row in states if row['rule_id']==101))
+            echo(stable);echo(other)
+        finally: occupied.close()
         request('apply', plan(1, 2, '8.8.43.21'))
         self.assertEqual(parent, pid(1))
         udp_echo(41000)
@@ -174,10 +210,14 @@ class Recovery(unittest.TestCase):
         IP.unlink()
         IP.with_name('ip.qa-original').rename(IP)
         SYSTEMCTL.rename(SYSTEMCTL.with_name('systemctl.qa-original'))
-        SYSTEMCTL.write_text('#!/bin/sh\nif [ "$1" = stop ] && [ "$2" = relaydeck-owner-1.service ]; then exit 1; fi\nexec /usr/bin/systemctl.qa-original "$@"\n')
+        SYSTEMCTL.write_text('#!/bin/sh\nif [ "$1" = stop ] && [ "$2" = relaydeck-owner-1.service ]; then sleep 5; exit 1; fi\nexec /usr/bin/systemctl.qa-original "$@"\n')
         SYSTEMCTL.chmod(0o755)
         reply = request('stop', 1, success=False)
         self.assertTrue(reply['retryable'])
+        # Keep the main broker loop occupied beyond the 30-second lease.
+        until=time.monotonic()+33
+        while time.monotonic()<until:
+            request('stop',1,success=False);echo(other)
         self.assertIsNone(self.broker.poll())
         echo(other)
         # Restart still serves owner 2 even when owner 1 cleanup fails.
@@ -193,6 +233,7 @@ class Recovery(unittest.TestCase):
         with connection(41000) as resumed:
             echo(resumed)
         # Independent authorization expiration can recover the same revision.
+        with LEASE_LOCK: LEASES.pop(1,None)
         time.sleep(32)
         request('apply', plan(1, 5, '8.8.43.21'))
         with connection(41001) as resumed:

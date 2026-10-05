@@ -420,6 +420,9 @@ async fn runtime_reports_only_current_confirmed_revision_and_scopes_retries() {
         .execute(&f.state.pool)
         .await
         .unwrap();
+    let (_, _, unobserved) = call(&f.app, "GET", "/api/rules", None, Some(&alice), false).await;
+    assert_eq!(unobserved[0]["runtime_status"], "pending");
+    sqlx::query("INSERT INTO rule_runtime_states SELECT r.id,u.desired_revision,1,unixepoch() FROM rules r JOIN users u ON u.id=r.owner_id WHERE u.id=?").bind(owner).execute(&f.state.pool).await.unwrap();
     let (_, _, rules) = call(&f.app, "GET", "/api/rules", None, Some(&alice), false).await;
     assert_eq!(rules[0]["runtime_status"], "active");
     sqlx::query("UPDATE apply_jobs SET status='applied' WHERE owner_id=?")
@@ -2057,6 +2060,7 @@ async fn connectivity_is_scoped_csrf_protected_bounded_and_rejects_stale_rules()
         .unwrap();
     sqlx::query("INSERT INTO runtime_states(owner_id,revision,status,updated_at) SELECT id,desired_revision,'active',unixepoch() FROM users WHERE id=?").bind(owner).execute(&f.state.pool).await.unwrap();
     sqlx::query("INSERT INTO executor_status(id,last_seen,status) VALUES(1,unixepoch(),'running') ON CONFLICT(id) DO UPDATE SET last_seen=excluded.last_seen,status=excluded.status").execute(&f.state.pool).await.unwrap();
+    sqlx::query("INSERT INTO rule_runtime_states SELECT r.id,u.desired_revision,1,unixepoch() FROM rules r JOIN users u ON u.id=r.owner_id WHERE u.id=?").bind(owner).execute(&f.state.pool).await.unwrap();
     let (status, _, result) = call(&f.app, "POST", &path, None, Some(&alice), true).await;
     assert_eq!(status, StatusCode::OK, "{result}");
     assert_eq!(result["target_tcp"]["status"], "timeout");
@@ -2780,4 +2784,87 @@ async fn configured_capacity_and_per_account_rules_do_not_have_global_mvp_ceilin
         .await
         .unwrap();
     assert_eq!(slot, 13);
+}
+
+#[tokio::test]
+async fn individual_rule_failure_does_not_misreport_healthy_siblings_or_accept_stale_events() {
+    let f = Fixture::new().await;
+    let (_, _, a) = call(
+        &f.app,
+        "POST",
+        "/api/rules",
+        Some(rule(46211)),
+        Some(&f.admin),
+        true,
+    )
+    .await;
+    let (_, _, b) = call(
+        &f.app,
+        "POST",
+        "/api/rules",
+        Some(rule(46212)),
+        Some(&f.admin),
+        true,
+    )
+    .await;
+    sqlx::query("UPDATE users SET applied_revision=desired_revision WHERE id=1")
+        .execute(&f.state.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO runtime_states(owner_id,revision,status,updated_at) SELECT id,desired_revision,'active',? FROM users WHERE id=1").bind(relaydeck::db::now()).execute(&f.state.pool).await.unwrap();
+    sqlx::query("INSERT INTO executor_status VALUES(1,?,'running')")
+        .bind(relaydeck::db::now())
+        .execute(&f.state.pool)
+        .await
+        .unwrap();
+    let revision: i64 = sqlx::query_scalar("SELECT desired_revision FROM users WHERE id=1")
+        .fetch_one(&f.state.pool)
+        .await
+        .unwrap();
+    let report = |id, revision, active| relaydeck::broker::RuleStatus {
+        owner: 1,
+        rule_id: id,
+        revision,
+        active,
+        observed_at: relaydeck::db::now(),
+    };
+    relaydeck::worker::record_rule_states(
+        &f.state.pool,
+        &[
+            report(a["id"].as_i64().unwrap(), revision, false),
+            report(b["id"].as_i64().unwrap(), revision, true),
+        ],
+    )
+    .await
+    .unwrap();
+    relaydeck::worker::record_rule_states(
+        &f.state.pool,
+        &[report(a["id"].as_i64().unwrap(), revision - 1, true)],
+    )
+    .await
+    .unwrap();
+    let (_, _, rules) = call(&f.app, "GET", "/api/rules", None, Some(&f.admin), false).await;
+    let rules = rules.as_array().unwrap();
+    assert_eq!(
+        rules.iter().find(|r| r["id"] == a["id"]).unwrap()["runtime_status"],
+        "failed"
+    );
+    assert_eq!(
+        rules.iter().find(|r| r["id"] == b["id"]).unwrap()["runtime_status"],
+        "active"
+    );
+    sqlx::query("UPDATE apply_jobs SET status='applied' WHERE owner_id=1")
+        .execute(&f.state.pool)
+        .await
+        .unwrap();
+    let (status, _, value) = call(
+        &f.app,
+        "POST",
+        "/api/users/1/apply",
+        None,
+        Some(&f.admin),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{value}");
 }

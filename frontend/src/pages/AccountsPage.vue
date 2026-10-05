@@ -44,10 +44,11 @@ const drawerUserId = computed(() => (route.name === 'account' ? Number(route.par
     <div class="flex flex-wrap items-end justify-between gap-4">
       <div>
         <h1 class="page-title">账户</h1>
-        <p class="mt-1 text-muted tabular">{{ users.isLoading.value ? '' : (maximum === null ? tenants.length + ' 个租户' : tenants.length + ' / ' + maximum + ' 个租户') }}</p>
+        <p class="mt-1 text-muted tabular">{{ users.isLoading.value || !capacity.isSuccess.value ? '' : (maximum === null ? tenants.length + ' 个租户' : tenants.length + ' / ' + maximum + ' 个租户') }}</p>
       </div>
-      <RouterLink v-if="(maximum === null || tenants.length < maximum)" to="/accounts/new" class="btn btn-primary"><Plus class="size-4" />新建账户</RouterLink>
-      <span v-else class="text-sm text-muted">租户已满</span>
+      <RouterLink v-if="capacity.isSuccess.value && (maximum === null || tenants.length < maximum)" to="/accounts/new" class="btn btn-primary"><Plus class="size-4" />新建账户</RouterLink>
+      <span v-else-if="capacity.isSuccess.value" class="text-sm text-muted">租户已满</span>
+      <button v-else-if="capacity.isError.value" class="btn btn-secondary" @click="capacity.refetch()">重试额度</button>
     </div>
 
     <section class="mt-6" aria-label="账户列表">
