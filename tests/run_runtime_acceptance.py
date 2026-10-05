@@ -45,7 +45,7 @@ CMD ["/sbin/init"]
         try:
             run('docker','build','-q','-t',image,str(work))
             run('docker','network','create','--internal','--subnet','8.8.43.0/24',network)
-            run('docker','run','-d','--name',host,'--privileged','--cgroupns=private','--volume','/sys/fs/cgroup:/sys/fs/cgroup:rw','--tmpfs','/run','--tmpfs','/run/lock','--network',network,'--ip','8.8.43.10','--sysctl','net.ipv4.ip_local_reserved_ports=41000-41019','--volume',str(SOURCE)+':/fixture:ro',image)
+            run('docker','run','-d','--name',host,'--privileged','--cgroupns=private','--tty','--env','SYSTEMD_LOG_TARGET=console','--tmpfs','/run','--tmpfs','/run/lock','--network',network,'--ip','8.8.43.10','--sysctl','net.ipv4.ip_local_reserved_ports=41000-41019','--volume',str(SOURCE)+':/fixture:ro',image)
             run('docker','run','-d','--name',peer,'--cap-add','NET_ADMIN','--network',network,'--ip','8.8.43.20',image,'sleep','infinity')
             run('docker','exec',peer,'ip','addr','add','8.8.43.21/24','dev','eth0')
             echo="""import socket,threading

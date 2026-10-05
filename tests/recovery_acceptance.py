@@ -40,6 +40,7 @@ class RecoveryBundle(unittest.TestCase):
                 subprocess.run(['runuser','-u','relaydeck','--','python3','-c',code,str(database),sql],check=True)
             db("INSERT INTO users(id,username,password_hash,role,port_start,port_end,max_rules,created_at) VALUES(1,'owner','hash','admin',1024,65535,10,1);")
             snapshot=state / 'backups/update-12345'
+            db("INSERT INTO sessions(token_hash,user_id,csrf_token,auth_version,expires_at,created_at) VALUES('old-session',1,'old-csrf',1,9999999999,1)")
             manage.as_web(manage.BIN,'backup',str(snapshot))
             key=(state / 'secrets/mfa.key').read_bytes()
             # Create a valid initial ledger, then add usage that exists only in
@@ -64,8 +65,9 @@ class RecoveryBundle(unittest.TestCase):
             self.assertEqual(saved['accounts']['1']['incoming'],456)
             db("UPDATE users SET username='changed'")
             (state / 'secrets/mfa.key').write_bytes(b'a'*64)
-            manage.restore_recovery(bundle)
+            manage.restore_recovery(bundle, revoke_sessions=True)
             with sqlite3.connect(database) as connection: self.assertEqual(connection.execute('SELECT username FROM users').fetchone()[0],'owner')
+            with sqlite3.connect(database) as connection: self.assertEqual(connection.execute('SELECT COUNT(*) FROM sessions').fetchone()[0],0)
             self.assertEqual((state / 'secrets/mfa.key').read_bytes(),key)
             self.assertEqual((state / 'secrets/mfa.key').stat().st_uid,1100)
             self.assertEqual((state / 'secrets/mfa.key').stat().st_mode & 0o777,0o600)

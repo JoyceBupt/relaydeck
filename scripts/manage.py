@@ -751,7 +751,7 @@ def verify_recovery(path):
     return manifest
 
 
-def restore_recovery(path):
+def restore_recovery(path, revoke_sessions=False):
     path=pathlib.Path(path)
     manifest=verify_recovery(path)
     # Parsing/overwriting application files remains unprivileged. Input is an
@@ -762,7 +762,9 @@ with tempfile.NamedTemporaryFile(dir=sys.argv[1]) as f:
  shutil.copyfileobj(sys.stdin.buffer,f);f.flush()
  s=sqlite3.connect('file:'+quote(f.name)+'?mode=ro',uri=True)
  assert s.execute('PRAGMA quick_check').fetchone()[0]=='ok'
- d=sqlite3.connect(os.path.join(sys.argv[1],'relaydeck.db'));s.backup(d);d.close();s.close()
+ d=sqlite3.connect(os.path.join(sys.argv[1],'relaydeck.db'));s.backup(d)
+ if sys.argv[2]=='1': d.execute('DELETE FROM sessions');d.commit()
+ d.close();s.close()
 """
     keyscript="""import os,sys,tempfile
 value=sys.stdin.buffer.read(66);assert len(value) in (64,65) and (len(value)==64 or value[-1:]==bytes([10])) and len(bytes.fromhex(value.decode().strip()))==32
@@ -772,7 +774,7 @@ os.replace(name,os.path.join(sys.argv[1],'mfa.key'))
 """
     for name,script,directory in (('relaydeck.db',dbscript,'data'),('mfa.key',keyscript,'secrets')):
         with (path / name).open('rb') as source:
-            subprocess.run(['runuser','-u','relaydeck','--','python3','-c',script,str(STATE / directory)],stdin=source,env=SAFE_ENV,check=True)
+            subprocess.run(['runuser','-u','relaydeck','--','python3','-c',script,str(STATE / directory),'1' if revoke_sessions else '0'],stdin=source,env=SAFE_ENV,check=True)
     for name in ('traffic-ledger.json','traffic-subscriptions.json'):
         atomic_copy(path / name,STATE / 'runtime' / name,0o600)
     # All managed tenants are stopped; stale kernel counters must not override
@@ -827,7 +829,7 @@ def restore(args):
                 'installation':json.loads((CONFIG / 'installation.json').read_text()),'broker_policy':json.loads((CONFIG / 'broker.json').read_text())}
         atomic_json(TRANSACTION,record)
         try:
-            restore_recovery(selected)
+            restore_recovery(selected, revoke_sessions=True)
             release=pathlib.Path(manifest['release'])
             atomic_copy(release / 'bin/relaydeck',BIN)
             current_link(release); management_tools(release)
