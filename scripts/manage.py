@@ -655,7 +655,7 @@ def copy_web_snapshot(source, destination):
         output.flush(); os.fsync(output.fileno())
 
 
-def forwarding_baseline(backup):
+def forwarding_baseline(backup, ledger):
     # Schema inspection and SQLite parsing always happen as the web identity.
     script = """import json,sqlite3,sys
 from urllib.parse import quote
@@ -665,13 +665,22 @@ extra=''
 if 'traffic_blocked' in cols('users'): extra+=' AND u.traffic_blocked=0'
 if 'dns_blocked' in cols('rules'): extra+=' AND r.dns_blocked=0'
 if s.execute("SELECT 1 FROM sqlite_master WHERE name='rule_runtime_states'").fetchone(): extra+=" AND EXISTS(SELECT 1 FROM rule_runtime_states rs WHERE rs.rule_id=r.id AND rs.revision=s.revision AND rs.active=1)"
-rows=s.execute("SELECT r.id,r.owner_id,u.expires_at FROM rules r JOIN users u ON u.id=r.owner_id JOIN runtime_states s ON s.owner_id=u.id WHERE r.deleted_at IS NULL AND r.enabled=1 AND u.enabled=1 AND s.status='active' AND s.revision=u.desired_revision AND u.applied_revision=u.desired_revision"+extra).fetchall()
+slot='COALESCE(u.runtime_slot,u.id)' if 'runtime_slot' in cols('users') else 'u.id'
+rows=s.execute("SELECT r.id,r.owner_id,u.expires_at,"+slot+" FROM rules r JOIN users u ON u.id=r.owner_id JOIN runtime_states s ON s.owner_id=u.id WHERE r.deleted_at IS NULL AND r.enabled=1 AND u.enabled=1 AND s.status='active' AND s.revision=u.desired_revision AND u.applied_revision=u.desired_revision"+extra).fetchall()
 print(json.dumps(rows))
 """
     value = json.loads(run('runuser','-u','relaydeck','--','python3','-c',script,str(backup / 'relaydeck.db'),capture=True))
-    if not isinstance(value,list) or any(not isinstance(row,list) or len(row)!=3 or any(type(v) is not int or v<=0 for v in row[:2]) or row[2] is not None and type(row[2]) is not int for row in value):
+    if not isinstance(value,list) or any(not isinstance(row,list) or len(row)!=4 or any(type(v) is not int or v<=0 for v in (row[0],row[1],row[3])) or row[2] is not None and type(row[2]) is not int for row in value):
         raise ValueError('Invalid forwarding recovery baseline')
-    return value
+    blocked=set()
+    for slot,account in ledger['accounts'].items():
+        budget=account['budget'];limit=budget['limit_bytes'];mode=budget['mode']
+        incoming=account['incoming'];outgoing=account['outgoing']
+        used=max(account['charged'], incoming+outgoing if mode=='both' else incoming if mode=='ingress' else outgoing)
+        if limit is not None and used>=limit: blocked.add(int(slot))
+    # Kernel quotas may have been exhausted just before the broker stopped,
+    # before the worker recorded the blocked flag in the database snapshot.
+    return [row[:3] for row in value if row[3] not in blocked]
 
 
 def complete_recovery(record, binary=BIN):
@@ -699,7 +708,7 @@ def complete_recovery(record, binary=BIN):
                 root_path(source); atomic_copy(source,stage / name,0o600)
         previous=pathlib.Path(record['previous'])
         root_path(previous)
-        manifest={'version':1,'release':str(previous),'release_sha256':digest(previous / 'release.json'),'forwarding':forwarding_baseline(backup),
+        manifest={'version':1,'release':str(previous),'release_sha256':digest(previous / 'release.json'),'forwarding':forwarding_baseline(backup,json.loads((stage / 'traffic-subscriptions.json').read_text())),
                   'files':{p.name:digest(p) for p in stage.iterdir()}}
         atomic_json(stage / 'manifest.json',manifest)
         # Publish only a complete, fsynced root-owned recovery bundle.

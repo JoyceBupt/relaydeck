@@ -290,3 +290,13 @@ class IdentityCapacity(unittest.TestCase):
             manage.provision_identities({'uid_start':62000,'max_owners':21},12)
             self.assertEqual(run.call_count,20)
             self.assertIn('relaydeck-runner-21',run.call_args.args)
+
+
+class ForwardingRecoveryBaseline(unittest.TestCase):
+    def test_final_root_quota_exhaustion_is_not_mistaken_for_an_upgrade_regression(self):
+        ledger={'accounts':{'7':{'budget':{'limit_bytes':100,'mode':'both'},'incoming':60,'outgoing':40,'charged':90}}}
+        with patch.object(manage,'run',return_value='[[91,41,null,7],[92,42,null,8]]'):
+            self.assertEqual(manage.forwarding_baseline(pathlib.Path('/unused'),ledger),[[92,42,None]])
+        ledger['accounts']['7']['budget']['mode']='ingress'
+        with patch.object(manage,'run',return_value='[[91,41,null,7]]'):
+            self.assertEqual(manage.forwarding_baseline(pathlib.Path('/unused'),ledger),[[91,41,None]])
