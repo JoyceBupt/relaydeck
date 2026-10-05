@@ -205,7 +205,7 @@ class PanelOrigin(unittest.TestCase):
                                     ('manage_lock', nullcontext), ('prepare', prepare_release),
                                     ('reserve_forwarding_ports', lambda policy: calls.append(policy.copy()) or {}),
                                     ('ensure_upgrade_policy', lambda: None), ('management_tools', lambda _: None),
-                                    ('current_link', lambda _: None), ('as_web', lambda *_: None),
+                                    ('current_link', lambda _: None), ('as_web', lambda *_: None), ('complete_recovery', lambda *_: None),
                                     ('atomic_json', lambda path, value, mode=0o600: path.write_text(json.dumps(value))),
                                     ('atomic_copy', lambda *_: None), ('run', lambda *_: None), ('wait_health', lambda _: None)]:
                     patches.enter_context(patch.object(manage, name, value))
@@ -268,6 +268,36 @@ class SharedPortDeployment(unittest.TestCase):
                                         'installation':{'units':{}}, 'broker_policy':policy})
             self.assertEqual(json.loads((config / 'broker.json').read_text()), policy)
             self.assertFalse(transaction.exists())
+
+
+
+
+class IdentityCapacity(unittest.TestCase):
+    def test_capacity_preflights_all_collisions_before_creating_any_identity(self):
+        account = SimpleNamespace(pw_name='unrelated', pw_uid=62012, pw_gid=62012, pw_dir='/nonexistent', pw_shell='/usr/sbin/nologin')
+        def lookup(uid):
+            if uid == 62012: return account
+            raise KeyError(uid)
+        with patch.object(manage.pwd, 'getpwuid', side_effect=lookup), patch.object(manage.pwd, 'getpwnam', side_effect=KeyError), patch.object(manage.grp, 'getgrgid', side_effect=KeyError), patch.object(manage.grp, 'getgrnam', side_effect=KeyError), patch.object(manage, 'run') as run:
+            with self.assertRaisesRegex(ValueError, 'collision'):
+                manage.provision_identities({'uid_start':62000,'max_owners':20},12)
+            run.assert_not_called()
+
+    def test_capacity_can_expand_beyond_original_eleven_identities(self):
+        with patch.object(manage.pwd, 'getpwuid', side_effect=KeyError), patch.object(manage.pwd, 'getpwnam', side_effect=KeyError), patch.object(manage.grp, 'getgrgid', side_effect=KeyError), patch.object(manage.grp, 'getgrnam', side_effect=KeyError), patch.object(manage, 'run') as run:
+            manage.provision_identities({'uid_start':62000,'max_owners':21},12)
+            self.assertEqual(run.call_count,20)
+            self.assertIn('relaydeck-runner-21',run.call_args.args)
+
+
+class ForwardingRecoveryBaseline(unittest.TestCase):
+    def test_final_root_quota_exhaustion_is_not_mistaken_for_an_upgrade_regression(self):
+        ledger={'accounts':{'7':{'budget':{'limit_bytes':100,'mode':'both'},'incoming':60,'outgoing':40,'charged':90}}}
+        with patch.object(manage,'run',return_value='[[91,41,null,7],[92,42,null,8]]'):
+            self.assertEqual(manage.forwarding_baseline(pathlib.Path('/unused'),ledger),[[92,42,None]])
+        ledger['accounts']['7']['budget']['mode']='ingress'
+        with patch.object(manage,'run',return_value='[[91,41,null,7]]'):
+            self.assertEqual(manage.forwarding_baseline(pathlib.Path('/unused'),ledger),[[91,41,None]])
 
 
 if __name__ == '__main__':

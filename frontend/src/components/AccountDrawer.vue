@@ -2,7 +2,8 @@
 import { computed, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useMutation } from '@tanstack/vue-query'
-import { ArrowRightLeft, Copy, KeyRound, RotateCw, RefreshCw, ShieldCheck } from '@lucide/vue'
+import { useIntervalFn } from '@vueuse/core'
+import { ArrowRightLeft, Copy, KeyRound, RotateCw, RefreshCw, ShieldCheck, Trash2, CalendarPlus } from '@lucide/vue'
 import SideDrawer from './SideDrawer.vue'
 import PortRuler from './PortRuler.vue'
 import TrafficSummary from './TrafficSummary.vue'
@@ -14,7 +15,7 @@ import { api } from '../api/endpoints'
 import { errorMessage, isStaleError } from '../api/client'
 import type { Rule, TrafficMode, User } from '../types'
 import { afterRuleChange, usePorts, useRetry, useTraffic } from '../lib/queries'
-import { dateInputValue, expiry, expiryFromDateInput, nowSeconds } from '../lib/format'
+import { dateTime, expiry } from '../lib/format'
 import { validatePassword, validateUsername } from '../lib/validation'
 import { generatePassword } from '../lib/password'
 import { toast } from '../lib/toast'
@@ -22,6 +23,8 @@ import { toast } from '../lib/toast'
 const props = defineProps<{ open: boolean; userId: number | null; users: User[]; rules: Rule[]; loaded: boolean }>()
 const emit = defineEmits<{ close: [] }>()
 const router = useRouter()
+const timestamp = ref(Math.floor(Date.now() / 1000))
+useIntervalFn(() => { timestamp.value = Math.floor(Date.now() / 1000) }, 1000)
 
 const user = computed(() => (props.userId === null ? null : props.users.find(item => item.id === props.userId) ?? null))
 const isNew = computed(() => props.userId === null)
@@ -31,8 +34,8 @@ const statuses = computed(() => Object.fromEntries(props.rules.map(rule => [rule
 const ownRules = computed(() => props.rules.filter(rule => rule.owner_id === props.userId))
 const failed = computed(() => ownRules.value.filter(rule => rule.runtime_status === 'failed'))
 
-interface FormState { username: string; password: string; enabled: boolean; max_rules: number | null; expires: string; traffic_unlimited: boolean; traffic_amount: number | null; traffic_unit: 'GB' | 'TB'; traffic_mode: TrafficMode }
-const form = reactive<FormState>({ username: '', password: '', enabled: true, max_rules: 10, expires: '', traffic_unlimited: false, traffic_amount: 100, traffic_unit: 'GB', traffic_mode: 'both' })
+interface FormState { username: string; password: string; enabled: boolean; max_rules: number | null; traffic_unlimited: boolean; traffic_amount: number | null; traffic_unit: 'GB' | 'TB'; traffic_mode: TrafficMode }
+const form = reactive<FormState>({ username: '', password: '', enabled: true, max_rules: 10, traffic_unlimited: false, traffic_amount: 100, traffic_unit: 'GB', traffic_mode: 'both' })
 const baseline = ref('')
 const initializedFor = ref<string | null>(null)
 const submitted = ref(false)
@@ -47,9 +50,9 @@ function load() {
   if (user.value) {
     const budget = user.value.traffic
     const unit = budget?.limit_bytes && budget.limit_bytes >= trafficFactors.TB ? 'TB' : 'GB'
-    Object.assign(form, { username: user.value.username, password: '', enabled: user.value.enabled, max_rules: user.value.max_rules, expires: dateInputValue(user.value.expires_at), traffic_unlimited: budget?.limit_bytes == null, traffic_amount: budget?.limit_bytes ? budget.limit_bytes / trafficFactors[unit] : 100, traffic_unit: unit, traffic_mode: budget?.mode ?? 'both' })
+    Object.assign(form, { username: user.value.username, password: '', enabled: user.value.enabled, max_rules: user.value.max_rules, traffic_unlimited: budget?.limit_bytes == null, traffic_amount: budget?.limit_bytes ? budget.limit_bytes / trafficFactors[unit] : 100, traffic_unit: unit, traffic_mode: budget?.mode ?? 'both' })
   } else {
-    Object.assign(form, { username: '', password: generatePassword(), enabled: true, max_rules: 10, expires: '', traffic_unlimited: false, traffic_amount: 100, traffic_unit: 'GB', traffic_mode: 'both' })
+    Object.assign(form, { username: '', password: generatePassword(), enabled: true, max_rules: 10, traffic_unlimited: false, traffic_amount: 100, traffic_unit: 'GB', traffic_mode: 'both' })
   }
   submitted.value = false
   serverError.value = ''
@@ -66,14 +69,12 @@ function setTrafficUnit(event: Event) {
 }
 
 const errors = computed(() => {
-  const expiresAt = expiryFromDateInput(form.expires)
   const bytes = trafficBytes(form.traffic_amount, form.traffic_unit)
   return {
     traffic: !form.traffic_unlimited && (bytes === null || bytes < 1 || bytes > 1_000_000_000_000_000) ? '额度须为 1 字节至 1000 TB' : '',
     username: isNew.value ? validateUsername(form.username) : '',
     password: isNew.value ? validatePassword(form.password) : '',
     maxRules: form.max_rules === null || !Number.isInteger(form.max_rules) || form.max_rules < 0 || form.max_rules > 30 ? '范围 0–30' : '',
-    expires: form.enabled && expiresAt !== null && expiresAt <= nowSeconds() ? '须晚于今天' : '',
   }
 })
 const valid = computed(() => Object.values(errors.value).every(message => !message))
@@ -86,7 +87,7 @@ const affected = computed(() => {
 
 const save = useMutation({
   mutationFn: () => {
-    const grant = { max_rules: form.max_rules!, expires_at: expiryFromDateInput(form.expires), traffic: { limit_bytes: form.traffic_unlimited ? null : trafficBytes(form.traffic_amount, form.traffic_unit), mode: form.traffic_mode } }
+    const grant = { max_rules: form.max_rules!, expires_at: user.value?.expires_at ?? null, traffic: { limit_bytes: form.traffic_unlimited ? null : trafficBytes(form.traffic_amount, form.traffic_unit), mode: form.traffic_mode } }
     return isNew.value
       ? api.createUser({ username: form.username.trim(), password: form.password, ...grant })
       : api.updateUser(props.userId!, { enabled: form.enabled, ...grant })
@@ -139,7 +140,39 @@ function requestClose() { guard(() => emit('close')) }
 function onBeforeClose(event: Event) { if (dirty.value) { event.preventDefault(); requestClose() } }
 function discard() { confirmDiscard.value = false; baseline.value = snapshot(); pending?.(); pending = null }
 
-const expiryInfo = computed(() => (user.value ? expiry(user.value.expires_at) : null))
+const deleting = computed(() => user.value?.deletion_requested_at != null)
+const canRenew = computed(() => user.value?.role === 'user' && !deleting.value && user.value.expires_at !== null && user.value.expires_at <= timestamp.value)
+const deleteOpen = ref(false)
+const renewOpen = ref(false)
+const actionError = ref('')
+const remove = useMutation({ mutationFn: (id: number) => api.deleteUser(id), onSettled: afterRuleChange })
+const renew = useMutation({ mutationFn: (target: User) => api.renewUser(target.id, target.subscription_id), onSettled: afterRuleChange })
+function openDelete() { guard(() => { actionError.value = ''; deleteOpen.value = true }) }
+function openRenew() { guard(() => { actionError.value = ''; renewOpen.value = true }) }
+async function confirmDelete() {
+  const target = user.value
+  if (!target || remove.isPending.value) return
+  try {
+    await remove.mutateAsync(target.id)
+    deleteOpen.value = false
+    baseline.value = snapshot()
+    toast('已提交删除')
+    emit('close')
+  } catch (error) { if (!isStaleError(error)) actionError.value = errorMessage(error) }
+}
+async function confirmRenew() {
+  const target = user.value
+  if (!target || renew.isPending.value) return
+  try {
+    await renew.mutateAsync(target)
+    renewOpen.value = false
+    initializedFor.value = null
+    load()
+    toast('已续订30天')
+  } catch (error) { if (!isStaleError(error)) actionError.value = errorMessage(error) }
+}
+
+const expiryInfo = computed(() => (user.value ? expiry(user.value.expires_at, timestamp.value) : null))
 </script>
 
 <template>
@@ -148,11 +181,13 @@ const expiryInfo = computed(() => (user.value ? expiry(user.value.expires_at) : 
     <div v-else class="grid gap-6">
       <section v-if="user" class="grid gap-3">
         <div class="flex flex-wrap gap-1.5">
-          <span class="chip" :class="user.enabled ? 'chip-green' : ''">{{ user.enabled ? '已启用' : '已停用' }}</span>
+          <span v-if="deleting" class="chip chip-amber" role="status">{{ user.deletion_error ? '删除待重试' : '删除中' }}</span>
+          <span v-else class="chip" :class="user.enabled ? 'chip-green' : ''">{{ user.enabled ? '已启用' : '已停用' }}</span>
           <span v-if="expiryInfo" class="chip" :class="expiryInfo.tone === 'soon' ? 'chip-amber' : expiryInfo.tone === 'expired' ? 'chip-red' : ''">{{ expiryInfo.text }}</span>
           <span class="chip" :class="user.mfa_enabled ? 'chip-blue' : ''"><ShieldCheck class="size-3" />{{ user.mfa_enabled ? '两步验证' : '无两步验证' }}</span>
           <span v-if="user.must_change_password" class="chip chip-violet">未改初始密码</span>
         </div>
+        <p v-if="user.deletion_error" class="field-error" role="alert">{{ user.deletion_error }}</p>
         <div v-if="failed.length" class="grid gap-1">
           <div class="flex min-h-8 items-center gap-2">
             <StatusMark status="failed" />
@@ -163,11 +198,12 @@ const expiryInfo = computed(() => (user.value ? expiry(user.value.expires_at) : 
         </div>
         <div class="flex flex-wrap gap-2">
           <RouterLink :to="{ path: '/rules', query: { owner: String(user.id) } }" class="btn btn-secondary btn-sm"><ArrowRightLeft class="size-4" />查看 {{ user.rule_count }} 条转发</RouterLink>
-          <button v-if="user?.role !== 'admin'" type="button" class="btn btn-secondary btn-sm" @click="openReset"><KeyRound class="size-4" />重置密码</button>
+          <button v-if="user?.role !== 'admin' && !deleting" type="button" class="btn btn-secondary btn-sm" @click="openReset"><KeyRound class="size-4" />重置密码</button>
         </div>
       </section>
 
       <form id="account-form" class="grid gap-5" novalidate @submit.prevent="submit">
+        <fieldset class="grid min-w-0 gap-5" :disabled="deleting || remove.isPending.value || renew.isPending.value">
         <template v-if="isNew">
           <label class="field">
             <span class="field-label">用户名</span>
@@ -191,26 +227,32 @@ const expiryInfo = computed(() => (user.value ? expiry(user.value.expires_at) : 
             <input v-model.number="form.max_rules" class="input input-mono" type="number" min="0" max="30" :aria-invalid="!!show('maxRules')" />
             <span v-if="show('maxRules')" class="field-error">{{ show('maxRules') }}</span>
           </label>
-          <div v-if="user?.role !== 'admin'" class="field">
-            <span class="flex items-baseline justify-between gap-2">
-              <label class="field-label" for="account-expiry">到期日</label>
-              <button v-if="form.expires" type="button" class="text-xs text-accent hover:underline" @click="form.expires = ''">清除</button>
-            </span>
-            <input id="account-expiry" v-model="form.expires" class="input" type="date" :aria-invalid="!!show('expires')" />
-            <span v-if="show('expires')" class="field-error">{{ show('expires') }}</span>
-            <span v-else-if="!form.expires" class="field-hint">留空为长期</span>
+          <div v-if="isNew" class="field">
+            <span class="field-label">订阅周期</span>
+            <span class="input flex items-center">30 天</span>
+            <span class="field-hint">创建时起算</span>
           </div>
         </div>
 
         <section class="grid gap-3" aria-label="流量额度">
           <div class="flex items-center justify-between gap-3"><span class="field-label">不限量</span><UiSwitch v-model="form.traffic_unlimited" label="不限流量" /></div>
           <div class="grid grid-cols-2 items-start gap-3">
-            <div class="field"><label class="field-label" for="account-traffic">流量额度</label><div class="flex gap-2"><input id="account-traffic" v-model.number="form.traffic_amount" class="input input-mono min-w-0" type="number" min="0.000000001" step="any" :disabled="form.traffic_unlimited" :aria-invalid="!!show('traffic')" /><select class="input !w-20 shrink-0" :value="form.traffic_unit" aria-label="流量单位" :disabled="form.traffic_unlimited" @change="setTrafficUnit"><option>GB</option><option>TB</option></select></div><span class="field-hint">每月重置</span></div>
+            <div class="field"><label class="field-label" for="account-traffic">流量额度</label><div class="flex gap-2"><input id="account-traffic" v-model.number="form.traffic_amount" class="input input-mono min-w-0" type="number" min="0.000000001" step="any" :disabled="form.traffic_unlimited" :aria-invalid="!!show('traffic')" /><select class="input !w-20 shrink-0" :value="form.traffic_unit" aria-label="流量单位" :disabled="form.traffic_unlimited" @change="setTrafficUnit"><option>GB</option><option>TB</option></select></div><span class="field-hint">续订时重置</span></div>
             <div class="field"><label class="field-label" for="account-traffic-mode">计量方向</label><select id="account-traffic-mode" v-model="form.traffic_mode" class="input" :disabled="form.traffic_unlimited"><option v-for="[value,label] in modeOptions" :key="value" :value="value">{{ label }}</option></select><span class="field-hint">客户端侧</span></div>
           </div>
           <p v-if="show('traffic')" class="field-error">{{ show('traffic') }}</p>
         </section>
-        <TrafficSummary v-if="user" class="border-t border-line pt-4" :traffic="traffic.data.value ?? user.traffic" :loading="traffic.isLoading.value" :error="traffic.isError.value" />
+        <section v-if="user?.role === 'user'" class="grid gap-3 border-t border-line pt-4" aria-label="订阅周期">
+          <div class="flex items-center justify-between gap-3">
+            <h3 class="field-label">订阅周期</h3>
+            <button v-if="canRenew" type="button" class="btn btn-secondary btn-sm" @click="openRenew"><CalendarPlus class="size-4" />续订</button>
+          </div>
+          <dl class="grid gap-2 text-sm">
+            <div class="flex flex-wrap justify-between gap-2"><dt class="text-muted">开始</dt><dd>{{ user.subscription_started_at ? dateTime(user.subscription_started_at) : '—' }}</dd></div>
+            <div class="flex flex-wrap justify-between gap-2"><dt class="text-muted">到期</dt><dd>{{ user.expires_at ? dateTime(user.expires_at) : '长期有效' }}</dd></div>
+          </dl>
+        </section>
+        <TrafficSummary v-if="user" :show-period="user.role !== 'user'" class="border-t border-line pt-4" :traffic="traffic.data.value ?? user.traffic" :loading="traffic.isLoading.value" :error="traffic.isError.value" />
 
         <div v-if="user && ports.data.value?.leases.length" class="field">
           <span class="field-label">已用端口</span>
@@ -228,18 +270,28 @@ const expiryInfo = computed(() => (user.value ? expiry(user.value.expires_at) : 
         <p v-if="affected > 0" class="text-xs text-warning" role="status">将停用 {{ affected }} 条超出授权的转发</p>
         <p v-if="!isNew && dirty" class="field-hint">保存后该账户需重新登录</p>
         <p v-if="serverError" class="field-error" role="alert">{{ serverError }}</p>
+        </fieldset>
       </form>
+      <div v-if="user?.role === 'user'" class="border-t border-line pt-4">
+        <button type="button" class="btn btn-danger" :disabled="save.isPending.value || remove.isPending.value || renew.isPending.value" @click="openDelete"><Trash2 class="size-4" />{{ deleting ? '重试删除' : '删除账户' }}</button>
+      </div>
     </div>
 
     <template v-if="!missing" #footer>
       <span v-if="dirty && !isNew" class="text-xs text-muted max-sm:hidden">未保存</span>
       <button type="button" class="btn btn-secondary ml-auto" @click="requestClose">取消</button>
-      <button type="submit" form="account-form" class="btn btn-primary" :disabled="save.isPending.value || (!isNew && !dirty)">
+      <button type="submit" form="account-form" class="btn btn-primary" :disabled="deleting || save.isPending.value || (!isNew && !dirty)">
         {{ save.isPending.value ? '保存中…' : isNew ? '创建' : '保存' }}
       </button>
     </template>
   </SideDrawer>
 
+  <ConfirmDialog :open="deleteOpen" :title="`删除 ${user?.username ?? ''}？`" description="账户及转发规则将永久删除。" confirm-label="删除" danger :busy="remove.isPending.value" @confirm="confirmDelete" @cancel="deleteOpen = false">
+    <p v-if="actionError" class="field-error mt-3" role="alert">{{ actionError }}</p>
+  </ConfirmDialog>
+  <ConfirmDialog :open="renewOpen" :title="`续订 ${user?.username ?? ''}？`" description="即日起30天，流量额度重置。" confirm-label="续订" :busy="renew.isPending.value" @confirm="confirmRenew" @cancel="renewOpen = false">
+    <p v-if="actionError" class="field-error mt-3" role="alert">{{ actionError }}</p>
+  </ConfirmDialog>
   <ConfirmDialog :open="resetOpen" :title="`重置 ${user?.username ?? ''} 的密码？`" description="该账户会被登出，用临时密码登录后须修改。" confirm-label="重置" :busy="reset.isPending.value" @confirm="confirmReset" @cancel="resetOpen = false">
     <div class="mt-4 field">
       <label class="field-label" for="reset-password">临时密码</label>

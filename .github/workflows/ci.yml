@@ -56,7 +56,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends wireguard-tools
           test_binary=$(./scripts/cargo.sh test --locked --test linux_contract --no-run --message-format=json | python3 -c 'import json,sys; items=[json.loads(line) for line in sys.stdin]; print(next(item["executable"] for item in items if item.get("reason") == "compiler-artifact" and item.get("executable") and item["target"]["name"] == "linux_contract"))')
           sudo "$test_binary" wireguard_kernel_forwarding_preserves_target_isolation --ignored --exact --test-threads=1
-      - name: Linux monthly quota enforcement acceptance
+      - name: Linux subscription quota enforcement acceptance
         if: matrix.os == 'ubuntu-24.04'
         run: |
           test_binary=$(./scripts/cargo.sh test --locked --test traffic --no-run --message-format=json | python3 -c 'import json,sys; items=[json.loads(line) for line in sys.stdin]; print(next(item["executable"] for item in items if item.get("reason") == "compiler-artifact" and item.get("executable") and item["target"]["name"] == "traffic"))')
@@ -65,5 +65,12 @@ jobs:
         if: matrix.os == 'ubuntu-24.04'
         run: |
           sudo env PYTHONDONTWRITEBYTECODE=1 RELAYDECK_POLICY_TEST=1 RELAYDECK_SYSTEMD_TEST=1 RELAYDECK_TEST_BINARY="$PWD/target/debug/relaydeck" python3 tests/frontend_preparation.py -v
+      - name: Isolated systemd failure and full recovery acceptance
+        if: matrix.os == 'ubuntu-24.04'
+        # Match the libc used by the runner-built debug executable. Release
+        # binaries and local acceptance retain the Debian 12 build baseline.
+        env:
+          RELAYDECK_RUNTIME_IMAGE: ubuntu:24.04
+        run: PYTHONDONTWRITEBYTECODE=1 python3 tests/run_runtime_acceptance.py
       - name: Release validation tests
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py' -v

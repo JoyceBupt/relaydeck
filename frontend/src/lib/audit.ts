@@ -23,6 +23,9 @@ const phrases: Record<string, { verb: string; category: AuditCategory; self?: bo
   rule_dns_blocked: { verb: '目标已阻断', category: 'rule' },
   user_traffic_blocked: { verb: '已阻断流量', category: 'account' },
   user_traffic_restored: { verb: '已恢复流量', category: 'account' },
+  subscription_renewed: { verb: '续订了账户', category: 'account' },
+  user_deletion_requested: { verb: '申请删除账户', category: 'account' },
+  user_deleted: { verb: '删除了账户', category: 'account' },
   user_created: { verb: '创建了账户', category: 'account' },
   user_updated: { verb: '调整了账户授权', category: 'account' },
   password_reset: { verb: '重置了账户密码', category: 'account' },
@@ -34,7 +37,7 @@ export function describeAudit(entry: Audit) {
   const object = phrase.self || entry.resource_id === null ? null : {
     name: entry.resource_name ?? `#${entry.resource_id}`,
     port: entry.resource_port,
-    to: entry.resource_kind === 'rule' && entry.action !== 'rule_deleted' ? `/rules/${entry.resource_id}` : entry.resource_kind === 'user' ? `/accounts/${entry.resource_id}` : null,
+    to: entry.resource_kind === 'rule' && entry.action !== 'rule_deleted' ? `/rules/${entry.resource_id}` : entry.resource_kind === 'user' && entry.action !== 'user_deleted' ? `/accounts/${entry.resource_id}` : null,
   }
   return { verb: entry.failure_count > 0 ? `${phrase.verb}（${entry.failure_count} 次）` : phrase.verb, category: phrase.category, object }
 }

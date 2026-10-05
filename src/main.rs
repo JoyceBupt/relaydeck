@@ -82,6 +82,19 @@ async fn main() -> anyhow::Result<()> {
             std::path::Path::new(destination),
         );
     }
+    if let [command, path] = arguments.as_slice()
+        && command == "checkpoint-traffic"
+    {
+        #[cfg(target_os = "linux")]
+        {
+            return relaydeck::traffic::driver::checkpoint(std::path::Path::new(path)).await;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = path;
+            anyhow::bail!("traffic checkpoints require Linux");
+        }
+    }
     let config = relaydeck::config::Config::from_env()?;
     let pool = relaydeck::db::connect(&config.database).await?;
     match arguments.as_slice() {

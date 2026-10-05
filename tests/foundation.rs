@@ -289,3 +289,42 @@ async fn shared_port_migration_preserves_credentials_rules_quotas_and_owner_iden
             .unwrap();
     assert_eq!(pending, (1, user.desired_revision));
 }
+
+#[tokio::test]
+async fn subscription_migration_preserves_installed_usage_and_explicit_expiry() {
+    use sqlx::Executor;
+    let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+    for migration in [
+        include_str!("../migrations/0001_control_plane.sql"),
+        include_str!("../migrations/0002_mfa.sql"),
+        include_str!("../migrations/0003_runtime.sql"),
+        include_str!("../migrations/0004_security.sql"),
+        include_str!("../migrations/0005_runtime_recovery.sql"),
+        include_str!("../migrations/0006_dns.sql"),
+        include_str!("../migrations/0007_isolated_recovery.sql"),
+        include_str!("../migrations/0008_shared_ports.sql"),
+        include_str!("../migrations/0009_traffic.sql"),
+    ] {
+        pool.execute(migration).await.unwrap();
+    }
+    pool.execute("INSERT INTO users(id,username,password_hash,role,port_start,port_end,max_rules,created_at,expires_at,traffic_used_bytes,desired_revision) VALUES(1,'admin','unchanged','admin',1024,65535,10,1000,NULL,42,7),(2,'tenant','unchanged','user',1024,65535,10,1000,NULL,1234,9),(3,'custom','unchanged','user',1024,65535,10,1000,9999999,5678,11)").await.unwrap();
+    pool.execute(include_str!("../migrations/0010_subscriptions.sql"))
+        .await
+        .unwrap();
+    let users:Vec<(i64,i64,i64,Option<i64>,i64,String)>=sqlx::query_as("SELECT id,runtime_slot,subscription_started_at,expires_at,traffic_used_bytes,password_hash FROM users ORDER BY id").fetch_all(&pool).await.unwrap();
+    assert_eq!(
+        users,
+        vec![
+            (1, 1, 1000, None, 42, "unchanged".into()),
+            (2, 2, 1000, None, 1234, "unchanged".into()),
+            (3, 3, 1000, Some(9999999), 5678, "unchanged".into())
+        ]
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT revision FROM runtime_slots WHERE id=3")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        11
+    );
+}

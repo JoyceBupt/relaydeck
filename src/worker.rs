@@ -60,19 +60,19 @@ pub async fn record_traffic(
 ) -> anyhow::Result<()> {
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     for snapshot in snapshots {
-        let previous:Option<(bool,Option<i64>,bool)>=sqlx::query_as("SELECT traffic_blocked,traffic_period_start,traffic_ready FROM users WHERE id=? AND traffic_limit_bytes IS ? AND traffic_mode=? AND (traffic_period_start IS NULL OR traffic_period_start<=?)")
-            .bind(snapshot.owner_id).bind(snapshot.budget.limit_bytes).bind(snapshot.budget.mode.as_str()).bind(snapshot.period_start).fetch_optional(&mut *tx).await?;
-        let Some((blocked, period, ready)) = previous else {
+        let previous:Option<(i64,bool,Option<i64>,bool)>=sqlx::query_as("SELECT id,traffic_blocked,traffic_period_start,traffic_ready FROM users WHERE COALESCE(runtime_slot,id)=? AND traffic_limit_bytes IS ? AND traffic_mode=? AND subscription_id=? AND subscription_started_at=? AND COALESCE(expires_at,9223372036854775807)=? AND deletion_requested_at IS NULL AND (traffic_observed_at IS NULL OR traffic_observed_at<=?)")
+            .bind(snapshot.owner_id).bind(snapshot.budget.limit_bytes).bind(snapshot.budget.mode.as_str()).bind(snapshot.period_id).bind(snapshot.period_start).bind(snapshot.reset_at).bind(snapshot.observed_at).fetch_optional(&mut *tx).await?;
+        let Some((owner_id, blocked, period, ready)) = previous else {
             continue;
         };
         let signed = |value: u64| value.min(i64::MAX as u64) as i64;
         sqlx::query("UPDATE users SET traffic_in_bytes=?,traffic_out_bytes=?,traffic_used_bytes=?,traffic_period_start=?,traffic_reset_at=?,traffic_blocked=?,traffic_ready=?,traffic_error=?,traffic_observed_at=? WHERE id=?")
-            .bind(signed(snapshot.in_bytes)).bind(signed(snapshot.out_bytes)).bind(signed(snapshot.used_bytes)).bind(snapshot.period_start).bind(snapshot.reset_at).bind(snapshot.blocked).bind(snapshot.ready).bind(&snapshot.error).bind(snapshot.observed_at).bind(snapshot.owner_id).execute(&mut *tx).await?;
+            .bind(signed(snapshot.in_bytes)).bind(signed(snapshot.out_bytes)).bind(signed(snapshot.used_bytes)).bind(snapshot.period_start).bind(snapshot.reset_at).bind(snapshot.blocked).bind(snapshot.ready).bind(&snapshot.error).bind(snapshot.observed_at).bind(owner_id).execute(&mut *tx).await?;
         if blocked != snapshot.blocked
             || period != Some(snapshot.period_start)
             || ready != snapshot.ready
         {
-            crate::api::enqueue_apply(&mut tx, snapshot.owner_id).await?;
+            crate::api::enqueue_apply(&mut tx, owner_id).await?;
             if blocked != snapshot.blocked {
                 crate::api::record_system_user_audit(
                     &mut tx,
@@ -81,7 +81,7 @@ pub async fn record_traffic(
                     } else {
                         "user_traffic_restored"
                     },
-                    snapshot.owner_id,
+                    owner_id,
                 )
                 .await?;
             }
@@ -93,13 +93,14 @@ pub async fn record_traffic(
 
 #[cfg(target_os = "linux")]
 async fn refresh_traffic(pool: &SqlitePool, driver: &SocketDriver) -> anyhow::Result<()> {
-    let rows: Vec<(i64, Option<i64>, String)> =
-        sqlx::query_as("SELECT id,traffic_limit_bytes,traffic_mode FROM users ORDER BY id")
+    let rows: Vec<(i64, Option<i64>, String, i64, i64, i64)> =
+        sqlx::query_as("SELECT COALESCE(runtime_slot,id),traffic_limit_bytes,traffic_mode,subscription_id,COALESCE(subscription_started_at,created_at),COALESCE(expires_at,9223372036854775807) FROM users ORDER BY id")
             .fetch_all(pool)
             .await?;
     let mut grants = Vec::with_capacity(rows.len());
-    for (owner_id, limit_bytes, mode) in rows {
+    for (owner_id, limit_bytes, mode, id, start, end) in rows {
         grants.push(crate::traffic::TrafficGrant {
+            period: Some(crate::traffic::TrafficPeriod { id, start, end }),
             owner_id,
             budget: crate::traffic::TrafficBudget {
                 limit_bytes,
@@ -107,7 +108,10 @@ async fn refresh_traffic(pool: &SqlitePool, driver: &SocketDriver) -> anyhow::Re
             },
         });
     }
-    record_traffic(pool, &driver.traffic(grants).await?).await
+    for batch in grants.chunks(64) {
+        record_traffic(pool, &driver.traffic(batch.to_vec()).await?).await?;
+    }
+    Ok(())
 }
 
 pub async fn refresh_dns<F, Fut>(
@@ -176,6 +180,27 @@ where
     Ok(())
 }
 
+pub async fn record_rule_states(
+    pool: &SqlitePool,
+    states: &[crate::broker::RuleStatus],
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    for state in states {
+        sqlx::query("INSERT INTO rule_runtime_states(rule_id,revision,active,observed_at) SELECT r.id,?,?,? FROM rules r JOIN users u ON u.id=r.owner_id WHERE r.id=? AND COALESCE(u.runtime_slot,u.id)=? AND u.desired_revision=? AND r.deleted_at IS NULL ON CONFLICT(rule_id) DO UPDATE SET revision=excluded.revision,active=excluded.active,observed_at=excluded.observed_at WHERE rule_runtime_states.observed_at<=excluded.observed_at")
+            .bind(state.revision).bind(state.active).bind(state.observed_at).bind(state.rule_id).bind(state.owner).bind(state.revision).execute(&mut *tx).await?;
+    }
+    tx.commit().await
+}
+
+#[cfg(target_os = "linux")]
+async fn observe_rules(pool: &SqlitePool, driver: &SocketDriver) -> anyhow::Result<()> {
+    let slots:Vec<i64>=sqlx::query_scalar("SELECT COALESCE(runtime_slot,id) FROM users WHERE enabled=1 AND deletion_requested_at IS NULL").fetch_all(pool).await?;
+    for batch in slots.chunks(16) {
+        record_rule_states(pool, &driver.rule_states(batch.to_vec()).await?).await?;
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 async fn receive_failures(pool: &SqlitePool, driver: &SocketDriver) -> anyhow::Result<()> {
     let events = driver.inspect().await?;
@@ -201,8 +226,18 @@ pub async fn record_runtime_failures(
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     for event in events {
+        let owner_id: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM users WHERE COALESCE(runtime_slot,id)=? AND desired_revision=?",
+        )
+        .bind(event.owner)
+        .bind(event.revision)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(owner_id) = owner_id else {
+            continue;
+        };
         let existing: Option<(i64,String)> = sqlx::query_as("SELECT retry_count,status FROM runtime_states WHERE owner_id=? AND revision=? AND revision=(SELECT desired_revision FROM users WHERE id=?)")
-            .bind(event.owner).bind(event.revision).bind(event.owner).fetch_optional(&mut *tx).await?;
+            .bind(owner_id).bind(event.revision).bind(owner_id).fetch_optional(&mut *tx).await?;
         let Some((retries, status)) = existing else {
             continue;
         };
@@ -211,15 +246,36 @@ pub async fn record_runtime_failures(
         }
         let retry_at = (event.retryable && retries < 3).then(|| now() + (10_i64 << retries.min(3)));
         sqlx::query("UPDATE runtime_states SET status='failed',healthy_since=NULL,last_error=?,updated_at=?,retry_count=?,retry_at=? WHERE owner_id=? AND revision=?")
-            .bind(&event.message).bind(now()).bind(retries+ i64::from(retry_at.is_some())).bind(retry_at).bind(event.owner).bind(event.revision).execute(&mut *tx).await?;
+            .bind(&event.message).bind(now()).bind(retries+ i64::from(retry_at.is_some())).bind(retry_at).bind(owner_id).bind(event.revision).execute(&mut *tx).await?;
         sqlx::query("UPDATE apply_jobs SET status='failed' WHERE owner_id=? AND revision=?")
-            .bind(event.owner)
+            .bind(owner_id)
             .bind(event.revision)
             .execute(&mut *tx)
             .await?;
     }
     tx.commit().await?;
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn renewal_loop(pool: SqlitePool, driver: Arc<SocketDriver>) {
+    let mut clock = tokio::time::interval(Duration::from_secs(5));
+    clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        clock.tick().await;
+        let renewed=async {
+            let revisions:Vec<(i64,i64)>=sqlx::query_as("SELECT COALESCE(u.runtime_slot,u.id),s.revision FROM users u JOIN runtime_states s ON s.owner_id=u.id WHERE u.enabled=1 AND u.deletion_requested_at IS NULL AND u.traffic_blocked=0 AND (u.expires_at IS NULL OR u.expires_at>?) AND s.status='active' AND s.revision=u.desired_revision AND u.applied_revision=u.desired_revision")
+                .bind(now()).fetch_all(&pool).await?;
+            // An empty renewal is also a broker liveness check.
+            if revisions.is_empty() { driver.renew(Vec::new()).await?; }
+            for batch in revisions.chunks(64) {driver.renew(batch.to_vec()).await?;}
+            sqlx::query("INSERT INTO executor_status(id,last_seen,status) VALUES(1,?,'running') ON CONFLICT(id) DO UPDATE SET last_seen=excluded.last_seen,status=excluded.status").bind(now()).execute(&pool).await?;
+            Ok::<(),anyhow::Error>(())
+        }.await;
+        if let Err(error) = renewed {
+            tracing::warn!(%error,"independent runtime renewal deferred");
+        }
+    }
 }
 
 pub async fn run(policy_path: &Path) -> anyhow::Result<()> {
@@ -260,6 +316,7 @@ pub async fn run(policy_path: &Path) -> anyhow::Result<()> {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        let mut renewal = tokio::spawn(renewal_loop(pool.clone(), driver.clone()));
         let result = async {
             loop {
                 tokio::select! {
@@ -268,6 +325,7 @@ pub async fn run(policy_path: &Path) -> anyhow::Result<()> {
                             if let Err(error)=refresh_traffic(&pool,&driver).await {tracing::error!(%error,"traffic synchronization deferred; existing authorizations continue independently");}
                             receive_failures(&pool,&driver).await?;
                             reconcile_tick(&pool,&reconciler).await?;
+                            observe_rules(&pool,&driver).await?;
                             refresh_dns(&pool,&local_ips,|host,port| {let ips=local_ips.clone();async move {crate::rules::resolve_host(&host,port,&ips).await}}).await
                         }.await;
                         if let Err(error) = tick {
@@ -286,12 +344,18 @@ pub async fn run(policy_path: &Path) -> anyhow::Result<()> {
                             tracing::warn!(%error,"database temporarily busy; retrying without stopping unrelated accounts");
                         }
                     }
+                    result = &mut renewal => {result?;anyhow::bail!("renewal worker stopped");},
                     _ = terminate.recv() => break,
                     _ = tokio::signal::ctrl_c() => break,
                 }
             }
             Ok::<_,anyhow::Error>(())
         }.await;
+        let renewal_finished = renewal.is_finished();
+        renewal.abort();
+        if !renewal_finished {
+            let _ = renewal.await;
+        }
         crate::db::close(&pool)
             .await
             .context("close worker database")?;

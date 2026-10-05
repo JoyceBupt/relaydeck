@@ -24,7 +24,7 @@ use crate::{
 
 static DNS_SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(4)));
 const MAX_DNS_RESULTS: usize = 32;
-const RULE_SELECT: &str = "SELECT r.id,r.owner_id,u.username AS owner_username,r.name,r.listen_port,r.target_host,r.target_ip,r.target_port,r.protocol,r.source_cidrs,r.enabled,r.created_at,r.updated_at,r.dns_error,CASE WHEN r.enabled=0 OR u.enabled=0 OR (u.expires_at IS NOT NULL AND u.expires_at<=unixepoch()) THEN 'stopped' WHEN r.dns_blocked=1 OR u.traffic_blocked=1 THEN 'blocked' WHEN s.revision=u.desired_revision AND s.status='failed' THEN 'failed' WHEN e.status IS NULL OR e.status!='running' OR e.last_seen<=unixepoch()-10 THEN 'pending' WHEN s.revision!=u.desired_revision OR u.applied_revision!=u.desired_revision THEN 'pending' WHEN s.status='stopped' THEN 'stopped' WHEN s.status='active' AND r.enabled=0 THEN 'stopped' WHEN s.status='active' AND u.enabled=1 AND (u.expires_at IS NULL OR u.expires_at>unixepoch()) THEN 'active' ELSE 'pending' END AS runtime_status,CASE WHEN u.traffic_blocked=1 THEN COALESCE(u.traffic_error,'流量额度已用尽') WHEN s.revision=u.desired_revision AND s.status='failed' THEN s.last_error END AS runtime_error,s.updated_at AS runtime_updated_at FROM rules r JOIN users u ON u.id=r.owner_id LEFT JOIN runtime_states s ON s.owner_id=u.id LEFT JOIN executor_status e ON e.id=1";
+const RULE_SELECT: &str = "SELECT r.id,r.owner_id,u.username AS owner_username,r.name,r.listen_port,r.target_host,r.target_ip,r.target_port,r.protocol,r.source_cidrs,r.enabled,r.created_at,r.updated_at,r.dns_error,CASE WHEN r.enabled=0 OR u.enabled=0 OR (u.expires_at IS NOT NULL AND u.expires_at<=unixepoch()) THEN 'stopped' WHEN r.dns_blocked=1 OR u.traffic_blocked=1 THEN 'blocked' WHEN s.revision=u.desired_revision AND s.status='failed' THEN 'failed' WHEN e.status IS NULL OR e.status!='running' OR e.last_seen<=unixepoch()-10 THEN 'pending' WHEN s.revision!=u.desired_revision OR u.applied_revision!=u.desired_revision THEN 'pending' WHEN s.status='stopped' THEN 'stopped' WHEN rs.revision IS NULL OR rs.revision!=u.desired_revision OR rs.observed_at<=unixepoch()-20 THEN 'pending' WHEN rs.active=0 THEN 'failed' WHEN s.status='active' AND r.enabled=0 THEN 'stopped' WHEN s.status='active' AND u.enabled=1 AND (u.expires_at IS NULL OR u.expires_at>unixepoch()) THEN 'active' ELSE 'pending' END AS runtime_status,CASE WHEN u.traffic_blocked=1 THEN COALESCE(u.traffic_error,'流量额度已用尽') WHEN s.revision=u.desired_revision AND s.status='failed' THEN s.last_error WHEN rs.revision=u.desired_revision AND rs.active=0 THEN '监听失败，请重试或更换端口' END AS runtime_error,COALESCE(rs.observed_at,s.updated_at) AS runtime_updated_at FROM rules r JOIN users u ON u.id=r.owner_id LEFT JOIN runtime_states s ON s.owner_id=u.id LEFT JOIN rule_runtime_states rs ON rs.rule_id=r.id LEFT JOIN executor_status e ON e.id=1";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -208,17 +208,13 @@ async fn check_create_quota<'e, E>(executor: E, owner: &DbUser) -> Result<(), Ap
 where
     E: Executor<'e, Database = Sqlite>,
 {
-    let (owner_count, total_count): (i64, i64) = sqlx::query_as(
-        "SELECT (SELECT COUNT(*) FROM rules WHERE owner_id=? AND deleted_at IS NULL),(SELECT COUNT(*) FROM rules WHERE deleted_at IS NULL)",
-    )
-    .bind(owner.id)
-    .fetch_one(executor)
-    .await?;
+    let owner_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM rules WHERE owner_id=? AND deleted_at IS NULL")
+            .bind(owner.id)
+            .fetch_one(executor)
+            .await?;
     if owner_count >= owner.max_rules {
         return Err(ApiError::conflict("端口额度已满"));
-    }
-    if total_count >= 30 {
-        return Err(ApiError::conflict("总规则数已达30条"));
     }
     Ok(())
 }
@@ -427,8 +423,12 @@ async fn check_rule(
         .bind(rule.owner_id)
         .fetch_one(&state.pool)
         .await?;
+    let slot: i64 = sqlx::query_scalar("SELECT COALESCE(runtime_slot,id) FROM users WHERE id=?")
+        .bind(rule.owner_id)
+        .fetch_one(&state.pool)
+        .await?;
     let request = crate::connectivity::CheckRequest {
-        owner_id: rule.owner_id,
+        owner_id: slot,
         revision,
         rule_id: id,
     };
@@ -492,7 +492,9 @@ async fn create_rule(
     check_lease(&mut *tx, input.listen_port, owner.id, None).await?;
     check_host_port(input.listen_port)?;
     let timestamp = now();
-    let id = sqlx::query("INSERT INTO rules(owner_id,name,listen_port,target_host,target_ip,target_port,protocol,source_cidrs,enabled,created_at,updated_at,dns_checked_at,dns_resolved_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,unixepoch(),unixepoch())")
+    let id = crate::subscriptions::next_identity(&mut tx, "rule").await?;
+    sqlx::query("INSERT INTO rules(id,owner_id,name,listen_port,target_host,target_ip,target_port,protocol,source_cidrs,enabled,created_at,updated_at,dns_checked_at,dns_resolved_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,unixepoch(),unixepoch())")
+        .bind(id)
         .bind(owner.id)
         .bind(&input.name)
         .bind(input.listen_port)
@@ -505,8 +507,7 @@ async fn create_rule(
         .bind(timestamp)
         .bind(timestamp)
         .execute(&mut *tx)
-        .await?
-        .last_insert_rowid();
+        .await?;
     sqlx::query("INSERT INTO port_leases(port,owner_id,rule_id,created_at) VALUES(?,?,?,?)")
         .bind(input.listen_port)
         .bind(owner.id)

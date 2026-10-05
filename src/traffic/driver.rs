@@ -8,6 +8,7 @@ use crate::{
 };
 use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, path::PathBuf};
 
 const NFT: &str = "/usr/sbin/nft";
@@ -17,6 +18,8 @@ const GUARD: &str = "relaydeck_usage_guard";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Account {
+    #[serde(default)]
+    period: Option<super::TrafficPeriod>,
     budget: TrafficBudget,
     incoming: u64,
     outgoing: u64,
@@ -40,6 +43,8 @@ impl Account {
 #[serde(deny_unknown_fields)]
 struct Ledger {
     version: u8,
+    #[serde(default)]
+    legacy_digest: Option<String>,
     period: i64,
     reset_at: i64,
     accounts: BTreeMap<i64, Account>,
@@ -67,20 +72,56 @@ impl TrafficMeter {
             unsafe { libc::geteuid() } == 0,
             "traffic meter requires root"
         );
-        let path = policy.runtime_dir.join("traffic-ledger.json");
+        let path = policy.runtime_dir.join("traffic-subscriptions.json");
+        let legacy_path = policy.runtime_dir.join("traffic-ledger.json");
+        // Keep a v1-compatible ledger for an interrupted upgrade's old updater.
+        // Only fall back when the new ledger is absent, never when it is corrupt.
+        let source = match std::fs::symlink_metadata(&path) {
+            Ok(_) => &path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => &legacy_path,
+            Err(error) => return Err(error.into()),
+        };
         let (period, reset_at) = utc_month(clock())?;
-        let ledger = match std::fs::symlink_metadata(&path) {
+        let ledger = match std::fs::symlink_metadata(source) {
             Ok(meta) => {
                 use std::os::unix::fs::MetadataExt;
-                secure_root_path(&path, false)?;
+                secure_root_path(source, false)?;
                 ensure!(
                     meta.mode() & 0o077 == 0,
                     "traffic ledger must remain private to root"
                 );
-                ensure!(meta.len() <= 64 * 1024, "traffic ledger too large");
-                let ledger: Ledger = serde_json::from_slice(&std::fs::read(&path)?)?;
                 ensure!(
-                    ledger.version == 1 && ledger.accounts.len() <= policy.max_owners as usize,
+                    meta.len()
+                        <= u64::from(policy.max_owners)
+                            .saturating_mul(2048)
+                            .max(64 * 1024),
+                    "traffic ledger too large"
+                );
+                let mut ledger: Ledger = serde_json::from_slice(&std::fs::read(source)?)?;
+                if source == &path
+                    && let Some(expected) = &ledger.legacy_digest
+                {
+                    let meta = std::fs::symlink_metadata(&legacy_path)?;
+                    secure_root_path(&legacy_path, false)?;
+                    ensure!(
+                        meta.mode() & 0o077 == 0
+                            && meta.len()
+                                <= u64::from(policy.max_owners)
+                                    .saturating_mul(2048)
+                                    .max(64 * 1024),
+                        "invalid compatibility ledger"
+                    );
+                    let bytes = std::fs::read(&legacy_path)?;
+                    if &format!("{:x}", Sha256::digest(&bytes)) != expected {
+                        // A rolled-back old broker has recorded newer usage.
+                        // Re-adopt its counters instead of reviving stale v2 usage.
+                        ledger = serde_json::from_slice(&bytes)?;
+                        ensure!(ledger.version == 1, "unexpected compatibility ledger");
+                    }
+                }
+                ensure!(
+                    matches!(ledger.version, 1 | 2)
+                        && ledger.accounts.len() <= policy.max_owners as usize,
                     "invalid traffic ledger version or size"
                 );
                 ensure!(
@@ -89,6 +130,9 @@ impl TrafficMeter {
                 );
                 for (owner, account) in &ledger.accounts {
                     policy.uid(*owner)?;
+                    if let Some(period) = &account.period {
+                        period.validate()?;
+                    }
                     account.budget.validate()?;
                     if let Some(applied) = &account.applied {
                         applied.validate()?;
@@ -101,7 +145,8 @@ impl TrafficMeter {
                 ledger
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ledger {
-                version: 1,
+                version: 2,
+                legacy_digest: None,
                 period,
                 reset_at,
                 accounts: BTreeMap::new(),
@@ -122,18 +167,56 @@ impl TrafficMeter {
 
     fn names(&self, owner: i64, account: &Account) -> (String, String, String) {
         (
-            format!("rx_{owner}_{}", self.ledger.period),
-            format!("tx_{owner}_{}", self.ledger.period),
+            format!(
+                "rx_{owner}_{}",
+                account
+                    .period
+                    .as_ref()
+                    .map_or(self.ledger.period, |period| period.id)
+            ),
+            format!(
+                "tx_{owner}_{}",
+                account
+                    .period
+                    .as_ref()
+                    .map_or(self.ledger.period, |period| period.id)
+            ),
             format!(
                 "q_{owner}_{}_{}",
-                self.ledger.period,
+                account
+                    .period
+                    .as_ref()
+                    .map_or(self.ledger.period, |period| period.id),
                 account.budget.mode.as_str()
             ),
         )
     }
 
     fn persist(&self) -> anyhow::Result<()> {
-        write_root_file(&self.path, &serde_json::to_vec(&self.ledger)?, 0o600, 0)?;
+        let mut legacy = serde_json::to_value(&self.ledger)?;
+        legacy["version"] = 1.into();
+        legacy.as_object_mut().unwrap().remove("legacy_digest");
+        for account in legacy["accounts"]
+            .as_object_mut()
+            .context("invalid ledger accounts")?
+            .values_mut()
+        {
+            account
+                .as_object_mut()
+                .context("invalid ledger account")?
+                .remove("period");
+        }
+        let bytes = serde_json::to_vec(&legacy)?;
+        let mut current = serde_json::to_value(&self.ledger)?;
+        current["version"] = 2.into();
+        current["legacy_digest"] = format!("{:x}", Sha256::digest(&bytes)).into();
+        write_root_file(
+            &self.policy.runtime_dir.join("traffic-ledger.json"),
+            &bytes,
+            0o600,
+            0,
+        )?;
+        write_root_file(&self.path, &serde_json::to_vec(&current)?, 0o600, 0)?;
         std::fs::File::open(&self.policy.runtime_dir)?.sync_all()?;
         Ok(())
     }
@@ -163,8 +246,11 @@ impl TrafficMeter {
 
     fn absorb(&mut self, value: &serde_json::Value) -> anyhow::Result<()> {
         let values = kernel_values(value)?;
-        let period = self.ledger.period;
         for (owner, account) in &mut self.ledger.accounts {
+            let period = account
+                .period
+                .as_ref()
+                .map_or(self.ledger.period, |period| period.id);
             account.incoming = account
                 .incoming
                 .max(*values.get(&format!("rx_{owner}_{period}")).unwrap_or(&0));
@@ -181,22 +267,6 @@ impl TrafficMeter {
             );
         }
         Ok(())
-    }
-
-    fn roll_clock(&mut self, timestamp: i64) -> anyhow::Result<bool> {
-        let (period, reset_at) = utc_month(timestamp)?;
-        // A backward clock correction must never create free traffic credits.
-        if period <= self.ledger.period {
-            return Ok(false);
-        }
-        self.ledger.period = period;
-        self.ledger.reset_at = reset_at;
-        for account in self.ledger.accounts.values_mut() {
-            account.incoming = 0;
-            account.outgoing = 0;
-            account.charged = 0;
-        }
-        Ok(true)
     }
 
     async fn freeze(&self, owners: &[i64]) -> anyhow::Result<()> {
@@ -375,17 +445,39 @@ impl TrafficMeter {
         Ok(())
     }
 
+    /// Called only after all tenant runtimes are stopped. No table is rebuilt
+    /// or quota reset; final kernel counters are durably folded into the ledger.
+    pub async fn checkpoint(&mut self) -> anyhow::Result<()> {
+        if let Some(value) = Self::table().await? {
+            ensure!(
+                self.path.try_exists()?
+                    || self
+                        .policy
+                        .runtime_dir
+                        .join("traffic-ledger.json")
+                        .try_exists()?,
+                "traffic ledger missing; refusing an incomplete backup"
+            );
+            self.absorb(&value)?;
+        }
+        self.persist()
+    }
+
     async fn initialize(&mut self) -> anyhow::Result<()> {
         if self.initialized {
             return Ok(());
         }
         if Self::table().await?.is_some() {
             ensure!(
-                self.path.try_exists()?,
+                self.path.try_exists()?
+                    || self
+                        .policy
+                        .runtime_dir
+                        .join("traffic-ledger.json")
+                        .try_exists()?,
                 "traffic ledger missing; restore its root-owned backup"
             );
         }
-        self.roll_clock((self.clock)())?;
         self.rebuild().await
     }
 
@@ -410,9 +502,14 @@ impl TrafficMeter {
             "too many traffic grants"
         );
         let mut desired = BTreeMap::new();
+        let mut periods = BTreeMap::new();
         for grant in grants {
             self.policy.uid(grant.owner_id)?;
             grant.budget.validate()?;
+            if let Some(period) = &grant.period {
+                period.validate()?;
+            }
+            periods.insert(grant.owner_id, grant.period.clone());
             ensure!(
                 desired
                     .insert(grant.owner_id, grant.budget.clone())
@@ -428,6 +525,55 @@ impl TrafficMeter {
                 self.rebuild().await?;
             }
         } else {
+            self.rebuild().await?;
+        }
+        let cycles = grants
+            .iter()
+            .filter(|grant| {
+                self.ledger
+                    .accounts
+                    .get(&grant.owner_id)
+                    .is_some_and(|account| account.period != grant.period)
+            })
+            .collect::<Vec<_>>();
+        for grant in &cycles {
+            let old = &self.ledger.accounts[&grant.owner_id].period;
+            ensure!(
+                grant.period.is_some(),
+                "subscription period cannot be removed"
+            );
+            if let Some(old) = old {
+                let next = grant.period.as_ref().unwrap();
+                ensure!(
+                    next.id > old.id && next.start >= old.start,
+                    "stale subscription period"
+                );
+            }
+        }
+        if !cycles.is_empty() {
+            self.freeze(
+                &cycles
+                    .iter()
+                    .map(|grant| grant.owner_id)
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
+            if let Some(value) = Self::table().await? {
+                self.absorb(&value)?;
+            }
+            for grant in cycles {
+                let account = self.ledger.accounts.get_mut(&grant.owner_id).unwrap();
+                // Migrating v1 adopts the subscription without granting fresh traffic.
+                if account.period.is_some() {
+                    account.incoming = 0;
+                    account.outgoing = 0;
+                    account.charged = 0;
+                }
+                account.period = grant.period.clone();
+                account.prepared = false;
+                account.applied = None;
+            }
+            self.ledger.version = 2;
             self.rebuild().await?;
         }
         let changed = desired
@@ -459,6 +605,7 @@ impl TrafficMeter {
                 let mut text = String::new();
                 let previous = self.ledger.accounts.get(&owner).cloned();
                 let dummy = Account {
+                    period: periods[&owner].clone(),
                     budget: desired[&owner].clone(),
                     incoming: 0,
                     outgoing: 0,
@@ -474,8 +621,14 @@ impl TrafficMeter {
                         .and_then(|account| account.applied.as_ref())
                         && applied.limit_bytes.is_some()
                     {
-                        let q =
-                            format!("q_{owner}_{}_{}", self.ledger.period, applied.mode.as_str());
+                        let q = format!(
+                            "q_{owner}_{}_{}",
+                            previous
+                                .as_ref()
+                                .and_then(|account| account.period.as_ref())
+                                .map_or(self.ledger.period, |period| period.id),
+                            applied.mode.as_str()
+                        );
                         text.push_str(&format!("delete quota inet {TABLE} {q}\n"));
                     }
                 } else {
@@ -513,14 +666,22 @@ impl TrafficMeter {
             .ledger
             .accounts
             .iter()
+            .filter(|(owner, _)| desired.contains_key(owner))
             .map(|(owner, account)| TrafficSnapshot {
+                period_id: account.period.as_ref().map(|period| period.id),
                 owner_id: *owner,
                 budget: account.budget.clone(),
                 in_bytes: account.incoming,
                 out_bytes: account.outgoing,
                 used_bytes: account.used(),
-                period_start: self.ledger.period,
-                reset_at: self.ledger.reset_at,
+                period_start: account
+                    .period
+                    .as_ref()
+                    .map_or(self.ledger.period, |period| period.start),
+                reset_at: account
+                    .period
+                    .as_ref()
+                    .map_or(self.ledger.reset_at, |period| period.end),
                 blocked: !account.prepared || account.blocked(),
                 ready: account.prepared,
                 error: (!account.prepared).then(|| "流量策略未就绪".into()),
@@ -533,9 +694,7 @@ impl TrafficMeter {
         if !self.initialized {
             return self.initialize().await;
         }
-        if self.roll_clock((self.clock)())? {
-            self.rebuild().await?;
-        }
+        // Expiry stops the runtime; only an explicit renewal can reset usage.
         Ok(())
     }
 
@@ -549,4 +708,38 @@ impl TrafficMeter {
                     })
             })
     }
+}
+
+pub async fn checkpoint(path: &std::path::Path) -> anyhow::Result<()> {
+    secure_root_path(path, false)?;
+    ensure!(
+        std::fs::metadata(path)?.len() <= 16 * 1024,
+        "policy too large"
+    );
+    let policy: BrokerPolicy = serde_json::from_slice(&std::fs::read(path)?)?;
+    policy.validate()?;
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        if !entry
+            .file_name()
+            .as_encoded_bytes()
+            .iter()
+            .all(u8::is_ascii_digit)
+        {
+            continue;
+        }
+        if let Ok(status) = std::fs::read_to_string(entry.path().join("status")) {
+            let uid = status.lines().find_map(|line| {
+                line.strip_prefix("Uid:")
+                    .and_then(|value| value.split_whitespace().next()?.parse::<u32>().ok())
+            });
+            ensure!(
+                uid.is_none_or(
+                    |uid| !(policy.uid_start..policy.uid_start + policy.max_owners).contains(&uid)
+                ),
+                "stop all tenant runtimes before checkpointing traffic"
+            );
+        }
+    }
+    TrafficMeter::open(policy)?.checkpoint().await
 }

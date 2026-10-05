@@ -1,7 +1,7 @@
 export type ViewMode = 'table' | 'cards'
 export type Protocol = 'tcp' | 'udp' | 'both'
 export type RuntimeStatus = 'pending' | 'active' | 'stopped' | 'failed' | 'blocked'
-export type ExecutorState = 'unconfigured' | 'running' | 'offline'
+export type ExecutorState = 'unconfigured' | 'running' | 'offline' | 'recovering'
 
 export interface User {
   id: number
@@ -9,6 +9,10 @@ export interface User {
   role: 'admin' | 'user'
   enabled: boolean
   must_change_password: boolean
+  subscription_id: number
+  subscription_started_at: number | null
+  deletion_requested_at: number | null
+  deletion_error: string | null
   expires_at: number | null
   port_start: number
   port_end: number

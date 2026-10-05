@@ -28,9 +28,12 @@ export const api = {
   ports: (ownerId: number) => request<PortUsage>(`/users/${ownerId}/ports`),
   traffic: (ownerId: number) => request<TrafficView>(`/users/${ownerId}/traffic`),
 
+  capacity: () => request<{ max_tenants: number | null; max_rules_per_account: number }>('/capacity'),
   users: () => request<User[]>('/users'),
   createUser: (input: NewUserInput) => request<User>('/users', 'POST', input),
   updateUser: (id: number, input: UserGrantInput) => request<User>(`/users/${id}`, 'PUT', input),
+  deleteUser: (id: number) => request<{ status: string }>(`/users/${id}`, 'DELETE'),
+  renewUser: (id: number, subscription_id: number) => request<User>(`/users/${id}/subscription`, 'POST', { subscription_id }),
   resetPassword: (id: number, password: string) => request<void>(`/users/${id}/password`, 'POST', { password }),
   audit: () => request<Audit[]>('/audit'),
 }

@@ -1,6 +1,7 @@
 pub mod api;
 pub mod bindguard;
 pub mod broker;
+pub mod capacity;
 pub mod config;
 pub mod connectivity;
 pub mod credentials;
@@ -13,7 +14,10 @@ pub mod mfa;
 pub mod models;
 pub mod policy;
 pub mod rules;
+pub mod subscriptions;
 pub mod tenant;
 pub mod traffic;
 pub mod upgrade;
 pub mod worker;
+
+pub mod readiness;

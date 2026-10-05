@@ -25,6 +25,7 @@ use tokio::sync::Mutex;
 #[derive(Clone)]
 pub struct AppState {
     pub pool: SqlitePool,
+    pub max_tenants: Option<i64>,
     pub config: Arc<Config>,
     pub credentials: Credentials,
     pub mfa: crate::mfa::MfaService,
@@ -49,6 +50,7 @@ impl AppState {
                 as Arc<dyn crate::upgrade::UpgradeChannel>
         });
         Ok(Self {
+            max_tenants: crate::capacity::installed()?,
             connectivity: Arc::new(crate::broker::SocketDriver::new(
                 std::env::var_os("RELAYDECK_BROKER_SOCKET")
                     .map(std::path::PathBuf::from)
@@ -274,8 +276,9 @@ pub async fn enqueue_apply(
     tx: &mut Transaction<'_, Sqlite>,
     owner_id: i64,
 ) -> Result<(), ApiError> {
-    let revision: i64 = sqlx::query_scalar("UPDATE users SET desired_revision=desired_revision+1 WHERE id=? RETURNING desired_revision")
+    let revision: i64 = sqlx::query_scalar("UPDATE users SET desired_revision=MAX(desired_revision,(SELECT revision FROM runtime_slots WHERE id=COALESCE(users.runtime_slot,users.id)))+1 WHERE id=? RETURNING desired_revision")
         .bind(owner_id).fetch_one(&mut **tx).await?;
+    sqlx::query("UPDATE runtime_slots SET revision=? WHERE id=(SELECT COALESCE(runtime_slot,id) FROM users WHERE id=?)").bind(revision).bind(owner_id).execute(&mut **tx).await?;
     sqlx::query("DELETE FROM apply_jobs WHERE owner_id=? AND status='pending'")
         .bind(owner_id)
         .execute(&mut **tx)
@@ -743,13 +746,32 @@ async fn health(State(state): State<AppState>) -> Result<Json<serde_json::Value>
         sqlx::query_as("SELECT last_seen,status FROM executor_status WHERE id=1")
             .fetch_optional(&state.pool)
             .await?;
-    let executor = match runtime {
+    let mut executor = match runtime {
         None => "unconfigured",
         Some((seen, status)) if status == "running" && now().saturating_sub(seen) < 10 => "running",
         Some(_) => "offline",
     };
+    let upgrade_ready = match crate::readiness::upgrade_ready(&state.pool, &state.config).await {
+        Ok(ready) => ready,
+        Err(error) => {
+            tracing::warn!(%error,"upgrade forwarding readiness unavailable");
+            false
+        }
+    };
+    if executor == "running" && !upgrade_ready {
+        executor = "recovering";
+    }
+    let (expected,active,failed):(i64,i64,i64)=sqlx::query_as("SELECT COUNT(*),COALESCE(SUM(s.status='active' AND s.revision=u.desired_revision AND u.applied_revision=u.desired_revision AND rs.revision=u.desired_revision AND rs.active=1 AND rs.observed_at>?),0),COALESCE(SUM((s.revision=u.desired_revision AND s.status='failed') OR (rs.revision=u.desired_revision AND rs.active=0)),0) FROM rules r JOIN users u ON u.id=r.owner_id LEFT JOIN runtime_states s ON s.owner_id=u.id LEFT JOIN rule_runtime_states rs ON rs.rule_id=r.id WHERE r.deleted_at IS NULL AND r.enabled=1 AND r.dns_blocked=0 AND u.enabled=1 AND u.traffic_blocked=0 AND (u.expires_at IS NULL OR u.expires_at>?)")
+        .bind(now()-20).bind(now()).fetch_one(&state.pool).await?;
+    let status = if !upgrade_ready {
+        "recovering"
+    } else if active < expected {
+        "degraded"
+    } else {
+        "ok"
+    };
     Ok(Json(
-        serde_json::json!({"status":"ok","name":"RelayDeck","version":env!("CARGO_PKG_VERSION"),"executor":executor}),
+        serde_json::json!({"status":status,"name":"RelayDeck","version":env!("CARGO_PKG_VERSION"),"executor":executor,"upgrade_ready":upgrade_ready,"forwarding":{"expected":expected,"active":active,"failed":failed,"pending":(expected-active-failed).max(0)}}),
     ))
 }
 
@@ -780,7 +802,7 @@ async fn retry_apply(
     if pending != 0 {
         return Ok(StatusCode::ACCEPTED);
     }
-    let failed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runtime_states s JOIN users u ON u.id=s.owner_id WHERE s.owner_id=? AND s.revision=u.desired_revision AND s.status='failed'").bind(id).fetch_one(&mut *tx).await?;
+    let failed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runtime_states s JOIN users u ON u.id=s.owner_id WHERE s.owner_id=? AND s.revision=u.desired_revision AND (s.status='failed' OR EXISTS(SELECT 1 FROM rule_runtime_states rs JOIN rules r ON r.id=rs.rule_id WHERE r.owner_id=u.id AND r.deleted_at IS NULL AND r.enabled=1 AND rs.revision=u.desired_revision AND rs.active=0))").bind(id).fetch_one(&mut *tx).await?;
     if failed != 1 {
         return Err(ApiError::conflict("当前无需重试"));
     }
@@ -824,13 +846,6 @@ fn default_port_quota() -> i64 {
     10
 }
 
-fn validate_expiry(expiry: Option<i64>) -> Result<(), ApiError> {
-    if expiry.is_some_and(|expiry| expiry <= now()) {
-        return Err(ApiError::bad_request("到期时间须晚于当前时间"));
-    }
-    Ok(())
-}
-
 async fn create_user(
     State(state): State<AppState>,
     auth: AuthContext,
@@ -841,7 +856,9 @@ async fn create_user(
     input.traffic.validate()?;
     policy::validate_password(&input.password)?;
     policy::validate_port_grant(1024, 65535, input.max_rules)?;
-    validate_expiry(input.expires_at)?;
+    if input.expires_at.is_some() {
+        return Err(ApiError::bad_request("订阅周期固定为30天"));
+    }
     let hash = state.credentials.hash_password(input.password).await?;
     let mut tx = state.pool.begin_with("BEGIN IMMEDIATE").await?;
     let actor = write_actor(&mut tx, &auth).await?;
@@ -851,11 +868,20 @@ async fn create_user(
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE role='user'")
         .fetch_one(&mut *tx)
         .await?;
-    if count >= 10 {
-        return Err(ApiError::conflict("首版最多10个用户"));
+    if state.max_tenants.is_some_and(|maximum| count >= maximum) {
+        return Err(ApiError::conflict("租户额度已满"));
     }
-    let id=sqlx::query("INSERT INTO users(username,password_hash,role,port_start,port_end,max_rules,expires_at,created_at,traffic_limit_bytes,traffic_mode) VALUES(?,?,'user',?,?,?,?,?,?,?)")
-        .bind(input.username).bind(hash).bind(1024).bind(65535).bind(input.max_rules).bind(input.expires_at).bind(now()).bind(input.traffic.limit_bytes).bind(input.traffic.mode.as_str()).execute(&mut *tx).await?.last_insert_rowid();
+    let slot = crate::capacity::allocate_slot(&mut tx, state.max_tenants).await?;
+    let id = crate::subscriptions::next_identity(&mut tx, "account").await?;
+    let cycle = crate::subscriptions::next_identity(&mut tx, "subscription").await?;
+    let start = now();
+    let end = start + crate::subscriptions::PERIOD_SECONDS;
+    sqlx::query("INSERT INTO users(id,username,password_hash,role,port_start,port_end,max_rules,expires_at,created_at,traffic_limit_bytes,traffic_mode,runtime_slot,subscription_id,subscription_started_at,traffic_period_start,traffic_reset_at) VALUES(?,?,?,'user',1024,65535,?,?,?,?,?,?,?,?,?,?)")
+        .bind(id).bind(input.username).bind(hash).bind(input.max_rules).bind(end).bind(start)
+        .bind(input.traffic.limit_bytes).bind(input.traffic.mode.as_str()).bind(slot).bind(cycle).bind(start).bind(start).bind(end)
+        .execute(&mut *tx).await?;
+    sqlx::query("UPDATE users SET desired_revision=(SELECT CASE WHEN revision=0 THEN 0 ELSE revision+1 END FROM runtime_slots WHERE id=?),applied_revision=(SELECT CASE WHEN revision=0 THEN 0 ELSE revision+1 END FROM runtime_slots WHERE id=?) WHERE id=?").bind(slot).bind(slot).bind(id).execute(&mut *tx).await?;
+    sqlx::query("UPDATE runtime_slots SET revision=(SELECT desired_revision FROM users WHERE id=?) WHERE id=?").bind(id).bind(slot).execute(&mut *tx).await?;
     record_audit(&mut tx, &actor, "user_created", Some(id)).await?;
     tx.commit().await?;
     Ok((StatusCode::CREATED, Json(user_view(&state.pool, id).await?)))
@@ -889,6 +915,16 @@ pub async fn record_system_user_audit(
     Ok(())
 }
 
+async fn capacity(
+    State(state): State<AppState>,
+    auth: AuthContext,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    auth.admin()?;
+    Ok(Json(
+        serde_json::json!({"max_tenants":state.max_tenants,"max_rules_per_account":crate::executor::MAX_RULES}),
+    ))
+}
+
 async fn list_users(
     State(state): State<AppState>,
     auth: AuthContext,
@@ -905,7 +941,16 @@ async fn list_users(
         .bind(user.id)
         .fetch_one(&state.pool)
         .await?;
-        result.push(UserView::from_user(user, count));
+        let mut view = UserView::from_user(user, count);
+        if view.deletion_requested_at.is_some() {
+            view.deletion_error =
+                sqlx::query_scalar("SELECT last_error FROM runtime_states WHERE owner_id=?")
+                    .bind(view.id)
+                    .fetch_optional(&state.pool)
+                    .await?
+                    .flatten();
+        }
+        result.push(view);
     }
     Ok(Json(result))
 }
@@ -930,9 +975,6 @@ async fn update_user(
         budget.validate()?;
     }
     policy::validate_port_grant(1024, 65535, input.max_rules)?;
-    if input.enabled {
-        validate_expiry(input.expires_at)?;
-    }
     let mut tx = state.pool.begin_with("BEGIN IMMEDIATE").await?;
     let actor = write_actor(&mut tx, &auth).await?;
     if actor.role != "admin" {
@@ -943,6 +985,12 @@ async fn update_user(
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(ApiError::not_found)?;
+    if target.deletion_requested_at.is_some() {
+        return Err(ApiError::conflict("账户正在删除"));
+    }
+    if input.expires_at.is_some() && input.expires_at != target.expires_at {
+        return Err(ApiError::bad_request("请通过续订延长订阅"));
+    }
     if target.role == "admin" && (!input.enabled || input.expires_at.is_some()) {
         return Err(ApiError::bad_request("管理员不能停用或设置到期时间"));
     }
@@ -955,8 +1003,8 @@ async fn update_user(
             .execute(&mut *tx)
             .await?;
     }
-    sqlx::query("UPDATE users SET enabled=?,port_start=?,port_end=?,max_rules=?,expires_at=?,auth_version=auth_version+1 WHERE id=?")
-        .bind(input.enabled).bind(1024).bind(65535).bind(input.max_rules).bind(input.expires_at).bind(id).execute(&mut *tx).await?;
+    sqlx::query("UPDATE users SET enabled=?,port_start=?,port_end=?,max_rules=?,auth_version=auth_version+1 WHERE id=?")
+        .bind(input.enabled).bind(1024).bind(65535).bind(input.max_rules).bind(id).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM sessions WHERE user_id=?")
         .bind(id)
         .execute(&mut *tx)
@@ -968,6 +1016,92 @@ async fn update_user(
     record_audit(&mut tx, &actor, "user_updated", Some(id)).await?;
     tx.commit().await?;
     Ok(Json(user_view(&state.pool, id).await?))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenewSubscription {
+    subscription_id: i64,
+}
+
+async fn renew_subscription(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(id): Path<i64>,
+    Json(input): Json<RenewSubscription>,
+) -> Result<Json<UserView>, ApiError> {
+    auth.admin()?;
+    let mut tx = state.pool.begin_with("BEGIN IMMEDIATE").await?;
+    let actor = write_actor(&mut tx, &auth).await?;
+    if actor.role != "admin" {
+        return Err(ApiError::forbidden());
+    }
+    let target: DbUser = sqlx::query_as("SELECT * FROM users WHERE id=?")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(ApiError::not_found)?;
+    if target.role != "user" {
+        return Err(ApiError::forbidden());
+    }
+    if target.deletion_requested_at.is_some() {
+        return Err(ApiError::conflict("账户正在删除"));
+    }
+    if target.subscription_id != input.subscription_id {
+        return Err(ApiError::conflict("订阅已变更，请刷新"));
+    }
+    let start = now();
+    if target.expires_at.is_none_or(|end| end > start) {
+        return Err(ApiError::conflict("订阅尚未到期"));
+    }
+    let end = start + crate::subscriptions::PERIOD_SECONDS;
+    let cycle = crate::subscriptions::next_identity(&mut tx, "subscription").await?;
+    sqlx::query("UPDATE users SET enabled=1,subscription_id=?,subscription_started_at=?,expires_at=?,auth_version=auth_version+1,traffic_in_bytes=0,traffic_out_bytes=0,traffic_used_bytes=0,traffic_period_start=?,traffic_reset_at=?,traffic_blocked=0,traffic_ready=0,traffic_observed_at=NULL,traffic_error=NULL WHERE id=?")
+        .bind(cycle).bind(start).bind(end).bind(start).bind(end).bind(id).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM sessions WHERE user_id=?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    enqueue_apply(&mut tx, id).await?;
+    record_audit(&mut tx, &actor, "subscription_renewed", Some(id)).await?;
+    tx.commit().await?;
+    Ok(Json(user_view(&state.pool, id).await?))
+}
+
+async fn delete_user(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(id): Path<i64>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    auth.admin()?;
+    let mut tx = state.pool.begin_with("BEGIN IMMEDIATE").await?;
+    let actor = write_actor(&mut tx, &auth).await?;
+    if actor.role != "admin" {
+        return Err(ApiError::forbidden());
+    }
+    let target: DbUser = sqlx::query_as("SELECT * FROM users WHERE id=?")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(ApiError::not_found)?;
+    if target.role != "user" || target.id == actor.id {
+        return Err(ApiError::forbidden());
+    }
+    sqlx::query("UPDATE users SET enabled=0,deletion_requested_at=COALESCE(deletion_requested_at,?),auth_version=auth_version+1 WHERE id=?")
+        .bind(now()).bind(id).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM sessions WHERE user_id=?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE rules SET enabled=0,deleted_at=COALESCE(deleted_at,?),updated_at=? WHERE owner_id=?")
+        .bind(now()).bind(now()).bind(id).execute(&mut *tx).await?;
+    enqueue_apply(&mut tx, id).await?;
+    record_audit(&mut tx, &actor, "user_deletion_requested", Some(id)).await?;
+    tx.commit().await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({"status":"deleting"})),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -995,7 +1129,7 @@ async fn reset_password(
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(ApiError::not_found)?;
-    if target.role == "admin" {
+    if target.role == "admin" || target.deletion_requested_at.is_some() {
         return Err(ApiError::forbidden());
     }
     sqlx::query("UPDATE users SET password_hash=?,must_change_password=1,auth_version=auth_version+1 WHERE id=?").bind(hash).bind(id).execute(&mut *tx).await?;
@@ -1044,7 +1178,7 @@ struct AuditView {
     resource_id: Option<i64>,
     // Event-time name of the referenced rule or account, so the log reads as
     // sentences rather than bare identifiers. Rules keep their name after
-    // soft deletion; accounts are never deleted.
+    // deletion; audit snapshots remain after account removal.
     resource_kind: Option<String>,
     resource_name: Option<String>,
     resource_port: Option<i64>,
@@ -1130,8 +1264,9 @@ pub async fn initialize_admin(
         .fetch_one(&mut *tx)
         .await?;
     anyhow::ensure!(count == 0, "an administrator already exists");
-    sqlx::query("INSERT INTO users(username,password_hash,role,must_change_password,port_start,port_end,max_rules,created_at) VALUES(?,?,'admin',0,1024,65535,10,?)")
-        .bind(username).bind(hash).bind(now()).execute(&mut *tx).await?;
+    let cycle = crate::subscriptions::next_identity(&mut tx, "subscription").await?;
+    sqlx::query("INSERT INTO users(username,password_hash,role,must_change_password,port_start,port_end,max_rules,created_at,runtime_slot,subscription_id,subscription_started_at) VALUES(?,?,'admin',0,1024,65535,10,?,1,?,?)")
+        .bind(username).bind(hash).bind(now()).bind(cycle).bind(now()).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -1299,7 +1434,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/mfa/confirm",post(confirm_mfa))
         .route("/api/mfa/disable",post(disable_mfa))
         .route("/api/users",get(list_users).post(create_user))
-        .route("/api/users/{id}",put(update_user))
+        .route("/api/capacity",get(capacity))
+        .route("/api/users/{id}",put(update_user).delete(delete_user))
+        .route("/api/users/{id}/subscription",post(renew_subscription))
         .route("/api/users/{id}/password",post(reset_password))
         .route("/api/users/{id}/apply",post(retry_apply))
         .route("/api/users/{id}/ports",get(port_usage))

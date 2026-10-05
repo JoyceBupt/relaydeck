@@ -28,8 +28,12 @@ export function useRules() {
   return useQuery({ queryKey: keys.rules, queryFn: api.rules, enabled: signedIn, refetchInterval: poll(5_000) })
 }
 
+export function useCapacity() {
+  return useQuery({ queryKey: ['capacity'], queryFn: api.capacity, enabled: computed(() => signedIn.value && isAdmin.value), refetchInterval: poll(30_000) })
+}
+
 export function useUsers() {
-  return useQuery({ queryKey: keys.users, queryFn: api.users, enabled: computed(() => signedIn.value && isAdmin.value), refetchInterval: poll(15_000) })
+  return useQuery({ queryKey: keys.users, queryFn: api.users, enabled: computed(() => signedIn.value && isAdmin.value), refetchInterval: query => visibility.value === 'visible' ? query.state.data?.some(user => user.deletion_requested_at != null) ? 2_000 : 15_000 : false })
 }
 
 export function useAudit() {

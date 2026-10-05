@@ -9,6 +9,7 @@ const state = computed(() => {
   if (health.isError.value) return { tone: 'bg-danger', text: '无法连接', help: '重试中' }
   switch (health.data.value?.executor) {
     case 'running': return { tone: 'bg-success', text: '执行器在线', help: '变更会自动应用' }
+    case 'recovering': return { tone: 'bg-warning', text: '转发恢复中', help: '等待运行确认' }
     case 'offline': return { tone: 'bg-danger', text: '执行器离线', help: '超过 10 秒无心跳，新变更暂不生效' }
     case 'unconfigured': return { tone: 'bg-faint', text: '执行器未连接', help: '规则只保存，不生效' }
     default: return { tone: 'bg-surface-3', text: '检查中', help: '' }
