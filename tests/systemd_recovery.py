@@ -136,8 +136,14 @@ class Recovery(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.renewal_stop.set();cls.renewal.join(timeout=45)
+        table=json.loads(subprocess.check_output(['nft','-j','list','table','inet','relaydeck_usage'],text=True))
+        incoming={row['counter']['name']:row['counter']['bytes'] for row in table['nftables'] if 'counter' in row and row['counter']['name'].startswith('rx_')}
         cls.broker.send_signal(signal.SIGTERM)
         cls.broker.wait(timeout=30)
+        ledger=json.loads((ROOT / 'runtime/traffic-ledger.json').read_text())
+        for name,amount in incoming.items():
+            owner=name.split('_')[1]
+            if owner in ledger['accounts']: assert ledger['accounts'][owner]['incoming']>=amount,'shutdown lost the final kernel usage'
         cls.log.close()
         for path in (SYSTEMCTL, IP):
             original = path.with_name(path.name + '.qa-original')

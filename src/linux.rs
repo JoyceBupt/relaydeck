@@ -1988,7 +1988,11 @@ impl LinuxDriver {
     pub(crate) async fn shutdown(&self) -> anyhow::Result<()> {
         let mut plans = self.plans.lock().await;
         plans.clear();
-        fail_closed_cleanup(self.firewall(&plans), self.stop_all_services()).await
+        let stopped = fail_closed_cleanup(self.firewall(&plans), self.stop_all_services()).await;
+        // The old updater may restore an old binary immediately after stopping
+        // us. Persist the compatibility ledger with the final kernel counts.
+        let checkpoint = self.traffic.lock().await.checkpoint().await;
+        stopped.and(checkpoint)
     }
 }
 
