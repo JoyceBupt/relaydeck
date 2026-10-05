@@ -272,3 +272,21 @@ class SharedPortDeployment(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class IdentityCapacity(unittest.TestCase):
+    def test_capacity_preflights_all_collisions_before_creating_any_identity(self):
+        account = SimpleNamespace(pw_name='unrelated', pw_uid=62012, pw_gid=62012, pw_dir='/nonexistent', pw_shell='/usr/sbin/nologin')
+        def lookup(uid):
+            if uid == 62012: return account
+            raise KeyError(uid)
+        with patch.object(manage.pwd, 'getpwuid', side_effect=lookup), patch.object(manage.pwd, 'getpwnam', side_effect=KeyError), patch.object(manage.grp, 'getgrgid', side_effect=KeyError), patch.object(manage.grp, 'getgrnam', side_effect=KeyError), patch.object(manage, 'run') as run:
+            with self.assertRaisesRegex(ValueError, 'collision'):
+                manage.provision_identities({'uid_start':62000,'max_owners':20},12)
+            run.assert_not_called()
+
+    def test_capacity_can_expand_beyond_original_eleven_identities(self):
+        with patch.object(manage.pwd, 'getpwuid', side_effect=KeyError), patch.object(manage.pwd, 'getpwnam', side_effect=KeyError), patch.object(manage.grp, 'getgrgid', side_effect=KeyError), patch.object(manage.grp, 'getgrnam', side_effect=KeyError), patch.object(manage, 'run') as run:
+            manage.provision_identities({'uid_start':62000,'max_owners':21},12)
+            self.assertEqual(run.call_count,20)
+            self.assertIn('relaydeck-runner-21',run.call_args.args)

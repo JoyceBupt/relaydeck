@@ -460,6 +460,70 @@ def confirm_update(yes):
         raise ValueError('Update cancelled')
 
 
+def provision_identities(policy, start_slot=1):
+    end = policy['uid_start'] + policy['max_owners']
+    if type(policy['max_owners']) is not int or policy['max_owners'] < 1 or not 60000 <= policy['uid_start'] < end < 2**32-1:
+        raise ValueError('Invalid runtime identity capacity')
+    missing = []
+    for slot in range(start_slot, policy['max_owners'] + 1):
+        uid = policy['uid_start'] + slot - 1
+        name = f'relaydeck-runner-{slot}'
+        try:
+            account = pwd.getpwuid(uid)
+        except KeyError:
+            account = None
+        try:
+            named = pwd.getpwnam(name)
+        except KeyError:
+            named = None
+        if account or named:
+            if not account or not named or account.pw_name != name or named.pw_uid != uid or account.pw_gid != uid or account.pw_dir != '/nonexistent' or account.pw_shell != '/usr/sbin/nologin':
+                raise ValueError(f'Runtime identity collision: {name}/{uid}')
+        try:
+            group = grp.getgrgid(uid)
+        except KeyError:
+            group = None
+        try:
+            named_group = grp.getgrnam(name)
+        except KeyError:
+            named_group = None
+        if (group or named_group) and (not group or not named_group or group.gr_name != name or named_group.gr_gid != uid or group.gr_mem):
+            raise ValueError(f'Runtime group collision: {name}/{uid}')
+        missing.append((name, uid, account is None, group is None))
+    for name, uid, user_missing, group_missing in missing:
+        if group_missing: run('groupadd', '--gid', str(uid), name)
+        if user_missing: run('useradd', '--uid', str(uid), '--gid', str(uid), '--home-dir', '/nonexistent', '--no-create-home', '--shell', '/usr/sbin/nologin', name)
+
+
+def capacity(args):
+    preflight()
+    if args.max_tenants < 0: raise ValueError('Tenant capacity cannot be negative')
+    confirm_update(args.yes)
+    with manage_lock():
+        path = CONFIG / 'broker.json'
+        root_path(path)
+        previous = json.loads(path.read_text())
+        maximum = args.max_tenants + 1
+        if maximum < previous['max_owners']:
+            raise ValueError('Capacity cannot shrink while identities may still be assigned')
+        if maximum == previous['max_owners']:
+            return
+        policy = dict(previous, max_owners=maximum)
+        provision_identities(policy, previous['max_owners'] + 1)
+        # New identities are inert until the root policy is committed.
+        backup = CONFIG / ('broker-capacity-' + str(time.time_ns()) + '.json')
+        atomic_json(backup, previous, 0o600)
+        atomic_json(path, policy, 0o644)
+        try:
+            run('systemctl', 'restart', *UNITS)
+            wait_health(json.loads((CURRENT / 'release.json').read_text())['version'])
+        except BaseException:
+            atomic_json(path, previous, 0o644)
+            run('systemctl', 'restart', *UNITS)
+            raise
+        print(f'Tenant capacity: {args.max_tenants}. Previous policy: {backup}')
+
+
 def install(args):
     preflight()
     if any(path.exists() or path.is_symlink() for path in (CONFIG, STATE, CURRENT, BIN, BIN.with_name('realm'), MANAGER, UPDATER)):
@@ -484,6 +548,8 @@ def install(args):
             if path.exists() or path.is_symlink():
                 raise ValueError(f'Existing unit requires review: {unit}')
         policy = json.loads((stage / 'deploy/broker.example.json').read_text())
+        policy['max_owners'] = args.max_tenants + 1
+        if args.max_tenants < 0: raise ValueError('Tenant capacity cannot be negative')
         for slot in range(1, policy['max_owners'] + 1):
             uid = policy['uid_start'] + slot - 1
             name = f'relaydeck-runner-{slot}'
@@ -499,11 +565,7 @@ def install(args):
         except KeyError:
             run('useradd', '--system', '--user-group', '--home-dir', str(STATE), '--shell', '/usr/sbin/nologin', 'relaydeck')
             account = pwd.getpwnam('relaydeck')
-        for slot in range(1, policy['max_owners'] + 1):
-            uid = policy['uid_start'] + slot - 1
-            name = f'relaydeck-runner-{slot}'
-            run('groupadd', '--gid', str(uid), name)
-            run('useradd', '--uid', str(uid), '--gid', str(uid), '--home-dir', '/nonexistent', '--no-create-home', '--shell', '/usr/sbin/nologin', name)
+        provision_identities(policy)
         for path in (CONFIG, STATE, STATE / 'runtime', RELEASES, BIN.parent, UPDATER.parent):
             path.mkdir(parents=True, exist_ok=True)
             root_path(path)
@@ -519,6 +581,7 @@ def install(args):
         management_tools(release)
         current_link(release)
         policy = json.loads((release / 'deploy/broker.example.json').read_text())
+        policy['max_owners'] = args.max_tenants + 1
         policy.update(web_uid=account.pw_uid, web_gid=account.pw_gid)
         reserve_control_ports(policy, origin)
         (CONFIG / 'broker.json').write_text(json.dumps(policy, indent=2) + '\n')
@@ -758,6 +821,10 @@ def main():
             sub.add_argument('--realm-sha256', required=True)
             sub.add_argument('--origin', required=True, help='HTTPS domain[:port]; new installations default to port 17443')
             sub.add_argument('--admin', required=True)
+            sub.add_argument('--max-tenants', type=int, default=10, help='Provision this many tenant identities; expandable with capacity')
+    cap = commands.add_parser('capacity', help='Expand the root-approved tenant identity pool')
+    cap.add_argument('--max-tenants', type=int, required=True)
+    cap.add_argument('--yes', action='store_true')
     commands.add_parser('recover')
     commands.add_parser('prepare-frontend')
     sub = commands.add_parser('package')

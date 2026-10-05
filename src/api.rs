@@ -25,6 +25,7 @@ use tokio::sync::Mutex;
 #[derive(Clone)]
 pub struct AppState {
     pub pool: SqlitePool,
+    pub max_tenants: Option<i64>,
     pub config: Arc<Config>,
     pub credentials: Credentials,
     pub mfa: crate::mfa::MfaService,
@@ -49,6 +50,7 @@ impl AppState {
                 as Arc<dyn crate::upgrade::UpgradeChannel>
         });
         Ok(Self {
+            max_tenants: crate::capacity::installed()?,
             connectivity: Arc::new(crate::broker::SocketDriver::new(
                 std::env::var_os("RELAYDECK_BROKER_SOCKET")
                     .map(std::path::PathBuf::from)
@@ -847,11 +849,10 @@ async fn create_user(
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE role='user'")
         .fetch_one(&mut *tx)
         .await?;
-    if count >= 10 {
-        return Err(ApiError::conflict("首版最多10个用户"));
+    if state.max_tenants.is_some_and(|maximum| count >= maximum) {
+        return Err(ApiError::conflict("租户额度已满"));
     }
-    let slot: Option<i64> = sqlx::query_scalar("SELECT id FROM runtime_slots WHERE id NOT IN (SELECT COALESCE(runtime_slot,id) FROM users) ORDER BY id LIMIT 1").fetch_optional(&mut *tx).await?;
-    let slot = slot.ok_or_else(|| ApiError::conflict("运行席位已满"))?;
+    let slot = crate::capacity::allocate_slot(&mut tx, state.max_tenants).await?;
     let id = crate::subscriptions::next_identity(&mut tx, "account").await?;
     let cycle = crate::subscriptions::next_identity(&mut tx, "subscription").await?;
     let start = now();
@@ -893,6 +894,16 @@ pub async fn record_system_user_audit(
         .bind(action).bind(now()).bind(id).execute(&mut **tx).await?;
     sqlx::query("DELETE FROM audit_events WHERE id IN (SELECT id FROM audit_events ORDER BY id DESC LIMIT -1 OFFSET 10000)").execute(&mut **tx).await?;
     Ok(())
+}
+
+async fn capacity(
+    State(state): State<AppState>,
+    auth: AuthContext,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    auth.admin()?;
+    Ok(Json(
+        serde_json::json!({"max_tenants":state.max_tenants,"max_rules_per_account":crate::executor::MAX_RULES}),
+    ))
 }
 
 async fn list_users(
@@ -1404,6 +1415,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/mfa/confirm",post(confirm_mfa))
         .route("/api/mfa/disable",post(disable_mfa))
         .route("/api/users",get(list_users).post(create_user))
+        .route("/api/capacity",get(capacity))
         .route("/api/users/{id}",put(update_user).delete(delete_user))
         .route("/api/users/{id}/subscription",post(renew_subscription))
         .route("/api/users/{id}/password",post(reset_password))

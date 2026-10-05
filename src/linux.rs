@@ -157,8 +157,8 @@ impl BrokerPolicy {
             "invalid global port boundary"
         );
         ensure!(
-            (1..=11).contains(&self.max_owners),
-            "max_owners must be 1..11"
+            self.max_owners > 0,
+            "runtime identity pool must not be empty"
         );
         ensure!(
             self.uid_start >= 60000 && self.uid_start.checked_add(self.max_owners).is_some(),

@@ -208,17 +208,13 @@ async fn check_create_quota<'e, E>(executor: E, owner: &DbUser) -> Result<(), Ap
 where
     E: Executor<'e, Database = Sqlite>,
 {
-    let (owner_count, total_count): (i64, i64) = sqlx::query_as(
-        "SELECT (SELECT COUNT(*) FROM rules WHERE owner_id=? AND deleted_at IS NULL),(SELECT COUNT(*) FROM rules WHERE deleted_at IS NULL)",
-    )
-    .bind(owner.id)
-    .fetch_one(executor)
-    .await?;
+    let owner_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM rules WHERE owner_id=? AND deleted_at IS NULL")
+            .bind(owner.id)
+            .fetch_one(executor)
+            .await?;
     if owner_count >= owner.max_rules {
         return Err(ApiError::conflict("端口额度已满"));
-    }
-    if total_count >= 30 {
-        return Err(ApiError::conflict("总规则数已达30条"));
     }
     Ok(())
 }

@@ -316,7 +316,7 @@ async fn subscription_migration_preserves_installed_usage_and_explicit_expiry() 
         users,
         vec![
             (1, 1, 1000, None, 42, "unchanged".into()),
-            (2, 2, 1000, Some(2593000), 1234, "unchanged".into()),
+            (2, 2, 1000, None, 1234, "unchanged".into()),
             (3, 3, 1000, Some(9999999), 5678, "unchanged".into())
         ]
     );

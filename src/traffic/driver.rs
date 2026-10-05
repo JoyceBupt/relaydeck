@@ -90,7 +90,13 @@ impl TrafficMeter {
                     meta.mode() & 0o077 == 0,
                     "traffic ledger must remain private to root"
                 );
-                ensure!(meta.len() <= 64 * 1024, "traffic ledger too large");
+                ensure!(
+                    meta.len()
+                        <= u64::from(policy.max_owners)
+                            .saturating_mul(2048)
+                            .max(64 * 1024),
+                    "traffic ledger too large"
+                );
                 let mut ledger: Ledger = serde_json::from_slice(&std::fs::read(source)?)?;
                 if source == &path
                     && let Some(expected) = &ledger.legacy_digest
@@ -98,7 +104,11 @@ impl TrafficMeter {
                     let meta = std::fs::symlink_metadata(&legacy_path)?;
                     secure_root_path(&legacy_path, false)?;
                     ensure!(
-                        meta.mode() & 0o077 == 0 && meta.len() <= 64 * 1024,
+                        meta.mode() & 0o077 == 0
+                            && meta.len()
+                                <= u64::from(policy.max_owners)
+                                    .saturating_mul(2048)
+                                    .max(64 * 1024),
                         "invalid compatibility ledger"
                     );
                     let bytes = std::fs::read(&legacy_path)?;
@@ -638,6 +648,7 @@ impl TrafficMeter {
             .ledger
             .accounts
             .iter()
+            .filter(|(owner, _)| desired.contains_key(owner))
             .map(|(owner, account)| TrafficSnapshot {
                 period_id: account.period.as_ref().map(|period| period.id),
                 owner_id: *owner,

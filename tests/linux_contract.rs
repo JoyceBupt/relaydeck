@@ -366,6 +366,8 @@ fn broker_policy_rejects_path_grammar_uid_and_port_escalations() {
     assert!(value.validate().is_err());
     value = policy();
     value.max_owners = 1000;
+    assert!(value.validate().is_ok());
+    value.max_owners = u32::MAX;
     assert!(value.validate().is_err());
     value = policy();
     value.allowed_port_start = 22;

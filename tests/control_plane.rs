@@ -2724,3 +2724,60 @@ async fn account_deletion_waits_for_stop_preserves_audit_and_reuses_only_runtime
     }
     assert!(previous_id > 11);
 }
+
+#[tokio::test]
+async fn configured_capacity_and_per_account_rules_do_not_have_global_mvp_ceiling() {
+    let mut f = Fixture::new().await;
+    f.state.max_tenants = Some(12);
+    f.app = router(f.state.clone());
+    let (_, _, capacity) = call(&f.app, "GET", "/api/capacity", None, Some(&f.admin), false).await;
+    assert_eq!(capacity["max_tenants"], 12);
+    let mut last = Value::Null;
+    for index in 0..12 {
+        let (status, _, user) = call(
+            &f.app,
+            "POST",
+            "/api/users",
+            Some(json!({"username":format!("capacity{index}"),"password":INITIAL_PASSWORD})),
+            Some(&f.admin),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{user}");
+        last = user;
+    }
+    let (status, _, _) = call(
+        &f.app,
+        "POST",
+        "/api/users",
+        Some(json!({"username":"overflow","password":INITIAL_PASSWORD})),
+        Some(&f.admin),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    sqlx::query("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<30) INSERT INTO rules(id,owner_id,name,listen_port,target_host,target_ip,target_port,protocol,enabled,created_at,updated_at) SELECT x,1,'dormant',41000+x,'8.8.8.8','8.8.8.8',443,'tcp',0,0,0 FROM n").execute(&f.state.pool).await.unwrap();
+    sqlx::query("UPDATE identity_sequences SET value=30 WHERE name='rule'")
+        .execute(&f.state.pool)
+        .await
+        .unwrap();
+    let mut input = rule(42123);
+    input["owner_id"] = last["id"].clone();
+    input["enabled"] = json!(false);
+    let (status, _, created) = call(
+        &f.app,
+        "POST",
+        "/api/rules",
+        Some(input),
+        Some(&f.admin),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let slot: i64 = sqlx::query_scalar("SELECT runtime_slot FROM users WHERE id=?")
+        .bind(last["id"].as_i64().unwrap())
+        .fetch_one(&f.state.pool)
+        .await
+        .unwrap();
+    assert_eq!(slot, 13);
+}

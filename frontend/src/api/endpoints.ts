@@ -28,6 +28,7 @@ export const api = {
   ports: (ownerId: number) => request<PortUsage>(`/users/${ownerId}/ports`),
   traffic: (ownerId: number) => request<TrafficView>(`/users/${ownerId}/traffic`),
 
+  capacity: () => request<{ max_tenants: number | null; max_rules_per_account: number }>('/capacity'),
   users: () => request<User[]>('/users'),
   createUser: (input: NewUserInput) => request<User>('/users', 'POST', input),
   updateUser: (id: number, input: UserGrantInput) => request<User>(`/users/${id}`, 'PUT', input),

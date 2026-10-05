@@ -6,12 +6,14 @@ import AccountDrawer from '../components/AccountDrawer.vue'
 import EmptyState from '../components/EmptyState.vue'
 import { errorMessage } from '../api/client'
 import type { User } from '../types'
-import { useRules, useUsers } from '../lib/queries'
-import { expiry, MAX_TENANTS } from '../lib/format'
+import { useCapacity, useRules, useUsers } from '../lib/queries'
+import { expiry } from '../lib/format'
 
 const route = useRoute()
 const router = useRouter()
 const users = useUsers()
+const capacity = useCapacity()
+const maximum = computed(() => capacity.data.value?.max_tenants ?? null)
 const rules = useRules()
 
 const list = computed(() => [...(users.data.value ?? [])].sort((a, b) => (a.role === b.role ? a.id - b.id : a.role === 'admin' ? -1 : 1)))
@@ -42,9 +44,9 @@ const drawerUserId = computed(() => (route.name === 'account' ? Number(route.par
     <div class="flex flex-wrap items-end justify-between gap-4">
       <div>
         <h1 class="page-title">账户</h1>
-        <p class="mt-1 text-muted tabular">{{ users.isLoading.value ? '' : `${tenants.length} / ${MAX_TENANTS} 个租户` }}</p>
+        <p class="mt-1 text-muted tabular">{{ users.isLoading.value ? '' : (maximum === null ? tenants.length + ' 个租户' : tenants.length + ' / ' + maximum + ' 个租户') }}</p>
       </div>
-      <RouterLink v-if="tenants.length < MAX_TENANTS" to="/accounts/new" class="btn btn-primary"><Plus class="size-4" />新建账户</RouterLink>
+      <RouterLink v-if="(maximum === null || tenants.length < maximum)" to="/accounts/new" class="btn btn-primary"><Plus class="size-4" />新建账户</RouterLink>
       <span v-else class="text-sm text-muted">租户已满</span>
     </div>
 

@@ -108,7 +108,10 @@ async fn refresh_traffic(pool: &SqlitePool, driver: &SocketDriver) -> anyhow::Re
             },
         });
     }
-    record_traffic(pool, &driver.traffic(grants).await?).await
+    for batch in grants.chunks(64) {
+        record_traffic(pool, &driver.traffic(batch.to_vec()).await?).await?;
+    }
+    Ok(())
 }
 
 pub async fn refresh_dns<F, Fut>(

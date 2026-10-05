@@ -1,6 +1,7 @@
 pub mod api;
 pub mod bindguard;
 pub mod broker;
+pub mod capacity;
 pub mod config;
 pub mod connectivity;
 pub mod credentials;

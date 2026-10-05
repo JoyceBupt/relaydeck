@@ -8,11 +8,14 @@ import TrafficSummary from '../components/TrafficSummary.vue'
 import type { RuntimeStatus } from '../types'
 import { currentUser, isAdmin } from '../lib/session'
 import { useAudit, useHealth, usePorts, useRetry, useRules, useUsers, useTraffic } from '../lib/queries'
-import { expiry, MAX_TENANTS, relative, statusLabels } from '../lib/format'
+import { useCapacity } from '../lib/queries'
+import { expiry, relative, statusLabels } from '../lib/format'
 import { describeAudit } from '../lib/audit'
 
 const rules = useRules()
 const users = useUsers()
+const capacity = useCapacity()
+const maximum = computed(() => capacity.data.value?.max_tenants ?? null)
 const health = useHealth()
 const audit = useAudit()
 const retry = useRetry()
@@ -79,10 +82,10 @@ const recent = computed(() => (audit.data.value ?? []).slice(0, 5).map(entry => 
         <RouterLink v-if="isAdmin" to="/accounts" class="panel flex flex-col gap-3 p-4 transition-colors duration-200 hover:border-line-strong">
           <span class="stat-label">租户</span>
           <span v-if="users.isLoading.value" class="skeleton h-9 w-20" />
-          <span v-else-if="users.data.value"><span class="stat-value">{{ tenants.length }}</span><span class="stat-unit">/ {{ MAX_TENANTS }} 个</span></span>
+          <span v-else-if="users.data.value"><span class="stat-value">{{ tenants.length }}</span><span class="stat-unit">{{ maximum === null ? '个' : '/ ' + maximum + ' 个' }}</span></span>
           <span v-else class="text-sm text-danger">账户加载失败</span>
           <span class="meter" aria-hidden="true">
-            <span v-for="index in MAX_TENANTS" :key="index" :class="tenantTone(index - 1)" />
+            <span v-for="index in Math.min(maximum ?? tenants.length, 40)" :key="index" :class="tenantTone(index - 1)" />
           </span>
           <span v-if="expiring.length" class="text-xs text-warning">{{ expiring.length }} 个即将到期</span>
         </RouterLink>
